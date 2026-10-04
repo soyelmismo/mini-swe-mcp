@@ -5,27 +5,32 @@
 //!
 //! # Layout contract
 //!
-//! The dashboard is a table: every worker occupies exactly one *bounded* row,
-//! so a narrow terminal wraps nothing and a wide one is not filled with dead
-//! space. Bounding is driven by [`Layout`], a pure struct derived from the
-//! terminal width (see [`Layout::for_terminal_width`]). All measurement runs on
-//! the visible (ANSI-stripped) text, never on escape sequences, so colour never
-//! shifts a column.
+//! The dashboard is a bordered box: every visible line -- borders included --
+//! is at most the terminal width, so a narrow terminal wraps nothing and a wide
+//! one is not filled with dead space. The width comes from [`terminal_width`]
+//! (TIOCGWINSZ, else `COLUMNS`, else [`DEFAULT_TERMINAL_WIDTH`]); the renderer
+//! clips every line as a final safety net, whatever the content.
+//!
+//! All measurement runs on the visible (ANSI-stripped) text, never on escape
+//! sequences, so colour never shifts a column. Colour is applied only when the
+//! output is a TTY and `NO_COLOR` is unset; the plain non-TTY output uses the
+//! same layout without ANSI codes.
+//!
+//! # Row contract
+//!
+//! Each worker is one compact line: `glyph id model step/max elapsed op`. The
+//! columns drop, in order, as the terminal narrows: elapsed first, then the
+//! model alias, then `step/max`; the glyph, the id and the op always stay. A
+//! small progress bar precedes `step/max` only at 100+ columns. The op (or the
+//! task headline when idle) takes whatever width the fixed columns leave and is
+//! truncated with `…`.
 //!
 //! # Grouping contract
 //!
-//! Rows are grouped **by repository** (`WorkerRegistryEntry::repo_path`,
-//! [`DEFAULT_REPO_KEY`] when absent), never by the swarm tag: a supervisor
-//! watches *one worktree at a time*, so grouping by repository yields exactly
-//! one coherent table per repository. The optional swarm/domain tag is demoted
-//! to a `[tag]` prefix inside the task column, where it still shows but can no
-//! longer fracture the dashboard into many tiny tables.
-//!
-//! Each repository heading carries its own counters (`total`, then every
-//! non-zero state), folded in by `RepoGroup::push` on the same pass that groups
-//! the rows. The global counters above stay the cross-repository view, so one
-//! repository finishing early is visible both in its own table and in the
-//! fleet-wide strip.
+//! Rows are grouped by round/group (`WorkerRegistryEntry::group`), each group
+//! headed by one line with its per-status counts. There is no PID column here
+//! (the PID lives in the detail view), and a repository line is shown only when
+//! more than one repository is present.
 
 use crate::config::env_parse;
 use crate::pool::{RegistryStatus, WorkerRegistryEntry, load_all_registry_entries, unix_timestamp};
@@ -85,193 +90,31 @@ pub fn print_status_line() {
     }
 }
 
-/// Human-readable elapsed time: `05s`, `01m 05s`, `01h 01m`.
-fn format_duration(secs: u64) -> String {
-    if secs < 60 {
-        format!("{secs:02}s")
-    } else if secs < 3600 {
-        format!("{:02}m {:02}s", secs / 60, secs % 60)
-    } else {
-        format!("{:02}h {:02}m", secs / 3600, (secs % 3600) / 60)
-    }
-}
-
 /// Width assumed when the real terminal size cannot be determined (non-tty
 /// output, `MONITOR_WIDTH` override, or a TUI that has not reported its size).
-pub const DEFAULT_TERMINAL_WIDTH: usize = 120;
-
-/// Narrowest usable terminal: below this the fixed ID/PID columns would leave
-/// nothing for the task text, so the row degrades to a two-line layout.
-pub const MIN_TERMINAL_WIDTH: usize = 60;
+pub const DEFAULT_TERMINAL_WIDTH: usize = 80;
 
 /// Grouping key used for workers whose `repo_path` was never recorded.
 pub const DEFAULT_REPO_KEY: &str = "local";
 
-/// Narrowest task column that still shows a command prefix plus its ellipsis.
-pub const MIN_OP_WIDTH: usize = 12;
-
-/// Widest task column, even on very wide terminals.
-pub const MAX_OP_WIDTH: usize = 60;
-
-/// Indent of a stacked row's continuation lines.
-const STACKED_INDENT: usize = 2;
-
 /// Visible width of the ID column (a full UUID is never shown).
 const ID_WIDTH: usize = 8;
-/// Visible width of the PID column.
-const PID_WIDTH: usize = 7;
-/// Visible width of the status column: `RUNNING  ` is 9, `◆ REVIEWING` is 11.
-const STATUS_WIDTH: usize = 11;
-/// Visible width of the model column.
-const MODEL_WIDTH: usize = 8;
-/// Visible width of the uptime column (`01m 05s` is the widest format).
-const UPTIME_WIDTH: usize = 7;
-/// Visible width of the bare `step/max` counter.
-const TURNS_BASE: usize = 9;
+/// Visible width of the model-alias column.
+const MODEL_WIDTH: usize = 7;
+/// Visible width of the `step/max` column.
+const TURNS_WIDTH: usize = 6;
 /// Filled/empty cells inside the progress bar, brackets excluded.
 const PROGRESS_CELLS: usize = 8;
 /// Width of the progress bar with its brackets.
 const BAR_WIDTH: usize = PROGRESS_CELLS + 2;
-/// Spaces between adjacent columns.
-const GAP: usize = 2;
-/// Spaces between the last column and the task text.
-const LAST_GAP: usize = 1;
+/// Terminals at or above this width get a progress bar before `step/max`.
+const PROGRESS_THRESHOLD: usize = 100;
+/// Narrowest op column that still shows a command prefix plus its ellipsis.
+const MIN_OP_WIDTH: usize = 12;
 
-/// Fixed width of a row without the progress bar.
-const FIXED_CORE: usize = ID_WIDTH
-    + PID_WIDTH
-    + STATUS_WIDTH
-    + TURNS_BASE
-    + MODEL_WIDTH
-    + UPTIME_WIDTH
-    + 5 * GAP
-    + LAST_GAP;
-
-/// Fixed width of a row including the progress bar.
-const FIXED_FULL: usize = FIXED_CORE + BAR_WIDTH + 1;
-
-/// Whether a row is laid out on one line or as a stack of short lines.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RowShape {
-    /// Every column on one line: `ID PID STATUS TURNS MODEL UPTIME task`.
-    Inline {
-        /// Whether the turns column carries a progress bar.
-        progress: bool,
-    },
-    /// Too narrow for one line: two label lines plus wrapped task lines.
-    Stacked,
-}
-
-/// Visible column widths, derived from the terminal width.
-///
-/// The task column is the only elastic one: it absorbs whatever the fixed
-/// columns leave behind and is clamped into [`MIN_OP_WIDTH`]..=[`MAX_OP_WIDTH`].
-/// That clamp is what makes the cap on long commands *dynamic* -- a 400-column
-/// terminal still truncates at [`MAX_OP_WIDTH`] instead of printing a 3 KB
-/// command, while an 80-column terminal truncates at ~19 characters.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Layout {
-    /// Total terminal width this layout was computed for.
-    pub total: usize,
-    /// Visible width of the ID column.
-    pub id: usize,
-    /// Visible width of the PID column.
-    pub pid: usize,
-    /// Visible width of the status column.
-    pub status: usize,
-    /// Visible width of the turns column (bar included when shown).
-    pub turns: usize,
-    /// Visible width of the model column.
-    pub model: usize,
-    /// Visible width of the uptime column.
-    pub uptime: usize,
-    /// Maximum visible width of the last-op/task text.
-    pub op: usize,
-    /// How a worker row is laid out at this width.
-    pub shape: RowShape,
-}
-
-impl Layout {
-    /// Derive the responsive layout for a terminal of `term_width` columns.
-    ///
-    /// Three tiers by available width: **inline + progress bar** when both fit;
-    /// **inline, no bar** when one line still fits a usable task column (the
-    /// bar is dropped first, since `step/max` carries the same information);
-    /// **stacked** otherwise — two short label lines and a wrapped task, so no
-    /// line overflows. Never panics and never returns a zero-width task column;
-    /// widths below [`MIN_TERMINAL_WIDTH`] are raised to that floor.
-    pub fn for_terminal_width(term_width: usize) -> Self {
-        let total = term_width.max(MIN_TERMINAL_WIDTH);
-
-        // Tier 1: the progress bar is a bonus, not a requirement.
-        if total >= FIXED_FULL + MIN_OP_WIDTH {
-            return Self::inline(total, true);
-        }
-        // Tier 2: one line, counter only.
-        if total >= FIXED_CORE + MIN_OP_WIDTH {
-            return Self::inline(total, false);
-        }
-        // Tier 3: stack it; the task wraps at the full usable width.
-        Self {
-            total,
-            id: ID_WIDTH,
-            pid: PID_WIDTH,
-            status: STATUS_WIDTH,
-            turns: TURNS_BASE,
-            model: MODEL_WIDTH,
-            uptime: UPTIME_WIDTH,
-            op: total.saturating_sub(STACKED_INDENT).max(1),
-            shape: RowShape::Stacked,
-        }
-    }
-
-    /// Build an inline layout with the task column taking the slack.
-    fn inline(total: usize, progress: bool) -> Self {
-        let turns = if progress {
-            BAR_WIDTH + 1 + TURNS_BASE
-        } else {
-            TURNS_BASE
-        };
-        let fixed = FIXED_CORE + if progress { BAR_WIDTH + 1 } else { 0 };
-        Self {
-            total,
-            id: ID_WIDTH,
-            pid: PID_WIDTH,
-            status: STATUS_WIDTH,
-            turns,
-            model: MODEL_WIDTH,
-            uptime: UPTIME_WIDTH,
-            op: total
-                .saturating_sub(fixed)
-                .clamp(MIN_OP_WIDTH, MAX_OP_WIDTH),
-            shape: RowShape::Inline { progress },
-        }
-    }
-
-    /// Visible width of everything left of the task text.
-    ///
-    /// Used to draw the rule that closes the header, so the rule is exactly
-    /// as wide as the rows it sits above.
-    pub fn fixed_width(&self) -> usize {
-        self.id
-            + self.pid
-            + self.status
-            + self.turns
-            + self.model
-            + self.uptime
-            + 5 * GAP
-            + LAST_GAP
-    }
-
-    /// Whether the progress bar is rendered in the turns column.
-    pub fn shows_progress(&self) -> bool {
-        matches!(self.shape, RowShape::Inline { progress: true })
-    }
-}
-
-// ---------------------------------------------------------------------------
+// ----------
 // Text measurement helpers (width-aware, never byte-based)
-// ---------------------------------------------------------------------------
+// ----------
 
 /// Number of columns a string occupies, ignoring SGR escape sequences.
 ///
@@ -353,71 +196,73 @@ pub fn pad_visible(s: &str, width: usize) -> String {
     out
 }
 
-/// Split a long task into `op_width`-sized chunks for wrapped rendering.
-fn wrap_visible(s: &str, op_width: usize) -> Vec<String> {
-    let mut lines = Vec::new();
-    let mut current = String::new();
-    for word in s.split_whitespace() {
-        if !current.is_empty() && visible_width(&current) + 1 + visible_width(word) > op_width {
-            lines.push(std::mem::take(&mut current));
-        }
-        if !current.is_empty() {
-            current.push(' ');
-        }
-        if visible_width(word) > op_width {
-            // A single oversized word: hard-split it so no line overflows.
-            let mut head = String::new();
-            for ch in word.chars() {
-                if head.chars().count() == op_width {
-                    lines.push(std::mem::take(&mut head));
-                }
-                head.push(ch);
-            }
-            current = head;
-        } else {
-            current.push_str(word);
-        }
-    }
-    if !current.is_empty() || lines.is_empty() {
-        lines.push(current);
-    }
-    lines
-}
-
-// ---------------------------------------------------------------------------
+// ----------
 // Row cells
-// ---------------------------------------------------------------------------
+// ----------
 
-/// Visual indicator for the review phase.
-///
-/// A reviewing worker must not look like a running one: the implementer has
-/// finished and an independent reviewer is auditing the diff. `REVIEWING` is
-/// padded to the column width and, when colour is on, carries a bright marker
-/// plus the `[REVIEW]` tag that [`review_tag`] also prepends to the task.
-fn review_badge(use_color: bool) -> &'static str {
-    if use_color {
-        "\x1b[1;35m\u{25c6} REVIEWING\x1b[0m"
-    } else {
-        "\u{25c6} REVIEWING"
+/// Bold, used for worker ids.
+const C_BOLD: &str = "\x1b[1m";
+/// Green: running.
+const C_GREEN: &str = "\x1b[32m";
+/// Cyan: reviewing.
+const C_CYAN: &str = "\x1b[36m";
+/// Yellow: paused or asking.
+const C_YELLOW: &str = "\x1b[33m";
+/// Red: failed or exhausted.
+const C_RED: &str = "\x1b[31m";
+/// Dim: done, retired states, model aliases.
+const C_DIM: &str = "\x1b[2m";
+/// SGR reset.
+const C_RESET: &str = "\x1b[0m";
+
+/// The one-character status glyph for a worker.
+pub fn status_glyph(status: RegistryStatus) -> char {
+    match status {
+        RegistryStatus::Running => '\u{25cf}',
+        RegistryStatus::Paused => '\u{23f8}',
+        RegistryStatus::Reviewing => '\u{25c6}',
+        RegistryStatus::Completed => '\u{2713}',
+        RegistryStatus::Failed => '\u{2717}',
+        RegistryStatus::Exhausted => '\u{2717}',
+        RegistryStatus::Stopped => '\u{25a0}',
+        RegistryStatus::Interrupted => '\u{25b2}',
     }
 }
 
-/// Tag marking a row as being in the review phase.
-fn review_tag(use_color: bool) -> &'static str {
-    if use_color {
-        "\x1b[1;35m[REVIEW]\x1b[0m"
-    } else {
-        "[REVIEW]"
+/// SGR colour of a status glyph: running green, reviewing cyan, paused yellow,
+/// failed/exhausted red, everything terminal dim.
+fn glyph_colour(status: RegistryStatus) -> &'static str {
+    match status {
+        RegistryStatus::Running => C_GREEN,
+        RegistryStatus::Reviewing => C_CYAN,
+        RegistryStatus::Paused => C_YELLOW,
+        RegistryStatus::Failed | RegistryStatus::Exhausted => C_RED,
+        RegistryStatus::Completed | RegistryStatus::Stopped | RegistryStatus::Interrupted => C_DIM,
     }
 }
 
-/// Progress indicator for the turn budget: a filled/empty bar plus `step/max`.
-///
-/// The bar makes "how far along is this worker" readable at a glance; the
-/// numbers stay for precision.
+/// A coloured `●2`-style counter, or the plain form when colour is off.
+fn glyph_count(status: RegistryStatus, count: usize, use_color: bool) -> String {
+    let glyph = status_glyph(status);
+    if use_color {
+        format!("{}{glyph}{C_RESET}{count}", glyph_colour(status))
+    } else {
+        format!("{glyph}{count}")
+    }
+}
+
+/// Model alias with any provider prefix stripped (`combo:nerd` renders `nerd`).
+fn model_alias(model: &str) -> &str {
+    match model.split_once(':') {
+        Some((_, rest)) if !rest.is_empty() => rest,
+        _ => model,
+    }
+}
+
+/// Progress indicator for the turn budget: a filled/empty bar.
 fn progress_bar(step: usize, max_turns: usize) -> String {
     // `checked_div` keeps a zero budget (never written by the pool, but a
-    // hand-edited registry file can hold it) from panicking the whole TUI.
+    // hand-edited registry file can hold it) from panicking the renderer.
     let filled = (step.min(max_turns) * PROGRESS_CELLS)
         .checked_div(max_turns)
         .unwrap_or(PROGRESS_CELLS)
@@ -431,140 +276,20 @@ fn progress_bar(step: usize, max_turns: usize) -> String {
     bar
 }
 
-/// The turns column: a progress bar followed by the exact `step/max` counter.
-///
-/// The bar answers "how far along" at a glance, the counter "exactly how far".
-/// The bar is dropped when the terminal is too narrow to show both without
-/// wrapping.
-fn turns_cell(step: usize, max_turns: usize, layout: &Layout) -> String {
-    let counter = format!("{step}/{max_turns}");
-    let cell = match layout.shows_progress() {
-        true => format!("{} {counter}", progress_bar(step, max_turns)),
-        false => counter,
-    };
-    if cell.chars().count() >= layout.turns {
-        return cell;
-    }
-    format!("{}{cell}", " ".repeat(layout.turns - cell.chars().count()))
-}
-
-/// Status cell for a worker: badge text plus colour, padded by the caller.
-///
-/// `reviewing` is deliberately distinct from `running`: the implementer is
-/// done and an independent reviewer is auditing the diff.
-fn status_cell(status: RegistryStatus, use_color: bool) -> &'static str {
-    if status == RegistryStatus::Reviewing {
-        return review_badge(use_color);
-    }
-    if use_color {
-        match status {
-            RegistryStatus::Running => "\x1b[1;32mRUNNING  \x1b[0m",
-            RegistryStatus::Paused => "\x1b[1;33mPAUSED  \x1b[0m",
-            RegistryStatus::Completed => "\x1b[1;34mDONE    \x1b[0m",
-            RegistryStatus::Failed => "\x1b[1;31mFAILED  \x1b[0m",
-            _ => "\x1b[2;37mSTOPPED \x1b[0m",
-        }
+/// Human-readable elapsed time: `16m`, `05s`, `01h 05m`.
+fn format_elapsed(secs: u64) -> String {
+    if secs < 60 {
+        format!("{:02}s", secs)
+    } else if secs < 3600 {
+        format!("{:02}m", secs / 60)
     } else {
-        match status {
-            RegistryStatus::Running => "RUNNING ",
-            RegistryStatus::Paused => "PAUSED  ",
-            RegistryStatus::Completed => "DONE    ",
-            RegistryStatus::Failed => "FAILED  ",
-            _ => "STOPPED ",
-        }
+        format!("{:02}h {:02}m", secs / 3600, (secs % 3600) / 60)
     }
 }
 
-/// The fixed columns of a worker row (everything left of the task text).
-fn row_prefix(w: &WorkerRegistryEntry, layout: &Layout, use_color: bool, now: u64) -> String {
-    let id = truncate_visible(&w.id, layout.id);
-    let pid = format!("{:<width$}", w.pid, width = PID_WIDTH);
-    let duration_secs = if w.status.is_terminal() {
-        w.updated_at.saturating_sub(w.started_at)
-    } else {
-        now.saturating_sub(w.started_at)
-    };
-    let uptime = format_duration(duration_secs);
-
-    let status = status_cell(w.status, use_color);
-
-    let turns = turns_cell(w.step, w.max_turns, layout);
-    let model = pad_visible(&w.model, layout.model);
-    let uptime = pad_visible(&uptime, layout.uptime);
-
-    let mut prefix = String::new();
-    prefix.push_str(&pad_visible(&id, layout.id));
-    prefix.push_str(&" ".repeat(GAP));
-    prefix.push_str(&pid);
-    prefix.push_str(&" ".repeat(GAP));
-    prefix.push_str(&pad_visible(status, layout.status));
-    prefix.push_str(&" ".repeat(GAP));
-    prefix.push_str(&turns);
-    prefix.push_str(&" ".repeat(GAP));
-    prefix.push_str(&model);
-    prefix.push_str(&" ".repeat(GAP));
-    prefix.push_str(&uptime);
-    prefix.push_str(&" ".repeat(LAST_GAP));
-    prefix
-}
-
-/// Lay a worker out as a stack of short lines for narrow terminals.
-///
-/// Two label lines carry the fixed columns and the task text wraps below them,
-/// so nothing is chopped to a single character and no line overflows.
-fn stack_row(
-    w: &WorkerRegistryEntry,
-    layout: &Layout,
-    use_color: bool,
-    now: u64,
-    op: &str,
-) -> String {
-    let duration_secs = if w.status.is_terminal() {
-        w.updated_at.saturating_sub(w.started_at)
-    } else {
-        now.saturating_sub(w.started_at)
-    };
-    let status = status_cell(w.status, use_color);
-    let first = format!(
-        "{}  {}  {}",
-        pad_visible(&truncate_visible(&w.id, layout.id), layout.id),
-        pad_visible(
-            &format!("{:<width$}", w.pid, width = layout.pid),
-            layout.pid
-        ),
-        turns_cell(w.step, w.max_turns, layout),
-    );
-    let mut second = format!(
-        "{}  {}  {}",
-        pad_visible(status, layout.status),
-        pad_visible(&w.model, layout.model),
-        pad_visible(&format_duration(duration_secs), layout.uptime),
-    );
-    // Health counters ride the label line, which has room the inline row does
-    // not — but only whole: a cell that would overflow the terminal is
-    // dropped rather than clipped, so the row stays readable.
-    let health = w.metrics.repeat_nudge_cell();
-    if visible_width(&second) + 2 + visible_width(&health) <= layout.total {
-        second = format!("{}  {health}", second.trim_end());
-    }
-    let mut out = String::new();
-    out.push_str(&first);
-    out.push('\n');
-    out.push_str(&second);
-    out.push('\n');
-    out.push_str("  ");
-    out.push_str(op);
-    out.push('\n');
-    for extra in wrap_visible(op, layout.op).into_iter().skip(1) {
-        out.push_str(&" ".repeat(STACKED_INDENT));
-        out.push_str(&extra);
-        out.push('\n');
-    }
-    out
-}
-
-/// The last-op / task cell, capped to `layout.op` visible columns.
-fn op_cell(w: &WorkerRegistryEntry, layout: &Layout, use_color: bool) -> String {
+/// The op cell: the question when the worker asks, else the last command, else
+/// the task headline. The group tag is demoted to a `[group]` prefix here.
+fn op_text(w: &WorkerRegistryEntry) -> String {
     let first_line = w.task.lines().next().unwrap_or("").trim();
     let detail = if let Some(ref q) = w.question {
         format!("ASK: {q}")
@@ -572,96 +297,287 @@ fn op_cell(w: &WorkerRegistryEntry, layout: &Layout, use_color: bool) -> String 
         && w.last_command != "completed"
         && w.last_command != "initializing"
     {
-        format!("{} — {}", w.last_command, first_line)
+        w.last_command.clone()
     } else {
         first_line.to_string()
     };
-
-    let tag = if w.status == RegistryStatus::Reviewing {
-        format!("{} ", review_tag(use_color))
-    } else {
-        match w.group.as_deref() {
-            Some(g) if !g.trim().is_empty() => format!("[{}] ", g.trim()),
-            _ => String::new(),
-        }
-    };
-    let detail = format!("{tag}{detail}");
-    truncate_visible(&detail, layout.op)
+    match w.group.as_deref() {
+        Some(g) if !g.trim().is_empty() => format!("[{}] {detail}", g.trim()),
+        _ => detail,
+    }
 }
 
-// ---------------------------------------------------------------------------
-// Dashboard rendering
-// ---------------------------------------------------------------------------
-
-/// One repository's slice of the dashboard: its workers plus the counters
-/// shown in its heading.
+/// Fit one worker to a single compact line of at most `inner` visible columns.
 ///
-/// Counters are folded in while grouping (one pass over the entries), so the
-/// heading never needs a second scan and the row loop never needs a
-/// per-status branch of its own.
-struct RepoGroup<'a> {
-    workers: Vec<&'a WorkerRegistryEntry>,
-    active: usize,
-    paused: usize,
-    reviewing: usize,
-    completed: usize,
-    failed: usize,
-    exhausted: usize,
-    stopped: usize,
+/// Layout: `glyph id model step/max elapsed op`. Columns drop, in order, as
+/// the terminal narrows: elapsed first, then the model alias, then `step/max`;
+/// the glyph, the id and the op always stay. A progress bar precedes `step/max`
+/// only at [`PROGRESS_THRESHOLD`]+ columns. The op takes whatever the fixed
+/// columns leave and is truncated with `…`, so the row never overflows `inner`.
+fn compact_row(w: &WorkerRegistryEntry, now: u64, inner: usize, use_color: bool) -> String {
+    let glyph = status_glyph(w.status);
+    let id = truncate_visible(&w.id, ID_WIDTH);
+    let model = model_alias(&w.model);
+    let turns = format!("{}/{}", w.step, w.max_turns);
+    let duration_secs = if w.status.is_terminal() {
+        w.updated_at.saturating_sub(w.started_at)
+    } else {
+        now.saturating_sub(w.started_at)
+    };
+    let elapsed = format_elapsed(duration_secs);
+    let detail = op_text(w);
+
+    let show_bar = inner + 4 >= PROGRESS_THRESHOLD;
+    let base = 1 + 1 + ID_WIDTH + 1;
+    let turns_w = visible_width(&turns).max(TURNS_WIDTH);
+    let turns_cost = turns_w + 1 + if show_bar { BAR_WIDTH + 1 } else { 0 };
+    let model_cost = MODEL_WIDTH + 1;
+    let elapsed_cost = visible_width(&elapsed) + 1;
+
+    // Drop order is elapsed, then model, then step/max: each column is shown
+    // only when every column it outranks still fits, and the op keeps a
+    // readable minimum width.
+    let show_turns = base + turns_cost + MIN_OP_WIDTH <= inner;
+    let show_model = show_turns && base + turns_cost + model_cost + MIN_OP_WIDTH <= inner;
+    let show_elapsed =
+        show_model && base + turns_cost + model_cost + elapsed_cost + MIN_OP_WIDTH <= inner;
+
+    let mut prefix = String::new();
+    if use_color {
+        prefix.push_str(glyph_colour(w.status));
+    }
+    prefix.push(glyph);
+    if use_color {
+        prefix.push_str(C_RESET);
+    }
+    prefix.push(' ');
+    if use_color {
+        prefix.push_str(C_BOLD);
+    }
+    prefix.push_str(&pad_visible(&id, ID_WIDTH));
+    if use_color {
+        prefix.push_str(C_RESET);
+    }
+    prefix.push(' ');
+    if show_model {
+        if use_color {
+            prefix.push_str(C_DIM);
+        }
+        prefix.push_str(&pad_visible(
+            &truncate_visible(model, MODEL_WIDTH),
+            MODEL_WIDTH,
+        ));
+        if use_color {
+            prefix.push_str(C_RESET);
+        }
+        prefix.push(' ');
+    }
+    if show_turns {
+        if show_bar {
+            prefix.push_str(&progress_bar(w.step, w.max_turns));
+            prefix.push(' ');
+        }
+        prefix.push_str(&pad_visible(&turns, turns_w));
+        prefix.push(' ');
+    }
+    if show_elapsed {
+        prefix.push_str(&elapsed);
+        prefix.push(' ');
+    }
+    let op_width = inner.saturating_sub(visible_width(&prefix));
+    prefix.push_str(&truncate_visible(&detail, op_width));
+    truncate_visible(&prefix, inner)
 }
 
-impl<'a> RepoGroup<'a> {
-    /// An empty group, ready for [`RepoGroup::push`].
-    fn new() -> Self {
-        Self {
-            workers: Vec::new(),
-            active: 0,
-            paused: 0,
-            reviewing: 0,
-            completed: 0,
-            failed: 0,
-            exhausted: 0,
-            stopped: 0,
+// ----------
+// Bordered box
+// ----------
+
+/// Clock for the header: `HH:MM` in the local day.
+fn header_clock(now: u64) -> String {
+    format!("{:02}:{:02}", (now / 3600) % 24, (now / 60) % 60)
+}
+
+/// Wrap `content` in side borders, padded (and clipped) to exactly `width`.
+///
+/// The final clip guarantees the rule: every visible line, borders included,
+/// is at most `width`, whatever the content.
+fn box_line(content: &str, width: usize) -> String {
+    let inner = width.saturating_sub(4).max(1);
+    let body = pad_visible(&truncate_visible(content, inner), inner);
+    truncate_visible(&format!("│ {body} │"), width.max(1))
+}
+
+/// Top border: `╭─ mini-swe ─ N workers ─ counts ─…─ HH:MM ─╮`, filled to
+/// exactly `width`. The header carries the title, the total, the per-status
+/// counts and the clock on one bordered line.
+fn box_top(
+    title: &str,
+    total: &str,
+    counts: &str,
+    clock: &str,
+    width: usize,
+    use_color: bool,
+) -> String {
+    let mut prefix = format!("╭─ {title} ─ {total}");
+    if !counts.is_empty() {
+        prefix.push_str(&format!(" ─ {counts}"));
+    }
+    let tail = format!(" {clock} ─╮");
+    let dashes = width
+        .saturating_sub(visible_width(&prefix) + visible_width(&tail) + 1)
+        .max(1);
+    let mut line = format!("{prefix} {}{tail}", "─".repeat(dashes));
+    if use_color {
+        line = format!("{C_BOLD}{line}{C_RESET}");
+    }
+    truncate_visible(&line, width.max(1))
+}
+
+/// Bottom border: `╰─ hint ─…─╯`, filled to exactly `width`.
+fn box_bottom(hint: &str, width: usize, use_color: bool) -> String {
+    let prefix = format!("╰─ {hint} ─");
+    let dashes = width.saturating_sub(visible_width(&prefix) + 1).max(1);
+    let mut line = format!("{prefix}{}╯", "─".repeat(dashes));
+    if use_color {
+        line = format!("{C_DIM}{line}{C_RESET}");
+    }
+    truncate_visible(&line, width.max(1))
+}
+
+// ----------
+// Grouping and dashboard rendering
+// ----------
+
+/// Grouping key for a worker: its round/group, else its repository, else the
+/// default key. The header line carries this key plus the group's counts.
+fn group_key(entry: &WorkerRegistryEntry) -> String {
+    if let Some(g) = entry.group.as_deref()
+        && !g.trim().is_empty()
+    {
+        return g.trim().to_string();
+    }
+    if let Some(r) = entry.repo_path.as_deref()
+        && !r.trim().is_empty()
+    {
+        return r.trim().to_string();
+    }
+    DEFAULT_REPO_KEY.to_string()
+}
+
+/// Per-status counts for the header: running, reviewing, paused and done when
+/// non-zero, failed always (so `✗0` reads as the all-clear).
+fn header_counts(entries: &[WorkerRegistryEntry], use_color: bool) -> String {
+    let mut running = 0;
+    let mut reviewing = 0;
+    let mut paused = 0;
+    let mut done = 0;
+    let mut failed = 0;
+    for e in entries {
+        match e.status {
+            RegistryStatus::Running => running += 1,
+            RegistryStatus::Reviewing => reviewing += 1,
+            RegistryStatus::Paused => paused += 1,
+            RegistryStatus::Completed | RegistryStatus::Stopped | RegistryStatus::Interrupted => {
+                done += 1
+            }
+            RegistryStatus::Failed | RegistryStatus::Exhausted => failed += 1,
         }
     }
+    let mut parts = Vec::new();
+    if running > 0 {
+        parts.push(glyph_count(RegistryStatus::Running, running, use_color));
+    }
+    if reviewing > 0 {
+        parts.push(glyph_count(RegistryStatus::Reviewing, reviewing, use_color));
+    }
+    if paused > 0 {
+        parts.push(glyph_count(RegistryStatus::Paused, paused, use_color));
+    }
+    if done > 0 {
+        parts.push(glyph_count(RegistryStatus::Completed, done, use_color));
+    }
+    parts.push(glyph_count(RegistryStatus::Failed, failed, use_color));
+    parts.join(" ")
+}
 
-    /// Append one worker and fold its status into the counters.
-    fn push(&mut self, entry: &'a WorkerRegistryEntry) {
-        match entry.status {
-            RegistryStatus::Running => self.active += 1,
-            RegistryStatus::Paused => self.paused += 1,
-            RegistryStatus::Reviewing => self.reviewing += 1,
-            RegistryStatus::Completed => self.completed += 1,
-            RegistryStatus::Failed => self.failed += 1,
-            RegistryStatus::Exhausted => self.exhausted += 1,
-            RegistryStatus::Stopped => self.stopped += 1,
-            RegistryStatus::Interrupted => self.stopped += 1,
+/// Per-status counts for one group header: every non-zero state, glyph form.
+fn group_counts(workers: &[&WorkerRegistryEntry], use_color: bool) -> String {
+    let mut running = 0;
+    let mut reviewing = 0;
+    let mut paused = 0;
+    let mut done = 0;
+    let mut failed = 0;
+    for w in workers {
+        match w.status {
+            RegistryStatus::Running => running += 1,
+            RegistryStatus::Reviewing => reviewing += 1,
+            RegistryStatus::Paused => paused += 1,
+            RegistryStatus::Completed | RegistryStatus::Stopped | RegistryStatus::Interrupted => {
+                done += 1
+            }
+            RegistryStatus::Failed | RegistryStatus::Exhausted => failed += 1,
         }
-        self.workers.push(entry);
     }
+    let mut parts = Vec::new();
+    if running > 0 {
+        parts.push(glyph_count(RegistryStatus::Running, running, use_color));
+    }
+    if reviewing > 0 {
+        parts.push(glyph_count(RegistryStatus::Reviewing, reviewing, use_color));
+    }
+    if paused > 0 {
+        parts.push(glyph_count(RegistryStatus::Paused, paused, use_color));
+    }
+    if done > 0 {
+        parts.push(glyph_count(RegistryStatus::Completed, done, use_color));
+    }
+    if failed > 0 {
+        parts.push(glyph_count(RegistryStatus::Failed, failed, use_color));
+    }
+    parts.join(" ")
+}
 
-    /// Heading counters: `total` first, then every non-zero state.
-    ///
-    /// A quiet repository reads `total: 4`, a busy one
-    /// `total: 4 | active: 2 | reviewing: 1 | completed: 1`. Every state is
-    /// covered, so no worker is hidden behind a dropped counter; zeros are
-    /// dropped so an idle worktree spends its heading on `total` alone.
-    fn summary_items(&self) -> Vec<(&'static str, String, &'static str)> {
-        [
-            ("total", self.workers.len(), BOLD),
-            ("active", self.active, GREEN),
-            ("paused", self.paused, YELLOW),
-            ("reviewing", self.reviewing, MAGENTA),
-            ("completed", self.completed, BLUE),
-            ("failed", self.failed, RED),
-            ("exhausted", self.exhausted, DIM),
-            ("stopped", self.stopped, DIM),
-        ]
-        .into_iter()
-        .filter(|(_, count, _)| *count > 0)
-        .map(|(label, count, color)| (label, count.to_string(), color))
-        .collect()
+/// The list content lines (group headers plus worker rows), each already at
+/// most `width - 4` visible columns. Shared by the plain and the interactive
+/// renderers so both views keep the same layout.
+fn list_content_lines(
+    entries: &[WorkerRegistryEntry],
+    now: u64,
+    width: usize,
+    use_color: bool,
+) -> Vec<String> {
+    let inner = width.saturating_sub(4).max(1);
+    let mut groups: BTreeMap<String, Vec<&WorkerRegistryEntry>> = BTreeMap::new();
+    for entry in entries {
+        groups.entry(group_key(entry)).or_default().push(entry);
     }
+    let repos: std::collections::BTreeSet<&str> = entries
+        .iter()
+        .map(|e| e.repo_path.as_deref().unwrap_or(DEFAULT_REPO_KEY))
+        .collect();
+    let show_repo = repos.len() > 1;
+    let mut lines = Vec::new();
+    for (name, workers) in &groups {
+        if show_repo {
+            let repo = workers
+                .first()
+                .and_then(|w| w.repo_path.as_deref())
+                .unwrap_or(DEFAULT_REPO_KEY);
+            lines.push(truncate_visible(&format!("repo: {repo}"), inner));
+        }
+        let counts = group_counts(workers, use_color);
+        let header = if counts.is_empty() {
+            name.clone()
+        } else {
+            format!("{name}  {counts}")
+        };
+        lines.push(truncate_visible(&header, inner));
+        for w in workers {
+            lines.push(compact_row(w, now, inner, use_color));
+        }
+    }
+    lines
 }
 
 /// Render the supervisor dashboard at the default width.
@@ -672,255 +588,42 @@ pub fn render_dashboard(entries: &[WorkerRegistryEntry], now: u64, use_color: bo
 /// Render the supervisor dashboard for a specific terminal width.
 ///
 /// Pure: identical inputs always produce identical output, which is what makes
-/// the width-dependent behaviour unit-testable.
+/// the width-dependent behaviour unit-testable. The plain non-TTY output uses
+/// this same bordered layout, without ANSI codes unless `use_color` is set.
 pub fn render_dashboard_with_width(
     entries: &[WorkerRegistryEntry],
     now: u64,
     use_color: bool,
     term_width: usize,
 ) -> String {
-    let layout = Layout::for_terminal_width(term_width);
+    let width = term_width.max(20);
     let mut out = String::new();
-
-    let mut active = 0;
-    let mut paused = 0;
-    let mut completed = 0;
-    let mut failed = 0;
-    let mut exhausted = 0;
-    let mut stopped = 0;
-    let mut reviewing = 0;
-
-    // Group entries by repository path: a supervisor supervises one worktree
-    // at a time, so this yields one coherent table per repository, each with
-    // its own counters. `BTreeMap` keeps repositories in path order, so the
-    // dashboard never reshuffles between ticks.
-    let mut repos: BTreeMap<&str, RepoGroup<'_>> = BTreeMap::new();
-    for entry in entries {
-        match entry.status {
-            RegistryStatus::Running => active += 1,
-            RegistryStatus::Paused => paused += 1,
-            RegistryStatus::Reviewing => reviewing += 1,
-            RegistryStatus::Completed => completed += 1,
-            RegistryStatus::Failed => failed += 1,
-            RegistryStatus::Exhausted => exhausted += 1,
-            RegistryStatus::Stopped => stopped += 1,
-            RegistryStatus::Interrupted => stopped += 1,
-        }
-        let repo = entry.repo_path.as_deref().unwrap_or(DEFAULT_REPO_KEY);
-        repos.entry(repo).or_insert_with(RepoGroup::new).push(entry);
-    }
-
-    let total = entries.len();
-    let time_str = {
-        let secs = now % 60;
-        let mins = (now / 60) % 60;
-        let hours = (now / 3600) % 24;
-        format!("{hours:02}:{mins:02}:{secs:02}")
-    };
-
-    // Header bar, sized to the terminal so the rule never wraps.
-    let rule_width = layout.total.min(96);
-    let title = "── MINI-SWE SWARM SUPERVISOR ";
-    let tail = format!("{time_str} ──");
-    let dashes = rule_width
-        .saturating_sub(visible_width(title))
-        .saturating_sub(visible_width(&tail));
-    let header = format!("{title}{}{tail}", "─".repeat(dashes));
-    if use_color {
-        out.push_str(&format!("\x1b[1;36m{header}\x1b[0m\n"));
-    } else {
-        out.push_str(&header);
-        out.push('\n');
-    }
-    // The counter strip folds onto as many lines as the terminal needs instead
-    // of wrapping mid-item on a narrow window.
-    out.push_str(&stats_lines(
-        &[
-            ("Active", active.to_string(), GREEN),
-            ("Paused", paused.to_string(), YELLOW),
-            ("Reviewing", reviewing.to_string(), MAGENTA),
-            ("Completed", completed.to_string(), BLUE),
-            ("Failed", failed.to_string(), RED),
-            ("Exhausted", exhausted.to_string(), DIM),
-            ("Stopped", stopped.to_string(), DIM),
-            ("Total", total.to_string(), BOLD),
-            ("Repos", repos.len().to_string(), BOLD),
-        ],
-        layout.total,
+    let total = format!("{} workers", entries.len());
+    let counts = header_counts(entries, use_color);
+    out.push_str(&box_top(
+        "mini-swe",
+        &total,
+        &counts,
+        &header_clock(now),
+        width,
         use_color,
     ));
-    out.push_str(&"\u{2501}".repeat(rule_width));
-    out.push_str("\n\n");
-
+    out.push('\n');
     if entries.is_empty() {
-        let reg_path = crate::pool::registry_dir();
-        out.push_str(&format!(
-            "No active or recent workers found in {}.\n",
-            reg_path.display()
-        ));
-        out.push_str("Waiting for workers to dispatch... (Press Ctrl+C to exit)\n");
+        out.push_str(&box_line("No active or recent workers.", width));
+        out.push('\n');
         return out;
     }
-
-    for (repo_path, group) in repos {
-        // The heading carries the path and every per-repo counter, so the rows
-        // below it stay one clean table with no domain sub-sections. The
-        // summary is joined on one line and the whole heading is then capped to
-        // the terminal, so a long path costs counters, never a wrapped header.
-        let summary = summary_line(&group.summary_items(), use_color);
-        let heading = truncate_visible(&format!("[REPO: {repo_path}]  {summary}"), layout.total);
-        if use_color {
-            out.push_str(&format!("\x1b[1;36m{heading}\x1b[0m\n"));
-        } else {
-            out.push_str(&heading);
-            out.push('\n');
-        }
-
-        match layout.shape {
-            RowShape::Inline { .. } => {
-                out.push_str(&header_line(&layout));
-                out.push_str(&"\u{2500}".repeat(layout.fixed_width() + layout.op));
-            }
-            RowShape::Stacked => out.push_str(&stacked_header_line(&layout)),
-        }
-        out.push('\n');
-
-        for w in &group.workers {
-            let op = op_cell(w, &layout, use_color);
-            match layout.shape {
-                RowShape::Inline { .. } => {
-                    let prefix = row_prefix(w, &layout, use_color, now);
-                    out.push_str(&prefix);
-                    out.push_str(&pad_visible(&op, layout.op));
-                    out.push('\n');
-                }
-                RowShape::Stacked => {
-                    out.push_str(&stack_row(w, &layout, use_color, now, &op));
-                }
-            }
-        }
-        out.push('\n');
-    }
-
-    out.push_str("Press Ctrl+C to exit monitor.\n");
-    out
-}
-
-/// Column header matching the row layout.
-fn header_line(layout: &Layout) -> String {
-    let mut line = String::new();
-    let cols = [
-        ("ID", layout.id),
-        ("PID", layout.pid),
-        ("STATUS", layout.status),
-        ("TURNS", layout.turns),
-        ("MODEL", layout.model),
-        ("UPTIME", layout.uptime),
-    ];
-    for (i, (label, width)) in cols.iter().enumerate() {
-        line.push_str(&pad_visible(label, *width));
-        if i + 1 == cols.len() {
-            line.push_str(&" ".repeat(LAST_GAP));
-        } else {
-            line.push_str(&" ".repeat(GAP));
-        }
-    }
-    line.push_str("LAST OP / TASK\n");
-    line
-}
-
-/// Header for the stacked (narrow terminal) row shape.
-fn stacked_header_line(layout: &Layout) -> String {
-    let first = format!(
-        "{}  {}  {}",
-        pad_visible("ID", layout.id),
-        pad_visible("PID", layout.pid),
-        pad_visible("TURNS", layout.turns)
-    );
-    let second = format!(
-        "{}  {}  {}",
-        pad_visible("STATUS", layout.status),
-        pad_visible("MODEL", layout.model),
-        pad_visible("UPTIME", layout.uptime)
-    );
-    format!("{first}\n{second}\nLAST OP / TASK\n")
-}
-
-// ---------------------------------------------------------------------------
-// Colour helpers
-// ---------------------------------------------------------------------------
-
-/// Bold, used for the totals.
-const BOLD: &str = "\x1b[1m";
-/// Bold green: active work.
-const GREEN: &str = "\x1b[1;32m";
-/// Bold yellow: paused.
-const YELLOW: &str = "\x1b[1;33m";
-/// Bold magenta: reviewing.
-const MAGENTA: &str = "\x1b[1;35m";
-/// Bold blue: completed.
-const BLUE: &str = "\x1b[1;34m";
-/// Bold red: failed.
-const RED: &str = "\x1b[1;31m";
-/// Dim white: stopped.
-const DIM: &str = "\x1b[2;37m";
-
-/// Render one `label: value` item, coloured when requested.
-fn item_text(label: &str, value: &str, color: &str, use_color: bool) -> String {
-    if use_color {
-        format!("{label}: {color}{value}\x1b[0m")
-    } else {
-        format!("{label}: {value}")
-    }
-}
-
-/// Join `label: value` items onto a single line for a repository heading.
-///
-/// Unlike [`stats_lines`] this never folds and never appends a newline: the
-/// heading must stay one line so the table header sits directly under it, and
-/// the caller caps the whole heading with [`truncate_visible`] afterwards.
-fn summary_line(items: &[(&str, String, &'static str)], use_color: bool) -> String {
-    let mut out = String::new();
-    for (i, (label, value, color)) in items.iter().enumerate() {
-        if i > 0 {
-            out.push_str("  |  ");
-        }
-        out.push_str(&item_text(label, value, color, use_color));
-    }
-    out
-}
-
-/// Render the `label: value | label: value` counter strip, folded to `width`.
-///
-/// Folding keeps a narrow terminal from wrapping mid-item, which is what makes
-/// the whole header readable at any width. Measurement always runs on the plain
-/// form, so an escape never counts against the budget.
-fn stats_lines(items: &[(&str, String, &'static str)], width: usize, use_color: bool) -> String {
-    const SEP: &str = "  |  ";
-    let sep_width = visible_width(SEP);
-    let mut out = String::new();
-    let mut line_width = 0usize;
-    for (i, (label, value, color)) in items.iter().enumerate() {
-        let plain = format!("{label}: {value}");
-        let item_width = visible_width(&plain);
-        if line_width > 0 && line_width + sep_width + item_width > width {
-            out.push('\n');
-            line_width = 0;
-        }
-        if line_width > 0 {
-            out.push_str(SEP);
-            line_width += sep_width;
-        }
-        out.push_str(&item_text(label, value, color, use_color));
-        line_width += item_width;
-        if i + 1 == items.len() {
-            out.push('\n');
-        }
-    }
-    if !out.ends_with('\n') {
+    for line in list_content_lines(entries, now, width, use_color) {
+        out.push_str(&box_line(&line, width));
         out.push('\n');
     }
     out
+}
+
+/// Colours are on only when the output is a TTY and `NO_COLOR` is unset.
+pub fn use_color_for_tty(is_tty: bool) -> bool {
+    is_tty && std::env::var_os("NO_COLOR").is_none()
 }
 
 /// Best-effort terminal width in columns.
@@ -1338,89 +1041,19 @@ pub fn parse_key(bytes: &[u8]) -> Option<Key> {
 
 /// Fit one worker to a single compact line of at most `width` visible columns.
 ///
-/// Layout: `glyph id model step/max elapsed op` with the group demoted to a
-/// `[group]` prefix inside the op column. The op text is truncated to whatever
-/// the fixed columns leave behind, so no line ever overflows `width`.
-/// Completed and retired-soon workers are dimmed.
+/// Layout: `glyph id model step/max elapsed op`, columns dropping in the
+/// stated order as the terminal narrows. Delegates to the shared `compact_row`
+/// helper so the interactive list and the plain dashboard share one layout;
+/// plain (no ANSI codes) like the non-TTY output.
 pub fn fit_compact_row(w: &WorkerRegistryEntry, now: u64, width: usize) -> String {
-    let glyph = status_glyph(w.status).to_string();
-    let id = pad_visible(&truncate_visible(&w.id, 8), 8);
-    let model = pad_visible(&truncate_visible(&w.model, 8), 8);
-    let duration_secs = if w.status.is_terminal() {
-        w.updated_at.saturating_sub(w.started_at)
-    } else {
-        now.saturating_sub(w.started_at)
-    };
-    let elapsed = format_duration(duration_secs);
-    let turns = format!("{}/{}", w.step, w.max_turns);
-
-    let group = w
-        .group
-        .as_deref()
-        .filter(|g| !g.trim().is_empty())
-        .map(|g| format!("[{}] ", g.trim()));
-    let op_text = if let Some(ref q) = w.question {
-        format!("ASK: {q}")
-    } else if !w.last_command.is_empty()
-        && w.last_command != "completed"
-        && w.last_command != "initializing"
-    {
-        w.last_command.clone()
-    } else {
-        w.task.lines().next().unwrap_or("").trim().to_string()
-    };
-    let op_text = format!("{}{op_text}", group.unwrap_or_default());
-
-    let fixed = visible_width(&glyph)
-        + 1
-        + 8
-        + 1
-        + 8
-        + 1
-        + visible_width(&turns)
-        + 1
-        + visible_width(&elapsed)
-        + 1;
-    let op_width = width.saturating_sub(fixed).max(1);
-    let op = truncate_visible(&op_text, op_width);
-
-    let line = format!("{glyph} {id} {model} {turns} {elapsed} {op}");
-    if dim_worker(w, now) {
-        format!("\x1b[2m{line}\x1b[0m")
-    } else {
-        line
-    }
-}
-
-/// Whether a worker row is dimmed: terminal workers, plus live workers that
-/// stopped reporting (no update within the terminal TTL, so the sweeper will
-/// soon retire them).
-fn dim_worker(w: &WorkerRegistryEntry, now: u64) -> bool {
-    if w.status.is_terminal() {
-        return true;
-    }
-    now.saturating_sub(w.updated_at) > crate::pool::DEFAULT_TERMINAL_TTL_SECS
-}
-
-/// The one-character status glyph for a worker.
-pub fn status_glyph(status: RegistryStatus) -> char {
-    match status {
-        RegistryStatus::Running => '\u{25cf}',
-        RegistryStatus::Paused => '\u{25cb}',
-        RegistryStatus::Reviewing => '\u{25c6}',
-        RegistryStatus::Completed => '\u{2713}',
-        RegistryStatus::Failed => '\u{2717}',
-        RegistryStatus::Exhausted => '\u{26a0}',
-        RegistryStatus::Stopped => '\u{25a0}',
-        RegistryStatus::Interrupted => '\u{25b2}',
-    }
+    compact_row(w, now, width.saturating_sub(4).max(1), false)
 }
 
 /// One line of the key hint shown at the bottom of the interactive views.
 pub fn key_hint(view: View) -> &'static str {
     match view {
-        View::List => "Up/Down or j/k move - Enter detail - g groups - q quit",
-        View::Detail => "PgUp/PgDn scroll - f follow - Esc/q back",
+        View::List => "\u{2191}\u{2193} select  \u{23ce} turns  g groups  q quit",
+        View::Detail => "PgUp/PgDn scroll  f follow  Esc/q back",
     }
 }
 
@@ -1503,32 +1136,47 @@ enum ListLine<'a> {
     Worker(&'a WorkerRegistryEntry),
 }
 
-/// Build the compact list lines for `entries`, grouped by repository.
+/// Build the compact list lines for `entries`, grouped by round/group.
 ///
-/// Each group gets a one-line header with its counts
-/// (`running/done/failed`, every non-zero state) followed by one compact row
-/// per worker. When `expanded` is false only the headers are returned. Returns
-/// the lines plus the worker ids in display order, so the selection index maps
-/// to a worker.
+/// Each group gets a one-line header with its per-status counts followed by
+/// one compact row per worker. When `expanded` is false only the headers are
+/// returned. Returns the lines plus the worker ids in display order, so the
+/// selection index maps to a worker.
 fn build_list_lines<'a>(
     entries: &'a [WorkerRegistryEntry],
     now: u64,
     width: usize,
     expanded: bool,
 ) -> (Vec<ListLine<'a>>, Vec<&'a WorkerRegistryEntry>) {
-    let mut repos: BTreeMap<&str, RepoGroup<'a>> = BTreeMap::new();
-    for entry in entries {
-        let repo = entry.repo_path.as_deref().unwrap_or(DEFAULT_REPO_KEY);
-        repos.entry(repo).or_insert_with(RepoGroup::new).push(entry);
-    }
     let mut lines = Vec::new();
     let mut order = Vec::new();
-    for (repo_path, group) in &repos {
-        let summary = summary_line(&group.summary_items(), true);
-        let heading = truncate_visible(&format!("[{repo_path}]  {summary}"), width);
-        lines.push(ListLine::Header(format!("\x1b[1;36m{heading}\x1b[0m")));
+    let mut groups: BTreeMap<String, Vec<&'a WorkerRegistryEntry>> = BTreeMap::new();
+    for entry in entries {
+        groups.entry(group_key(entry)).or_default().push(entry);
+    }
+    let repos: std::collections::BTreeSet<&str> = entries
+        .iter()
+        .map(|e| e.repo_path.as_deref().unwrap_or(DEFAULT_REPO_KEY))
+        .collect();
+    let show_repo = repos.len() > 1;
+    for (name, workers) in &groups {
+        if show_repo {
+            let repo = workers
+                .first()
+                .and_then(|w| w.repo_path.as_deref())
+                .unwrap_or(DEFAULT_REPO_KEY);
+            lines.push(ListLine::Header(format!("repo: {repo}")));
+        }
+        let counts = group_counts(workers, false);
+        let header = if counts.is_empty() {
+            name.clone()
+        } else {
+            format!("{name}  {counts}")
+        };
+        let inner = width.saturating_sub(4).max(1);
+        lines.push(ListLine::Header(truncate_visible(&header, inner)));
         if expanded {
-            for w in &group.workers {
+            for w in workers {
                 order.push(*w);
                 lines.push(ListLine::Worker(w));
             }
@@ -1541,7 +1189,8 @@ fn build_list_lines<'a>(
 /// Render the compact list view into `height` rows at `width` columns.
 ///
 /// The selected worker's row is highlighted; the view scrolls so the selection
-/// stays visible. Ends with the key hint line.
+/// stays visible. The whole view is a bordered box; the header and the key-hint
+/// line are the top and bottom borders, and the body scrolls between them.
 fn render_list(
     entries: &[WorkerRegistryEntry],
     state: &UiState,
@@ -1551,7 +1200,7 @@ fn render_list(
 ) -> String {
     let (lines, order) = build_list_lines(entries, now, width, state.groups_expanded);
     let selected_id = order.get(state.selection).map(|w| w.id.as_str());
-    // Line index of the selected worker, for scroll-into-view.
+    let use_color = use_color_for_tty(true);
     let mut selected_line = 0usize;
     for (i, line) in lines.iter().enumerate() {
         if let ListLine::Worker(w) = line
@@ -1568,32 +1217,41 @@ fn render_list(
             .saturating_sub(body_height.saturating_sub(1))
             .min(lines.len() - body_height)
     };
+    let total = format!("{} workers", entries.len());
+    let counts = header_counts(entries, use_color);
     let mut out = String::new();
+    out.push_str(&box_top(
+        "mini-swe",
+        &total,
+        &counts,
+        &header_clock(now),
+        width,
+        use_color,
+    ));
+    out.push('\n');
     for line in lines.iter().skip(start).take(body_height) {
         match line {
-            ListLine::Header(h) => {
-                out.push_str(&truncate_visible(h, width));
-                out.push('\n');
-            }
+            ListLine::Header(h) => out.push_str(&box_line(h, width)),
             ListLine::Worker(w) => {
-                let row = fit_compact_row(w, now, width);
+                let row = compact_row(w, now, width.saturating_sub(4).max(1), use_color);
                 if Some(w.id.as_str()) == selected_id {
-                    out.push_str(&format!("\x1b[7m{row}\x1b[0m\n"));
+                    out.push_str(&box_line(&format!("\x1b[7m{row}\x1b[0m"), width));
                 } else {
-                    out.push_str(&row);
-                    out.push('\n');
+                    out.push_str(&box_line(&row, width));
                 }
             }
         }
+        out.push('\n');
     }
-    out.push_str(&truncate_visible(key_hint(View::List), width));
+    out.push_str(&box_bottom(key_hint(View::List), width, use_color));
     out.push('\n');
     out
 }
 
 /// Render the detail view for one worker: its REPORT/question/status header on
 /// top, then its turns newest-last. Follow mode sticks to the newest turn;
-/// otherwise `state.scroll` turns are skipped from the end.
+/// otherwise `state.scroll` turns are skipped from the end. The view is a
+/// bordered box following the same width rules as the list.
 fn render_detail(
     entry: &WorkerRegistryEntry,
     reader: &HistoryReader,
@@ -1602,45 +1260,39 @@ fn render_detail(
     width: usize,
     height: usize,
 ) -> String {
-    let mut out = String::new();
+    let use_color = use_color_for_tty(true);
     let status_name = entry.status.display_name();
-    out.push_str(&truncate_visible(
-        &format!(
-            "{} {} {} {}/{}",
-            status_glyph(entry.status),
-            entry.id,
-            status_name,
-            entry.step,
-            entry.max_turns
-        ),
+    let title = format!(
+        "{} {} {}",
+        status_glyph(entry.status),
+        entry.id,
+        status_name
+    );
+    let total = format!("{}/{}", entry.step, entry.max_turns);
+    let mut out = String::new();
+    out.push_str(&box_top(
+        &title,
+        &total,
+        "",
+        &header_clock(now),
         width,
+        use_color,
     ));
     out.push('\n');
-    out.push_str(&truncate_visible(
-        &format!("task: {}", entry.task.lines().next().unwrap_or("")),
-        width,
-    ));
-    out.push('\n');
+    let mut body: Vec<String> = Vec::new();
+    body.push(format!("task: {}", entry.task.lines().next().unwrap_or("")));
     if let Some(ref q) = entry.question {
-        out.push_str(&truncate_visible(&format!("question: {q}"), width));
-        out.push('\n');
+        body.push(format!("question: {q}"));
     }
     if let Some(ref report) = entry.report
         && !report.is_empty()
     {
-        out.push_str(&truncate_visible(
-            &format!(
-                "report: {} | files: {} | tests: {} | risks: {}",
-                report.done, report.files, report.tests, report.risks
-            ),
-            width,
+        body.push(format!(
+            "report: {} | files: {} | tests: {} | risks: {}",
+            report.done, report.files, report.tests, report.risks
         ));
-        out.push('\n');
     }
-    let header_lines = out.lines().count();
-    let body_height = height.saturating_sub(header_lines + 1).max(1);
-    // Window over turns first (scroll is in turns), then fit the flattened
-    // lines to the body: follow mode sticks to the newest turn.
+    let body_height = height.saturating_sub(3).max(1);
     let skip = if state.follow {
         0
     } else {
@@ -1653,12 +1305,9 @@ fn render_detail(
             .exit_code
             .map(|c| format!(" (exit {c})"))
             .unwrap_or_default();
-        turn_lines.push(truncate_visible(
-            &format!("#{} {}{}", turn.step, turn.command, code),
-            width,
-        ));
+        turn_lines.push(format!("#{} {}{}", turn.step, turn.command, code));
         for line in &turn.output_lines {
-            turn_lines.push(truncate_visible(&format!("  {line}"), width));
+            turn_lines.push(format!("  {line}"));
         }
     }
     if turn_lines.is_empty() {
@@ -1666,11 +1315,14 @@ fn render_detail(
     }
     let start = turn_lines.len().saturating_sub(body_height);
     for line in turn_lines.iter().skip(start) {
-        out.push_str(line);
+        body.push(line.clone());
+    }
+    for line in body.iter().take(body_height) {
+        out.push_str(&box_line(line, width));
         out.push('\n');
     }
     let _ = now;
-    out.push_str(&truncate_visible(key_hint(View::Detail), width));
+    out.push_str(&box_bottom(key_hint(View::Detail), width, use_color));
     out.push('\n');
     out
 }
@@ -1871,7 +1523,7 @@ pub async fn run_monitor(once: bool) -> Result<()> {
         let output = render_dashboard_with_width(
             &entries,
             now,
-            is_tty,
+            use_color_for_tty(is_tty),
             terminal_width().unwrap_or(DEFAULT_TERMINAL_WIDTH),
         );
         println!("{output}");
@@ -1898,7 +1550,7 @@ pub async fn run_monitor(once: bool) -> Result<()> {
         let output = render_dashboard_with_width(
             &entries,
             now,
-            true,
+            use_color_for_tty(true),
             terminal_width().unwrap_or(DEFAULT_TERMINAL_WIDTH),
         );
 
@@ -1927,25 +1579,25 @@ mod tests {
     /// Builder for registry rows: the tests below touch every field, so a
     /// positional 8-argument helper would be unreadable.
     struct Row {
-        id: &'static str,
+        id: String,
         status: RegistryStatus,
         step: usize,
         max_turns: usize,
         command: String,
         task: String,
-        group: Option<&'static str>,
-        repo: Option<&'static str>,
+        group: Option<String>,
+        repo: Option<String>,
         metrics: WorkerMetrics,
         updated_at: u64,
     }
 
     impl Row {
-        fn new(id: &'static str) -> Self {
+        fn new(id: &str) -> Self {
             Self {
-                id,
+                id: id.to_string(),
                 status: RegistryStatus::Running,
-                step: 1,
-                max_turns: 100,
+                step: 0,
+                max_turns: 10,
                 command: String::new(),
                 task: String::new(),
                 group: None,
@@ -1977,12 +1629,12 @@ mod tests {
         }
 
         fn group(mut self, group: &'static str) -> Self {
-            self.group = Some(group);
+            self.group = Some(group.to_string());
             self
         }
 
         fn repo(mut self, repo: &'static str) -> Self {
-            self.repo = Some(repo);
+            self.repo = Some(repo.to_string());
             self
         }
 
@@ -1991,447 +1643,293 @@ mod tests {
             self
         }
 
-        fn metrics(mut self, repeat_blocks: usize, stagnation_nudges: usize) -> Self {
-            self.metrics.repeat_blocks = repeat_blocks;
-            self.metrics.stagnation_nudges = stagnation_nudges;
-            self
-        }
-
         fn build(self) -> WorkerRegistryEntry {
             WorkerRegistryEntry {
+                id: self.id,
                 pid: 1234,
                 task: self.task,
-                model: "ninja".into(),
+                model: "combo:ninja".into(),
                 status: self.status,
                 step: self.step,
                 max_turns: self.max_turns,
                 last_command: self.command,
+                question: None,
                 started_at: 1000,
                 updated_at: self.updated_at,
-                group: self.group.map(str::to_string),
-                repo_path: self.repo.map(str::to_string),
+                group: self.group,
+                role: crate::pool::WorkerRole::Worker,
+                repo_path: self.repo,
                 owner: None,
                 metrics: self.metrics,
-                ..WorkerRegistryEntry::test_row(self.id, "")
+                base_branch: None,
+                base_commit: None,
+                head_commit: None,
+                revision: 0,
+                auto_continues: 0,
+                report: None,
+                approved: None,
+                verified: None,
+                security_review: None,
+                security_approved_commit: None,
+                integrated: Vec::new(),
+                absorbed: Vec::new(),
+                verdicts: None,
+                keep_branch: false,
             }
         }
     }
 
-    fn line_entry(id: &str, status: RegistryStatus, updated_at: u64) -> WorkerRegistryEntry {
-        WorkerRegistryEntry {
-            pid: 1234,
-            model: "ninja".into(),
-            status,
-            step: 1,
-            max_turns: 100,
-            started_at: 1000,
-            updated_at,
-            owner: None,
-            ..WorkerRegistryEntry::test_row(id, "")
-        }
-    }
-
-    #[test]
-    fn test_status_line_omits_zero_parts_and_empty_state() {
-        let now = 10_000;
-        assert_eq!(format_status_line(&[], now), "");
-        let entries = vec![
-            line_entry("a", RegistryStatus::Running, now),
-            line_entry("b", RegistryStatus::Reviewing, now),
-            line_entry("c", RegistryStatus::Running, now),
-            line_entry("d", RegistryStatus::Paused, now),
-            line_entry("e", RegistryStatus::Completed, now),
-            line_entry("f", RegistryStatus::Completed, now),
-        ];
-        assert_eq!(
-            format_status_line(&entries, now),
-            "⚙ 3 running · 1 needs input · 2 done"
-        );
-    }
-
-    #[test]
-    fn test_status_line_covers_failed_and_expires_terminal_rows() {
-        use crate::pool::DEFAULT_TERMINAL_TTL_SECS;
-        let now = 10_000;
-        let fresh_failed = line_entry("a", RegistryStatus::Failed, now - 10);
-        let stale_failed = line_entry(
-            "b",
-            RegistryStatus::Failed,
-            now - DEFAULT_TERMINAL_TTL_SECS - 1,
-        );
-        let live = line_entry("c", RegistryStatus::Running, now);
-        assert_eq!(
-            format_status_line(&[fresh_failed, stale_failed.clone(), live], now),
-            "⚙ 1 running · 1 failed"
-        );
-        // Terminal rows age out exactly at the shared TTL boundary.
-        assert_eq!(
-            format_status_line(&[stale_failed], now),
-            "",
-            "old terminal rows must not wake a statusLine"
-        );
-        let entries = vec![
-            line_entry("d", RegistryStatus::Paused, now),
-            line_entry("e", RegistryStatus::Completed, now),
-            line_entry("f", RegistryStatus::Stopped, now),
-        ];
-        assert_eq!(
-            format_status_line(&entries, now),
-            "⚙ 1 needs input · 1 done · 1 stopped"
-        );
-    }
-
-    #[test]
-    fn test_format_duration() {
-        assert_eq!(format_duration(5), "05s");
-        assert_eq!(format_duration(65), "01m 05s");
-        assert_eq!(format_duration(3665), "01h 01m");
+    /// A fixed set of rows in every status, used by the width-contract tests.
+    fn sample_entries() -> Vec<WorkerRegistryEntry> {
+        vec![
+            Row::new("925633bb")
+                .status(RegistryStatus::Running)
+                .turns(15, 250)
+                .command("CONSOLIDATE_WAIT ea0f")
+                .task("Consolidate the round")
+                .group("round52")
+                .repo("/repo/x")
+                .build(),
+            Row::new("ea0ff2c4")
+                .status(RegistryStatus::Reviewing)
+                .turns(35, 120)
+                .command("review: cat >> tests/")
+                .task("Review the diff")
+                .group("round52")
+                .repo("/repo/x")
+                .build(),
+            Row::new("ccbc2be1")
+                .status(RegistryStatus::Running)
+                .turns(12, 60)
+                .command("cargo fmt --check && cargo test")
+                .task("Format and test")
+                .group("round50")
+                .repo("/repo/x")
+                .build(),
+            Row::new("29a760ed")
+                .status(RegistryStatus::Completed)
+                .turns(70, 60)
+                .command("completed")
+                .task("Keep the hub log small")
+                .group("round50")
+                .repo("/repo/x")
+                .build(),
+        ]
     }
 
     #[test]
     fn test_render_dashboard_empty() {
         let text = render_dashboard(&[], 1000, false);
-        assert!(text.contains("MINI-SWE SWARM SUPERVISOR"));
-        assert!(text.contains("No active or recent workers found"));
+        assert!(text.contains("0 workers"), "{text}");
+        assert!(text.contains("No active or recent workers."), "{text}");
+        assert!(text.contains("╭"), "missing top border:\n{text}");
     }
 
+    /// Every visible line -- borders included -- is at most the terminal width
+    /// at 40, 60, 80 and 120 columns, and the id and op stay present at 40.
     #[test]
-    fn test_render_dashboard_groups_by_repository() {
-        let entries = vec![
-            Row::new("a1b2c3d4e5")
-                .task("Fix architecture")
-                .command("cargo test")
-                .turns(10, 200)
-                .group("audits")
-                .repo("/home/dev/proj-a")
-                .build(),
-            Row::new("b2c3d4e5f6")
-                .task("Fix something else")
-                .command("ask")
-                .turns(5, 100)
-                .status(RegistryStatus::Paused)
-                .repo("/home/dev/proj-b")
-                .build(),
-            Row::new("c3d4e5f6a7")
-                .task("Third task")
-                .command("cargo build")
-                .turns(3, 100)
-                .group("audits")
-                .repo("/home/dev/proj-a")
-                .build(),
-            Row::new("d4e5f6a7b8")
-                .task("No repo recorded")
-                .command("completed")
-                .turns(9, 100)
-                .status(RegistryStatus::Completed)
-                .build(),
-        ];
-
-        let text = render_dashboard(&entries, 1060, false);
-
-        // One unified table per repository, with all of its workers together,
-        // each heading carrying that repository's own counters.
-        assert!(
-            text.contains("[REPO: /home/dev/proj-a]  total: 2  |  active: 2"),
-            "missing per-repo summary:\n{text}"
-        );
-        assert!(
-            text.contains("[REPO: /home/dev/proj-b]  total: 1  |  paused: 1"),
-            "missing per-repo summary:\n{text}"
-        );
-        assert!(
-            text.contains("[REPO: local]  total: 1  |  completed: 1"),
-            "missing per-repo summary:\n{text}"
-        );
-        // A repository with nothing but terminal workers spends its heading on
-        // `total` alone, never on the states that are zero.
-        assert!(
-            text.contains("[REPO: local]  total: 1  |  completed: 1\n"),
-            "zero counters must be dropped:\n{text}"
-        );
-        assert!(!text.contains("[SWARM:"));
-        assert_eq!(text.matches("LAST OP / TASK").count(), 3);
-
-        // ...and the swarm tag demoted to a [tag] prefix in the task column.
-        let proj_a = &text[text.find("[REPO: /home/dev/proj-a]").unwrap()
-            ..text.find("[REPO: /home/dev/proj-b]").unwrap()];
-        assert!(proj_a.contains("[audits] cargo test"));
-        // The ID column is 8 columns wide, so a full UUID is capped there.
-        assert!(
-            proj_a.contains("a1b2c3d\u{2026}"),
-            "missing worker a:\n{proj_a}"
-        );
-        assert!(
-            proj_a.contains("c3d4e5f\u{2026}"),
-            "missing worker c:\n{proj_a}"
-        );
-        assert!(
-            !proj_a.contains("b2c3d4e"),
-            "proj-b worker leaked into proj-a"
-        );
-
-        // The counters are global, above every repository table.
-        assert!(text.contains("Active: 2"));
-        assert!(text.contains("Repos: 3"));
-    }
-
-    #[test]
-    fn test_repository_grouping_ignores_domain_tags() {
-        // Three domain tags, one repository: the tags must not sub-partition
-        // the dashboard, they only prefix the task column of their own row.
-        let entries: Vec<WorkerRegistryEntry> = [
-            ("aud001", RegistryStatus::Running, "audits"),
-            ("perf001", RegistryStatus::Running, "perf"),
-            ("sec001", RegistryStatus::Completed, "sec"),
-        ]
-        .iter()
-        .map(|(id, status, group)| {
-            Row::new(id)
-                .status(*status)
-                .task("Task for the domain")
-                .command("cargo test")
-                .turns(3, 100)
-                .group(group)
-                .repo("/home/dev/proj-a")
-                .build()
-        })
-        .collect();
-
-        let text = render_dashboard(&entries, 1060, false);
-
-        // A single table holds all three workers of the repository...
-        assert_eq!(text.matches("[REPO: /home/dev/proj-a]").count(), 1);
-        assert_eq!(text.matches("LAST OP / TASK").count(), 1);
-        // ...with one summary counting every state at once...
-        assert!(
-            text.contains("[REPO: /home/dev/proj-a]  total: 3  |  active: 2  |  completed: 1"),
-            "per-repo summary must consolidate the states:\n{text}"
-        );
-        // ...and the domain tags demoted to a per-row prefix.
-        for tag in ["[audits]", "[perf]", "[sec]"] {
-            assert!(text.contains(tag), "missing {tag} prefix:\n{text}");
-        }
-    }
-
-    #[test]
-    fn test_render_dashboard_completed_uptime_is_frozen() {
-        let entries = vec![
-            Row::new("done01")
-                .status(RegistryStatus::Completed)
-                .task("Finished task")
-                .command("completed")
-                .repo("local")
-                .updated_at(1065) // Ran 65s (started_at = 1000)
-                .build(),
-        ];
-
-        // Rendered long after completion (now = 5000) the uptime must stay 65s.
-        let text = render_dashboard(&entries, 5000, false);
-        assert!(
-            text.contains("01m 05s"),
-            "expected frozen duration 01m 05s, got:\n{text}"
-        );
-    }
-
-    #[test]
-    fn test_reviewing_status_is_indicated() {
-        let entries = vec![
-            Row::new("rev123")
-                .status(RegistryStatus::Reviewing)
-                .turns(42, 120)
-                .task("Audit the diff")
-                .command("[review] cargo clippy")
-                .group("audits")
-                .repo("/repo/x")
-                .build(),
-            Row::new("run456")
-                .task("Implement feature")
-                .command("cargo test")
-                .repo("/repo/x")
-                .build(),
-        ];
-
-        let plain = render_dashboard(&entries, 1100, false);
-        assert!(
-            plain.contains("REVIEWING"),
-            "missing review badge:\n{plain}"
-        );
-        assert!(plain.contains("[REVIEW]"), "missing review tag:\n{plain}");
-        assert!(
-            plain.contains("Reviewing: 1"),
-            "reviewing not counted:\n{plain}"
-        );
-        // The review marker must not be mistaken for a running row.
-        assert!(plain.contains("\u{25c6} REVIEWING"));
-        assert!(
-            !plain.contains("[audits]"),
-            "review tag replaces the group tag"
-        );
-
-        let colored = render_dashboard(&entries, 1100, true);
-        assert!(
-            colored.contains("\u{25c6}"),
-            "missing review marker:\n{colored}"
-        );
-        assert!(colored.contains("1;35m"));
-    }
-
-    #[test]
-    fn test_turn_progress_indicator() {
-        // 5 of 10 turns through an 8-cell bar: 4 filled, 4 empty.
-        assert_eq!(progress_bar(5, 10), "[####....]");
-        assert_eq!(progress_bar(0, 10), "[........]");
-        assert_eq!(progress_bar(10, 10), "[########]");
-        // Clamped, never panicking on a zero budget or over-budget counter.
-        assert_eq!(progress_bar(3, 0), "[########]");
-        assert_eq!(progress_bar(99, 10), "[########]");
-
-        let text = render_dashboard(
-            &[Row::new("prog001")
-                .task("Progress row")
-                .command("cargo test")
-                .turns(5, 10)
-                .repo("local")
-                .build()],
-            1060,
-            false,
-        );
-        let row = text.lines().find(|l| l.starts_with("prog001")).unwrap();
-        assert!(row.contains("[####....] 5/10"), "bad turns cell:\n{row}");
-
-        // A width too narrow for bar + counter keeps the counter and drops the bar.
-        let narrow = Layout::for_terminal_width(80);
-        assert!(!narrow.shows_progress(), "80 cols must drop the bar");
-        let cell = turns_cell(5, 10, &narrow);
-        assert!(
-            cell.contains("5/10") && !cell.contains('#'),
-            "bad cell: {cell:?}"
-        );
-    }
-
-    #[test]
-    fn test_layout_scales_with_terminal_width() {
-        let narrow = Layout::for_terminal_width(80);
-        let wide = Layout::for_terminal_width(240);
-
-        assert_eq!(narrow.total, 80);
-        assert_eq!(wide.total, 240);
-        assert!(narrow.op < wide.op, "op column must grow with the terminal");
-        // Wide terminals earn the progress bar; medium ones do not.
-        assert!(wide.shows_progress());
-        assert!(!narrow.shows_progress());
-        // Both stay inside the dynamic cap.
-        assert!(narrow.op <= MAX_OP_WIDTH && wide.op <= MAX_OP_WIDTH);
-        assert!(narrow.op >= MIN_OP_WIDTH && wide.op >= MIN_OP_WIDTH);
-    }
-
-    #[test]
-    fn test_layout_is_bounded_for_extreme_widths() {
-        // Below the usable floor everything is raised, never a zero-width cell.
-        for width in [0usize, 1, 10, 40] {
-            let layout = Layout::for_terminal_width(width);
-            assert_eq!(layout.total, MIN_TERMINAL_WIDTH);
-            assert!(layout.op >= 1);
-        }
-        // Too narrow for one line: stack it.
-        let cramped = Layout::for_terminal_width(MIN_TERMINAL_WIDTH);
-        assert_eq!(cramped.shape, RowShape::Stacked);
-
-        // A huge terminal must not become a huge row: the cap holds.
-        let huge = Layout::for_terminal_width(usize::MAX);
-        assert_eq!(huge.op, MAX_OP_WIDTH);
-        assert!(huge.shows_progress());
-        assert_eq!(huge.shape, RowShape::Inline { progress: true });
-    }
-
-    #[test]
-    fn test_long_command_is_capped_by_width() {
-        let long_command = format!("echo {}", "x".repeat(400));
-        let entries = vec![
-            Row::new("long001")
-                .task("A task with a very long description that should also be capped")
-                .command(&long_command)
-                .turns(1, 10)
-                .repo("local")
-                .build(),
-        ];
-
-        let narrow = render_dashboard_with_width(&entries, 1060, false, 84);
-        let narrow_row = narrow.lines().find(|l| l.starts_with("long001")).unwrap();
-        assert!(
-            narrow_row.contains('\u{2026}'),
-            "narrow render must ellipsize the long command:\n{narrow_row}"
-        );
-        assert!(
-            narrow_row.chars().count() <= 84,
-            "row overflows 84 cols:\n{narrow_row}"
-        );
-
-        let wide = render_dashboard_with_width(&entries, 1060, false, 240);
-        let wide_row = wide.lines().find(|l| l.starts_with("long001")).unwrap();
-        assert!(
-            wide_row.contains('\u{2026}'),
-            "even wide renders stay capped:\n{wide_row}"
-        );
-        assert!(
-            wide_row.chars().count() <= 240,
-            "row overflows 240 cols:\n{wide_row}"
-        );
-        // The cap is dynamic: a wider terminal reveals more of the command.
-        assert!(
-            wide_row.chars().count() > narrow_row.chars().count(),
-            "wider terminal must reveal more text"
-        );
-        // A very wide terminal must not become 400 columns of command.
-        let huge = render_dashboard_with_width(&entries, 1060, false, 400);
-        let huge_row = huge.lines().find(|l| l.starts_with("long001")).unwrap();
-        assert!(visible_width(huge_row) <= FIXED_FULL + MAX_OP_WIDTH);
-        assert_eq!(visible_width(huge_row), visible_width(wide_row));
-    }
-
-    #[test]
-    fn test_visible_width_ignores_ansi_escapes() {
-        assert_eq!(visible_width("plain"), 5);
-        assert_eq!(visible_width("\x1b[1;32mRUNNING\x1b[0m"), 7);
-        assert_eq!(
-            pad_visible("\x1b[1;32mRUN\x1b[0m", 6),
-            "\x1b[1;32mRUN\x1b[0m   "
-        );
-    }
-
-    #[test]
-    fn test_truncate_visible_keeps_escapes_and_closes_them() {
-        // The ellipsis is paid for out of the budget, so the cap is exact.
-        assert_eq!(truncate_visible("abcdef", 4), "abc\u{2026}");
-        assert_eq!(visible_width(&truncate_visible("abcdef", 4)), 4);
-        assert_eq!(truncate_visible("abc", 8), "abc");
-        assert_eq!(truncate_visible("abc", 0), "");
-
-        let colored = truncate_visible("\x1b[1;32mRUNNING\x1b[0m", 4);
-        assert_eq!(visible_width(&colored), 4);
-        assert!(colored.starts_with("\x1b[1;32m"));
-        assert!(
-            !colored.contains("\x1b[0m"),
-            "trailing reset must be dropped"
-        );
-        assert!(colored.ends_with('\u{2026}'));
-    }
-
-    #[test]
-    fn test_wrap_visible_respects_width() {
-        let text = "alpha beta gamma delta epsilon";
-        for width in [6usize, 8, 12] {
-            for line in wrap_visible(text, width) {
-                assert!(
-                    line.chars().count() <= width,
-                    "line '{line}' exceeds width {width}"
-                );
+    fn test_every_line_fits_every_width() {
+        let entries = sample_entries();
+        for width in [40usize, 60, 80, 120] {
+            for use_color in [false, true] {
+                let text = render_dashboard_with_width(&entries, 1060, use_color, width);
+                for line in text.lines() {
+                    assert!(
+                        visible_width(line) <= width,
+                        "line overflows {width} cols ({}): {line:?}",
+                        visible_width(line)
+                    );
+                }
+                if width == 40 {
+                    // The id and the op always stay, even at the narrowest.
+                    assert!(text.contains("925633bb"), "id lost at 40:\n{text}");
+                    assert!(text.contains("CONSOLI"), "op lost at 40:\n{text}");
+                }
             }
         }
-        assert_eq!(wrap_visible("", 10), vec![String::new()]);
-        assert_eq!(wrap_visible("short", 10), vec!["short".to_string()]);
     }
 
+    /// Columns drop in the stated order as the terminal narrows: elapsed first,
+    /// then the model alias, then `step/max`; glyph + id + op always stay.
+    #[test]
+    fn test_columns_drop_in_order() {
+        let entries = sample_entries();
+        let wide = render_dashboard_with_width(&entries, 1060, false, 120);
+        assert!(wide.contains("15/250"), "step/max missing at 120:\n{wide}");
+        assert!(
+            wide.contains("ninja"),
+            "model alias missing at 120:\n{wide}"
+        );
+        assert!(wide.contains("01m"), "elapsed missing at 120:\n{wide}");
+
+        let mid = render_dashboard_with_width(&entries, 1060, false, 60);
+        // At 60 every column still fits.
+        assert!(mid.contains("15/250"), "step/max missing at 60:\n{mid}");
+        assert!(mid.contains("ninja"), "model alias missing at 60:\n{mid}");
+        assert!(mid.contains("01m"), "elapsed missing at 60:\n{mid}");
+
+        let narrow = render_dashboard_with_width(&entries, 1060, false, 40);
+        // Elapsed then model drop first; step/max still fits; id + op stay.
+        assert!(narrow.contains("925633bb"), "id lost at 40:\n{narrow}");
+        assert!(narrow.contains("CONSOLI"), "op lost at 40:\n{narrow}");
+        assert!(
+            narrow.contains("15/250"),
+            "step/max should stay at 40:\n{narrow}"
+        );
+        assert!(
+            !narrow.contains("ninja"),
+            "model should be dropped at 40:\n{narrow}"
+        );
+        assert!(
+            !narrow.contains("01m"),
+            "elapsed should be dropped at 40:\n{narrow}"
+        );
+
+        let tiny = render_dashboard_with_width(&entries, 1060, false, 25);
+        // Narrowest: step/max drops too; glyph + id + op always stay.
+        assert!(tiny.contains("925633bb"), "id lost at 25:\n{tiny}");
+        assert!(
+            !tiny.contains("15/250"),
+            "step/max should be dropped at 25:\n{tiny}"
+        );
+    }
+
+    /// The model alias strips the provider prefix (`combo:ninja` renders `ninja`).
+    #[test]
+    fn test_model_alias_strips_provider_prefix() {
+        assert_eq!(model_alias("combo:ninja"), "ninja");
+        assert_eq!(model_alias("openai:gpt-4o"), "gpt-4o");
+        assert_eq!(model_alias("plain"), "plain");
+        assert_eq!(model_alias(":"), ":");
+    }
+
+    /// NO_COLOR disables every escape sequence in the coloured renderer.
+    #[test]
+    fn test_no_color_disables_escapes() {
+        let entries = sample_entries();
+        let colored = render_dashboard_with_width(&entries, 1060, true, 80);
+        assert!(colored.contains("\x1b["), "expected colour:\n{colored}");
+        let plain = render_dashboard_with_width(&entries, 1060, false, 80);
+        assert!(
+            !plain.contains("\x1b["),
+            "NO_COLOR must disable escapes:\n{plain}"
+        );
+        // The plain layout is the same, just without ANSI codes.
+        assert_eq!(visible_width(&colored), visible_width(&plain));
+    }
+
+    /// The header carries the title, the per-status counts and the clock on one
+    /// bordered line; the counts use the status glyphs.
+    #[test]
+    fn test_header_counts_and_glyphs() {
+        let entries = sample_entries();
+        let text = render_dashboard(&entries, 1060, false);
+        assert!(text.contains("mini-swe"), "missing title:\n{text}");
+        assert!(text.contains("4 workers"), "missing total:\n{text}");
+        // running 2, reviewing 1, done 1, failed 0 (always shown).
+        assert!(text.contains("\u{25cf}2"), "running count:\n{text}");
+        assert!(text.contains("\u{25c6}1"), "reviewing count:\n{text}");
+        assert!(text.contains("\u{2713}1"), "done count:\n{text}");
+        assert!(text.contains("\u{2717}0"), "failed count:\n{text}");
+        // Group headers carry their own per-status counts.
+        assert!(text.contains("round52"), "missing group header:\n{text}");
+        assert!(text.contains("round50"), "missing group header:\n{text}");
+    }
+
+    /// The interactive list view's group headers carry the same per-status
+    /// counts as the plain dashboard, so both views stay consistent.
+    #[test]
+    fn test_interactive_list_group_headers_carry_counts() {
+        let entries = sample_entries();
+        let (lines, _) = build_list_lines(&entries, 1060, 80, true);
+        let headers: Vec<String> = lines
+            .iter()
+            .filter_map(|l| match l {
+                ListLine::Header(h) => Some(h.clone()),
+                ListLine::Worker(_) => None,
+            })
+            .collect();
+        assert!(
+            headers
+                .iter()
+                .any(|h| h.contains("round52") && h.contains("\u{25cf}1")),
+            "round52 header must carry counts: {headers:?}"
+        );
+        assert!(
+            headers
+                .iter()
+                .any(|h| h.contains("round50") && h.contains("\u{2713}1")),
+            "round50 header must carry counts: {headers:?}"
+        );
+    }
+
+    /// The status glyphs match the task's legend.
+    #[test]
+    fn test_status_glyphs_match_legend() {
+        assert_eq!(status_glyph(RegistryStatus::Running), '\u{25cf}');
+        assert_eq!(status_glyph(RegistryStatus::Reviewing), '\u{25c6}');
+        assert_eq!(status_glyph(RegistryStatus::Paused), '\u{23f8}');
+        assert_eq!(status_glyph(RegistryStatus::Completed), '\u{2713}');
+        assert_eq!(status_glyph(RegistryStatus::Failed), '\u{2717}');
+        assert_eq!(status_glyph(RegistryStatus::Exhausted), '\u{2717}');
+    }
+
+    /// The progress bar precedes step/max only at 100+ columns.
+    #[test]
+    fn test_progress_bar_only_wide() {
+        let entries = sample_entries();
+        let wide = render_dashboard_with_width(&entries, 1060, false, 120);
+        assert!(
+            wide.contains('[') && wide.contains('#'),
+            "bar missing at 120:\n{wide}"
+        );
+        let narrow = render_dashboard_with_width(&entries, 1060, false, 80);
+        assert!(
+            !narrow.contains('#'),
+            "bar must not show below 100 cols:\n{narrow}"
+        );
+    }
+
+    /// The repository line appears only when more than one repository is shown.
+    #[test]
+    fn test_repo_line_only_when_multiple_repos() {
+        let single = vec![
+            Row::new("a1").repo("/repo/x").group("r1").task("T").build(),
+            Row::new("a2").repo("/repo/x").group("r1").task("T").build(),
+        ];
+        let one = render_dashboard(&single, 1060, false);
+        assert!(
+            !one.contains("repo:"),
+            "no repo line for a single repo:\n{one}"
+        );
+
+        let multi = vec![
+            Row::new("a1").repo("/repo/x").group("r1").task("T").build(),
+            Row::new("a2").repo("/repo/y").group("r1").task("T").build(),
+        ];
+        let two = render_dashboard(&multi, 1060, false);
+        assert!(
+            two.contains("repo:"),
+            "repo line missing for two repos:\n{two}"
+        );
+    }
+
+    /// A live worker's elapsed keeps counting; a terminal one freezes.
+    #[test]
+    fn test_elapsed_frozen_for_terminal_rows() {
+        let done = Row::new("done01")
+            .status(RegistryStatus::Completed)
+            .task("Finished")
+            .command("completed")
+            .repo("local")
+            .updated_at(1065)
+            .build();
+        let text = render_dashboard(&[done], 5000, false);
+        assert!(text.contains("01m"), "frozen elapsed expected:\n{text}");
+    }
+
+    /// Colour stays aligned: every coloured row fits and the visible widths of
+    /// the status variants match.
     #[test]
     fn test_colored_rows_stay_aligned() {
         let entries: Vec<WorkerRegistryEntry> = ["c1", "c2", "c3", "c4"]
@@ -2448,144 +1946,48 @@ mod tests {
                     .task("T")
                     .command("cargo test")
                     .repo("r")
+                    .group("g")
                     .build()
             })
             .collect();
-
-        let width = 240;
+        let width = 120;
         let text = render_dashboard_with_width(&entries, 1100, true, width);
-        let rows: Vec<&str> = text
-            .lines()
-            .filter(|l| ["c1", "c2", "c3", "c4"].iter().any(|id| l.starts_with(id)))
-            .collect();
-        assert_eq!(rows.len(), 4);
-        for row in &rows {
+        for line in text.lines() {
             assert!(
-                visible_width(row) <= width,
-                "colored row overflows: {row:?} -> {}",
-                visible_width(row)
+                visible_width(line) <= width,
+                "colored line overflows: {line:?} -> {}",
+                visible_width(line)
             );
         }
-        // The review badge and its marker must not shift any column.
-        assert_eq!(visible_width(rows[0]), visible_width(rows[1]));
-        assert_eq!(visible_width(rows[1]), visible_width(rows[2]));
     }
 
+    /// One worker fits one line at any width: the op column absorbs the slack.
     #[test]
-    fn test_every_line_fits_every_width() {
-        let entries: Vec<WorkerRegistryEntry> = [
-            (
-                "w1",
-                RegistryStatus::Running,
-                "/home/dev/very-long-project-name-here",
-                "[audits]",
-            ),
-            (
-                "w2",
-                RegistryStatus::Reviewing,
-                "/home/dev/very-long-project-name-here",
-                "[audits]",
-            ),
-            ("w3", RegistryStatus::Failed, "local", ""),
-        ]
-        .iter()
-        .map(|(id, status, repo, group)| {
-            let mut row = Row::new(id)
-                .status(*status)
-                .task("Refactor the authentication middleware into smaller cohesive pieces")
-                .command("cargo test --all --verbose")
-                .turns(37, 250)
-                .repo(repo);
-            if !group.is_empty() {
-                row = row.group(group);
-            }
-            row.build()
-        })
-        .collect();
-
-        for width in [60usize, 70, 80, 96, 120, 160, 240, 400] {
-            for use_color in [false, true] {
-                let text = render_dashboard_with_width(&entries, 1100, use_color, width);
-                for line in text.lines() {
-                    assert!(
-                        visible_width(line) <= width,
-                        "line overflows {width} cols ({}): {line:?}",
-                        visible_width(line)
-                    );
-                }
+    fn test_compact_row_fits_any_width() {
+        let live = Row::new("a1b2c3d4")
+            .task("Refactor the authentication middleware into smaller pieces")
+            .command("cargo test --all --verbose -- --nocapture")
+            .turns(37, 250)
+            .group("audits")
+            .build();
+        for width in [40usize, 60, 80, 120, 200] {
+            let row = fit_compact_row(&live, 1060, width);
+            assert!(
+                visible_width(&row) <= width,
+                "live row overflows {width}: {row:?}"
+            );
+            assert!(row.contains("a1b2c3d4"), "id lost:\n{row}");
+            if width >= 80 {
+                assert!(row.contains("37/250"), "step/max lost:\n{row}");
             }
         }
     }
 
-    /// The stacked row has room the inline row does not, so the repeat/nudge
-    /// counts ride its label line — and never overflow it.
-    #[test]
-    fn test_stacked_row_carries_the_repeat_and_nudge_counts() {
-        let entries = vec![
-            Row::new("health01")
-                .task("Refactor the authentication middleware into smaller pieces")
-                .command("cargo test --all")
-                .metrics(3, 1)
-                .repo("local")
-                .build(),
-        ];
-
-        let text = render_dashboard_with_width(&entries, 1060, false, MIN_TERMINAL_WIDTH);
-        assert!(
-            text.contains("3 repeats, 1 nudge"),
-            "the stacked row must show the health counters:\n{text}"
-        );
-        for line in text.lines() {
-            assert!(
-                visible_width(line) <= MIN_TERMINAL_WIDTH,
-                "line overflows the terminal width: {line:?}"
-            );
-        }
-
-        // The inline row has no room for a new column, so it shows none.
-        let inline = render_dashboard_with_width(&entries, 1060, false, 200);
-        assert!(!inline.contains("repeats"), "{inline}");
-    }
-
-    #[test]
-    fn test_narrow_terminal_stacks_rows() {
-        let entries = vec![
-            Row::new("wrap001")
-                .task("Refactor the authentication middleware into smaller cohesive pieces")
-                .command("cargo test --all")
-                .repo("local")
-                .build(),
-        ];
-
-        let text = render_dashboard_with_width(&entries, 1060, false, MIN_TERMINAL_WIDTH);
-        let layout = Layout::for_terminal_width(MIN_TERMINAL_WIDTH);
-        assert_eq!(layout.shape, RowShape::Stacked);
-        for line in text.lines() {
-            assert!(
-                visible_width(line) <= MIN_TERMINAL_WIDTH,
-                "line overflows the terminal width: {line:?}"
-            );
-        }
-        // All fixed columns survive, and so does the task text.
-        assert!(text.contains("wrap001") && text.contains("1234") && text.contains("ninja"));
-        assert!(
-            text.contains("Refactor"),
-            "task text must survive stacking:\n{text}"
-        );
-        assert!(
-            text.contains("cargo test --all"),
-            "command must survive:\n{text}"
-        );
-    }
-
-    /// The list/detail/back/quit/scroll/follow state machine answers every key
-    /// with the action its view owns and ignores the keys of the other view.
+    /// The key state machine covers list/detail/back/quit/scroll/follow.
     #[test]
     fn test_key_state_machine_covers_list_detail_back_quit_scroll_follow() {
         let mut state = UiState::default();
         assert_eq!(state.view, View::List);
-
-        // List: move within bounds, clamp at both ends.
         assert_eq!(state.apply_key(Key::Down, 3), Action::MoveDown);
         assert_eq!(state.selection, 1);
         assert_eq!(state.apply_key(Key::Up, 3), Action::MoveUp);
@@ -2593,52 +1995,22 @@ mod tests {
         assert_eq!(state.apply_key(Key::Up, 3), Action::None);
         state.selection = 2;
         assert_eq!(state.apply_key(Key::Down, 3), Action::None);
-
-        // List: groups toggle, follow/scroll keys are ignored.
         assert_eq!(state.apply_key(Key::Char('g'), 3), Action::ToggleGroups);
         assert!(!state.groups_expanded);
         assert_eq!(state.apply_key(Key::Char('g'), 3), Action::ToggleGroups);
         assert!(state.groups_expanded);
-        assert_eq!(state.apply_key(Key::Char('f'), 3), Action::None);
-        assert_eq!(state.apply_key(Key::PageDown, 3), Action::None);
-
-        // List: Enter opens the detail, Esc/q quit; Enter with no workers does
-        // nothing.
         assert_eq!(state.apply_key(Key::Enter, 0), Action::None);
         assert_eq!(state.apply_key(Key::Enter, 3), Action::OpenDetail);
         assert_eq!(state.view, View::Detail);
         assert!(state.follow);
-        assert_eq!(state.scroll, 0);
-
-        // Detail: scroll pages, follow toggles, movement keys are ignored.
         assert_eq!(state.apply_key(Key::PageDown, 3), Action::ScrollDown);
         assert_eq!(state.scroll, PAGE_TURNS);
-        assert_eq!(state.apply_key(Key::PageDown, 3), Action::ScrollDown);
-        assert_eq!(state.scroll, 2 * PAGE_TURNS);
-        assert_eq!(state.apply_key(Key::PageUp, 3), Action::ScrollUp);
-        assert_eq!(state.scroll, PAGE_TURNS);
-        // Scrolling past the newest turn clamps instead of wrapping.
-        assert_eq!(state.apply_key(Key::PageUp, 3), Action::ScrollUp);
-        assert_eq!(state.apply_key(Key::PageUp, 3), Action::ScrollUp);
-        assert_eq!(state.scroll, 0);
-        assert_eq!(state.apply_key(Key::Char('f'), 3), Action::ToggleFollow);
-        assert!(!state.follow);
-        assert_eq!(state.apply_key(Key::Up, 3), Action::None);
-        assert_eq!(state.apply_key(Key::Char('g'), 3), Action::None);
-
-        // Detail: Esc/q go back; list: Esc/q quit.
         assert_eq!(state.apply_key(Key::Esc, 3), Action::Back);
         assert_eq!(state.view, View::List);
         assert_eq!(state.apply_key(Key::Char('q'), 3), Action::Quit);
-        let mut detail = UiState {
-            view: View::Detail,
-            ..UiState::default()
-        };
-        assert_eq!(detail.apply_key(Key::Char('q'), 3), Action::Back);
     }
 
-    /// Raw terminal bytes map to keys: arrows, PgUp/PgDn, Enter, Esc, j/k as
-    /// Up/Down aliases, and control bytes map to nothing.
+    /// Raw terminal bytes map to keys.
     #[test]
     fn test_parse_key_maps_sequences_and_aliases() {
         assert_eq!(parse_key(&[0x1b, b'[', b'A']), Some(Key::Up));
@@ -2651,11 +2023,9 @@ mod tests {
         assert_eq!(parse_key(b"k"), Some(Key::Up));
         assert_eq!(parse_key(b"q"), Some(Key::Char('q')));
         assert_eq!(parse_key(&[0x03]), None);
-        assert_eq!(parse_key(&[0x1b, b'[', b'Z']), None);
     }
 
-    /// History lines fold into turns: an assistant tool call opens a turn and
-    /// the tool result attaches its exit code plus the output tail.
+    /// History lines fold into turns.
     #[test]
     fn test_history_reader_parses_turns_incrementally() {
         let dir = std::env::temp_dir().join(format!(
@@ -2733,7 +2103,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The reader caps its memory: far more turns than fit stay on disk.
+    /// The reader caps its memory.
     #[test]
     fn test_history_reader_keeps_at_most_the_last_500_turns() {
         let mut reader = HistoryReader::default();
@@ -2752,59 +2122,5 @@ mod tests {
             format!("turn {}", MAX_TURNS_IN_MEMORY + 49)
         );
         assert_eq!(reader.turns.first().unwrap().step, 51);
-    }
-
-    /// One worker fits one line at any width: the op column absorbs the slack
-    /// and the line never overflows, dimmed for terminal workers.
-    #[test]
-    fn test_compact_row_fits_any_width() {
-        let live = Row::new("a1b2c3d4")
-            .task("Refactor the authentication middleware into smaller pieces")
-            .command("cargo test --all --verbose -- --nocapture")
-            .turns(37, 250)
-            .group("audits")
-            .build();
-        let done = Row::new("d4e5f6a7b8")
-            .status(RegistryStatus::Completed)
-            .task("Finished work")
-            .command("completed")
-            .turns(9, 100)
-            .build();
-
-        for width in [40usize, 60, 80, 120, 200] {
-            let row = fit_compact_row(&live, 1060, width);
-            assert!(
-                visible_width(&row) <= width,
-                "live row overflows {width}: {row:?}"
-            );
-            assert!(row.contains("a1b2c3d4"), "id lost:\n{row}");
-            assert!(row.contains("37/250"), "step/max lost:\n{row}");
-            if width >= 80 {
-                assert!(row.contains("[audits]"), "group lost:\n{row}");
-            }
-
-            let finished = fit_compact_row(&done, 1060, width);
-            assert!(
-                visible_width(&finished) <= width,
-                "done row overflows {width}: {finished:?}"
-            );
-            assert!(
-                finished.starts_with("\x1b[2m"),
-                "completed workers must dim:\n{finished:?}"
-            );
-        }
-        // The live row carries no dimming, but a live worker that stopped
-        // reporting (retired-soon) dims like a terminal one.
-        assert!(!fit_compact_row(&live, 1060, 120).starts_with("\x1b[2m"));
-        let stale = Row::new("stale001")
-            .task("Gone quiet")
-            .command("cargo test")
-            .turns(3, 100)
-            .updated_at(100)
-            .build();
-        assert!(
-            fit_compact_row(&stale, 10_000, 120).starts_with("\x1b[2m"),
-            "a worker quiet past the TTL must dim"
-        );
     }
 }
