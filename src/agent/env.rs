@@ -37,8 +37,6 @@
 #[cfg(test)]
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-#[cfg(test)]
-use std::sync::{Mutex, MutexGuard};
 
 /// Variables copied verbatim from the parent process into the agent's shell.
 ///
@@ -183,20 +181,23 @@ pub fn resolve_cargo_home(explicit: Option<&Path>, home: Option<&Path>) -> Optio
 /// need it to exist (command spawning) create it explicitly, which keeps this
 /// function side-effect free and cheap to call from tests.
 pub fn build_clean_environment(repo_path: &Path, worktree_path: &Path) -> Vec<(String, String)> {
-    build_clean_environment_with(
+    build_clean_environment_from(
         repo_path,
         worktree_path,
+        &|name| std::env::var_os(name),
         std::env::var_os("HOME").as_deref().map(Path::new),
         std::env::var_os(CARGO_HOME_VAR).as_deref().map(Path::new),
     )
 }
 
-/// [`build_clean_environment`] with the host `HOME` and `CARGO_HOME` supplied by
-/// the caller, so tests can exercise toolchain-cache resolution without
-/// mutating process-global state.
-fn build_clean_environment_with(
+/// [`build_clean_environment`] with the parent environment supplied by the
+/// caller as `lookup`, so tests drive the allow-list, toolchain forwarding and
+/// secret scrubbing against a synthetic map instead of mutating
+/// process-global state. Production passes the real environment through.
+pub fn build_clean_environment_from(
     repo_path: &Path,
     worktree_path: &Path,
+    lookup: &dyn Fn(&str) -> Option<std::ffi::OsString>,
     host_home: Option<&Path>,
     explicit_cargo_home: Option<&Path>,
 ) -> Vec<(String, String)> {
@@ -207,10 +208,13 @@ fn build_clean_environment_with(
     for name in ALLOWED_VARS {
         // Empty values carry no information and can only confuse tools that
         // test "is this configured?" with a truthiness check.
-        match std::env::var(name) {
+        // A value the parent could not express as UTF-8 is dropped, not
+        // re-encoded: `to_string_lossy` would hand the child a name the parent
+        // never wrote, and a mangled `PATH` entry is worse than a missing one.
+        match lookup(name).and_then(|value| value.into_string().ok()) {
             // One allocation for the key, one for the value; nothing is
             // allocated for names that are unset or empty.
-            Ok(value) if !value.is_empty() => env.push(((*name).to_string(), value)),
+            Some(value) if !value.is_empty() => env.push(((*name).to_string(), value)),
             _ => {}
         }
     }
@@ -226,7 +230,7 @@ fn build_clean_environment_with(
         } else {
             // No `~/.rustup` fallback: a host with no rustup has no toolchain
             // directory to share, and an invented path would be a silent lie.
-            std::env::var_os(name)
+            lookup(name)
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from)
         };
@@ -254,7 +258,35 @@ pub fn apply_clean_environment_cmd(
     repo_path: &Path,
     worktree_path: &Path,
 ) {
-    let env = build_clean_environment(repo_path, worktree_path);
+    apply_clean_environment_cmd_from(
+        cmd,
+        repo_path,
+        worktree_path,
+        &|name| std::env::var_os(name),
+        std::env::var_os("HOME").as_deref().map(Path::new),
+        std::env::var_os(CARGO_HOME_VAR).as_deref().map(Path::new),
+    );
+}
+
+/// [`apply_clean_environment_cmd`] with the parent environment supplied by
+/// the caller as `lookup`/`host_home`/`explicit_cargo_home`, so tests drive
+/// the spawn path against a synthetic map instead of mutating process-global
+/// state. Production passes the real environment through.
+pub fn apply_clean_environment_cmd_from(
+    cmd: &mut tokio::process::Command,
+    repo_path: &Path,
+    worktree_path: &Path,
+    lookup: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+    host_home: Option<&Path>,
+    explicit_cargo_home: Option<&Path>,
+) {
+    let env = build_clean_environment_from(
+        repo_path,
+        worktree_path,
+        lookup,
+        host_home,
+        explicit_cargo_home,
+    );
     let _ = std::fs::create_dir_all(isolated_home(repo_path, worktree_path));
     cmd.env_clear();
     for (key, value) in env {
@@ -447,10 +479,24 @@ pub fn sanitize_ambient_value(name: &str, value: &str) -> Option<String> {
 /// orchestrator's shell, and it is what the differential verify gate layers on
 /// top of the canonical sandbox environment.
 pub fn ambient_environment_snapshot() -> Vec<(String, String)> {
-    let mut pairs: Vec<(String, String)> = std::env::vars_os()
+    ambient_snapshot_from(std::env::vars_os().map(|(name, value)| {
+        (
+            name.to_string_lossy().into_owned(),
+            value.to_string_lossy().into_owned(),
+        )
+    }))
+}
+
+/// [`ambient_environment_snapshot`] over an explicit `vars` iterator, so tests
+/// drive filtering, redaction and truncation against a synthetic map instead
+/// of mutating process-global state. [`ambient_environment_snapshot`]
+/// delegates here unchanged.
+pub fn ambient_snapshot_from(
+    vars: impl IntoIterator<Item = (String, String)>,
+) -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = vars
+        .into_iter()
         .filter_map(|(name, value)| {
-            let name = name.to_string_lossy().into_owned();
-            let value = value.to_string_lossy().into_owned();
             sanitize_ambient_value(&name, &value).map(|value| (name, value))
         })
         .collect();
@@ -470,47 +516,29 @@ pub fn ambient_environment_snapshot() -> Vec<(String, String)> {
     pairs
 }
 
-/// Serializes tests that mutate the process environment.
-///
-/// `std::env::set_var` is process-global, and the harness runs unit tests on
-/// parallel threads, so a test that overrides `HOME`/`CARGO_HOME` would
-/// otherwise be observed by an unrelated test running at the same instant - in
-/// this module *and* in `exec`, which spawns real children that read the same
-/// variables. Holding this lock for the whole mutating test, rather than just
-/// around the `set_var` calls, is what makes those tests atomic against their
-/// neighbours.
-///
-/// Exposed as a crate-visible test seam because sibling modules cannot reach a
-/// test-private item.
+/// Test-only core for callers that vary just `HOME`/`CARGO_HOME`: the
+/// remaining parent variables come from the process environment. Tests that
+/// vary anything else use [`build_clean_environment_from`] with a synthetic
+/// map instead, so no test mutates process-global state.
 #[cfg(test)]
-pub(crate) static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-/// Run `body` with exclusive access to the process environment.
-///
-/// The lock is a std `Mutex`, so `body` must be synchronous: holding it across
-/// an `.await` would park a runtime thread and can deadlock a multi-threaded
-/// runtime, which is exactly what `clippy::await_holding_lock` rejects. A test
-/// that needs both an environment override and an await therefore drives the
-/// future to completion inside this closure (see the `runtime.block_on` call in
-/// `exec`).
-#[cfg(test)]
-pub(crate) fn with_env_lock<T>(body: impl FnOnce() -> T) -> T {
-    let _guard = ENV_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    body()
+fn build_clean_environment_with(
+    repo_path: &Path,
+    worktree_path: &Path,
+    host_home: Option<&Path>,
+    explicit_cargo_home: Option<&Path>,
+) -> Vec<(String, String)> {
+    build_clean_environment_from(
+        repo_path,
+        worktree_path,
+        &|name| std::env::var_os(name),
+        host_home,
+        explicit_cargo_home,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Acquire the environment lock for the duration of a mutating test.
-    fn env_guard() -> MutexGuard<'static, ()> {
-        ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
 
     fn unique_dir(tag: &str) -> PathBuf {
         let unique_id = std::time::SystemTime::now()
@@ -590,24 +618,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A parent value that is not valid UTF-8 is dropped rather than
+    /// re-encoded: forwarding `U+FFFD` substitutes would hand the child a
+    /// value the parent never wrote (a mangled `PATH` entry among them).
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_allowlisted_value_is_dropped_not_recoded() {
+        use std::os::unix::ffi::OsStringExt;
+        let dir = unique_dir("non-utf8");
+        let lookup = |name: &str| match name {
+            "TERM" => Some(std::ffi::OsString::from_vec(vec![0xff, 0xfe])),
+            other => std::env::var_os(other),
+        };
+        let env = build_clean_environment_from(&dir, &dir, &lookup, None, None);
+        assert!(
+            env.iter().all(|(name, _)| name != "TERM"),
+            "a non-UTF-8 allow-listed value must not reach the child, got: {env:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn build_clean_environment_drops_secrets_from_parent() {
-        let _guard = env_guard();
         let dir = unique_dir("secrets");
-        // Inject secrets into *our* environment; the child env must not carry them.
-        unsafe {
-            std::env::set_var("OPENAI_API_KEY", "sk-test-should-not-leak");
-            std::env::set_var("AWS_SECRET_ACCESS_KEY", "aws-test-should-not-leak");
-            std::env::set_var("GITHUB_TOKEN", "gh-test-should-not-leak");
-            std::env::set_var("SSH_AUTH_SOCK", "/tmp/agent.sock");
-        }
-        let env = build_clean_environment(&dir, &dir);
-        unsafe {
-            std::env::remove_var("OPENAI_API_KEY");
-            std::env::remove_var("AWS_SECRET_ACCESS_KEY");
-            std::env::remove_var("GITHUB_TOKEN");
-            std::env::remove_var("SSH_AUTH_SOCK");
-        }
+        // Secrets present in the parent map must not reach the child env.
+        let lookup = |name: &str| match name {
+            "OPENAI_API_KEY" => Some(std::ffi::OsString::from("sk-test-should-not-leak")),
+            "AWS_SECRET_ACCESS_KEY" => Some(std::ffi::OsString::from("aws-test-should-not-leak")),
+            "GITHUB_TOKEN" => Some(std::ffi::OsString::from("gh-test-should-not-leak")),
+            "SSH_AUTH_SOCK" => Some(std::ffi::OsString::from("/tmp/agent.sock")),
+            other => std::env::var_os(other),
+        };
+        let env = build_clean_environment_from(&dir, &dir, &lookup, None, None);
 
         for (k, _) in &env {
             assert!(
@@ -674,7 +716,6 @@ mod tests {
 
     #[test]
     fn apply_clean_environment_clears_and_sets_isolated_home() {
-        let _guard = env_guard();
         let dir = unique_dir("apply");
         let mut cmd = tokio::process::Command::new("true");
         // Seed with a secret so env_clear has something to remove.
@@ -817,25 +858,21 @@ mod tests {
 
     #[test]
     fn ambient_snapshot_never_carries_secrets() {
-        let _guard = env_guard();
-        // SAFETY: serialized against every other test that reads the process
-        // environment.
-        unsafe {
-            std::env::set_var("SWE_AMBIENT_PLAIN_TEST", "hello");
-            std::env::set_var("SWE_AMBIENT_SECRET_TOKEN_TEST", "must-not-travel");
-            std::env::set_var(
-                "SWE_AMBIENT_URL_TEST",
-                "postgres://app:hunter2@db.internal:5432/prod",
-            );
-            std::env::set_var("http_proxy", "http://user:s3cret@proxy.internal:8080");
-        }
-        let snapshot = ambient_environment_snapshot();
-        unsafe {
-            std::env::remove_var("SWE_AMBIENT_PLAIN_TEST");
-            std::env::remove_var("SWE_AMBIENT_SECRET_TOKEN_TEST");
-            std::env::remove_var("SWE_AMBIENT_URL_TEST");
-            std::env::remove_var("http_proxy");
-        }
+        let snapshot = ambient_snapshot_from([
+            ("SWE_AMBIENT_PLAIN_TEST".to_string(), "hello".to_string()),
+            (
+                "SWE_AMBIENT_SECRET_TOKEN_TEST".to_string(),
+                "must-not-travel".to_string(),
+            ),
+            (
+                "SWE_AMBIENT_URL_TEST".to_string(),
+                "postgres://app:hunter2@db.internal:5432/prod".to_string(),
+            ),
+            (
+                "http_proxy".to_string(),
+                "http://user:s3cret@proxy.internal:8080".to_string(),
+            ),
+        ]);
         assert!(
             snapshot
                 .iter()
@@ -866,15 +903,16 @@ mod tests {
     /// forwarded verbatim, so a non-default install layout keeps working.
     #[test]
     fn an_explicit_cargo_home_is_forwarded_verbatim() {
-        let _guard = env_guard();
         let dir = unique_dir("cargo-home-explicit");
         let custom = dir.join("custom-cargo");
         std::fs::create_dir_all(&custom).expect("create custom cargo home");
-        // SAFETY: serialized against every other test that reads or writes the
-        // process environment.
-        unsafe { std::env::set_var("CARGO_HOME", &custom) };
-        let env = build_clean_environment(&dir, &dir);
-        unsafe { std::env::remove_var("CARGO_HOME") };
+        let env = build_clean_environment_from(
+            &dir,
+            &dir,
+            &|name| std::env::var_os(name),
+            None,
+            Some(&custom),
+        );
 
         assert_eq!(
             env.iter()
@@ -891,14 +929,17 @@ mod tests {
     /// fallback, because a host with no toolchain manager is not an error).
     #[test]
     fn rustup_home_is_forwarded_when_set_and_absent_otherwise() {
-        let _guard = env_guard();
         let dir = unique_dir("rustup-home");
-        // SAFETY: serialized against every other test that reads or writes the
-        // process environment.
-        unsafe { std::env::set_var("RUSTUP_HOME", "/opt/rustup") };
-        let set_env = build_clean_environment(&dir, &dir);
-        unsafe { std::env::remove_var("RUSTUP_HOME") };
-        let unset_env = build_clean_environment(&dir, &dir);
+        let set_lookup = |name: &str| match name {
+            "RUSTUP_HOME" => Some(std::ffi::OsString::from("/opt/rustup")),
+            other => std::env::var_os(other),
+        };
+        let set_env = build_clean_environment_from(&dir, &dir, &set_lookup, None, None);
+        let unset_lookup = |name: &str| match name {
+            "RUSTUP_HOME" => None,
+            other => std::env::var_os(other),
+        };
+        let unset_env = build_clean_environment_from(&dir, &dir, &unset_lookup, None, None);
 
         assert_eq!(
             set_env
