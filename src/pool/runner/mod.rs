@@ -1116,6 +1116,7 @@ fn finalize_worktree(input: FinalizeInput) -> Result<FinalizedWork> {
         let commit_msg = format!("worker({branch}): {clean_subject}");
         WorktreeGuard::commit_changes_at(&path, &repo_root, &branch, &base_commit, &commit_msg)?
     };
+    let committed = committed.branch;
     let head_commit = committed.as_ref().and_then(|branch| {
         crate::worktree::git(
             &repo_root,

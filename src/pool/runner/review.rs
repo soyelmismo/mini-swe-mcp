@@ -43,7 +43,7 @@ use std::path::Path;
 
 use crate::agent::{AgentRunner, ChatMessage, Role};
 use crate::manifest::{ModelManifest, build_system_prompt};
-use crate::worktree::WorktreeGuard;
+use crate::worktree::{CommitReport, WorktreeGuard};
 
 use super::super::WorkerPool;
 use super::super::registry::{RegistryStatus, WorkerMeta, WorkerRole};
@@ -1597,16 +1597,17 @@ impl WorkerPool {
         // shells out to git, so it runs off the runtime thread.
         {
             let path = worktree.path.clone();
+            let base_commit = worktree.base_commit.clone();
             let message = format!(
                 "worker({}): implementation phase completed (checkpoint)",
                 worker_id
             );
             let committed = tokio::task::spawn_blocking(move || {
-                crate::worktree::WorktreeGuard::commit_all(&path, &message)
+                crate::worktree::WorktreeGuard::commit_all(&path, &base_commit, &message)
             })
             .await
-            .unwrap_or(Ok(false));
-            if committed.unwrap_or(false) {
+            .unwrap_or(Ok(CommitReport::default()));
+            if committed.map(|r| r.committed()).unwrap_or(false) {
                 worktree.preserve_branch = true;
             }
         }

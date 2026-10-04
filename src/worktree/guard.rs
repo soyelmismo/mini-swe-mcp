@@ -31,8 +31,8 @@ use super::{
     remove_target_dirs_in,
 };
 use anyhow::{Context, Result};
-use std::collections::{BTreeMap, HashSet};
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -142,6 +142,15 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
+/// What one staging pass kept and refused.
+#[derive(Default)]
+struct Staging {
+    /// True when at least one path reached the index, so a commit has content.
+    staged: bool,
+    /// Paths the pass refused to stage.
+    skipped: Vec<SkippedPath>,
+}
+
 /// What one harness commit did: whether it committed, and what it left out.
 #[derive(Debug, Default, Clone)]
 pub struct CommitReport {
@@ -157,9 +166,9 @@ impl CommitReport {
         self.branch.is_some()
     }
 
-    /// The lines a checkpoint notice shows the worker, longest-first so the
-    /// paths a worker can act on are the ones it reads. `None` when nothing
-    /// was refused.
+    /// The lines a checkpoint notice shows the worker, in path order and
+    /// capped so a worktree full of cache files cannot flood the model.
+    /// `None` when nothing was refused.
     pub fn notice_lines(&self) -> Option<String> {
         if self.skipped.is_empty() {
             return None;
@@ -1129,15 +1138,11 @@ impl WorktreeGuard {
         if Self::merge_in_progress_at(path)? {
             anyhow::bail!("Base merge is still in progress; resolve it and request completion");
         }
-        let skipped = Self::stage_commitable_changes_at(path, base_commit)?;
-
-        // Check if there are changes to commit.
-        let status = git(path, "status", &["status", "--porcelain"])?;
-        if !status.status.success() {
-            let stderr = String::from_utf8_lossy(&status.stderr);
-            anyhow::bail!("git status failed: {}", stderr.trim());
-        }
-        if status.stdout.is_empty() {
+        let staging = Self::stage_commitable_changes_at(path, base_commit)?;
+        let skipped = staging.skipped;
+        if !staging.staged {
+            // Nothing the rules allowed reached the index, so a commit here
+            // would be an empty one preserving a branch that carries no work.
             return Ok(CommitReport {
                 branch: None,
                 skipped,
@@ -1145,7 +1150,6 @@ impl WorktreeGuard {
         }
 
         Self::commit_staged_at(path, message)?;
-        log_skipped(path, &skipped);
         Ok(CommitReport {
             branch: None,
             skipped,
@@ -1228,7 +1232,7 @@ impl WorktreeGuard {
     /// A refused path is never staged, so its content never reaches the object
     /// database, and anything an earlier pass left staged for it is unstaged.
     /// The caller reports the refusals to the worker.
-    fn stage_commitable_changes_at(path: &Path, base_commit: &str) -> Result<Vec<SkippedPath>> {
+    fn stage_commitable_changes_at(path: &Path, base_commit: &str) -> Result<Staging> {
         let status = git(
             path,
             "status",
@@ -1242,7 +1246,7 @@ impl WorktreeGuard {
         }
         let changed = status_entries(&status.stdout);
         if changed.is_empty() {
-            return Ok(Vec::new());
+            return Ok(Staging::default());
         }
         let cap = commit_file_cap_bytes();
         let base = base_tree_at(path, base_commit)?;
@@ -1255,7 +1259,11 @@ impl WorktreeGuard {
                 continue;
             }
             match Self::commit_refusal(path, &rel, cap, &base) {
-                Some((reason, bytes)) => skipped.push(SkippedPath { path: rel, bytes, reason }),
+                Some((reason, bytes)) => skipped.push(SkippedPath {
+                    path: rel,
+                    bytes,
+                    reason,
+                }),
                 None => keep.push(rel),
             }
         }
@@ -1269,11 +1277,13 @@ impl WorktreeGuard {
             run_pathspecs(path, "reset", &["reset", "--quiet"], &refused);
         }
         log_skipped(path, &skipped);
-        if keep.is_empty() {
-            return Ok(skipped);
+        if !keep.is_empty() {
+            run_pathspecs(path, "add", &["add"], &keep);
         }
-        run_pathspecs(path, "add", &["add"], &keep);
-        Ok(skipped)
+        Ok(Staging {
+            staged: !keep.is_empty(),
+            skipped,
+        })
     }
 
     /// Why a new path must not be staged, or `None` when it may be.
@@ -1287,7 +1297,7 @@ impl WorktreeGuard {
         cap: u64,
         base: &BaseTree,
     ) -> Option<(SkipReason, Option<u64>)> {
-        let Ok(meta) = std::fs::metadata(worktree.join(rel)) else {
+        let Ok(meta) = std::fs::symlink_metadata(worktree.join(rel)) else {
             return None;
         };
         let bytes = meta.len();
@@ -1675,7 +1685,11 @@ impl BaseTree {
 /// empty tree, which refuses nothing by the tracked rule and leaves the cache
 /// and size rules to apply to every path.
 fn base_tree_at(path: &Path, base_commit: &str) -> Result<BaseTree> {
-    let reference = if base_commit.is_empty() { "HEAD" } else { base_commit };
+    let reference = if base_commit.is_empty() {
+        "HEAD"
+    } else {
+        base_commit
+    };
     let out = git(
         path,
         "ls-tree",
