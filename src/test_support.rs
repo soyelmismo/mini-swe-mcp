@@ -19,6 +19,15 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 /// with the private scratch the runner derives from its leaf name.
 pub(crate) struct TestScratch {
     path: PathBuf,
+    /// The root this scratch was created under: the directory the derived
+    /// `swe-tmp-<leaf>` companions are filed in, and the only directory this
+    /// scratch may reclaim them from.
+    root: crate::worktree::ScratchRoot,
+    /// The paths handed out by [`Self::subdir`], each with the scratch root
+    /// that owns it. The runner derives a `swe-tmp-<leaf>` companion from
+    /// whichever path it is handed, so each one is dropped with the scratch
+    /// that created it rather than left behind.
+    subdirs: std::sync::Mutex<Vec<(PathBuf, crate::worktree::ScratchRoot)>>,
 }
 
 impl TestScratch {
@@ -27,7 +36,13 @@ impl TestScratch {
         let path = unique_path(tag);
         std::fs::create_dir_all(&path)
             .unwrap_or_else(|e| panic!("create test scratch {}: {e}", path.display()));
-        Self { path }
+        let root =
+            crate::worktree::ScratchRoot::new(path.parent().unwrap_or_else(|| Path::new(".")));
+        Self {
+            path,
+            subdirs: std::sync::Mutex::new(Vec::new()),
+            root,
+        }
     }
 
     /// Own an existing path: nothing is created, but the path and its
@@ -36,7 +51,13 @@ impl TestScratch {
     /// Used for unique names a test needs to build itself and for the
     /// fail-closed test whose worktree must stay absent.
     pub(crate) fn own(path: PathBuf) -> Self {
-        Self { path }
+        let root =
+            crate::worktree::ScratchRoot::new(path.parent().unwrap_or_else(|| Path::new(".")));
+        Self {
+            path,
+            subdirs: std::sync::Mutex::new(Vec::new()),
+            root,
+        }
     }
 
     /// A path that is deliberately absent, for tests pinning the fail-closed
@@ -44,7 +65,13 @@ impl TestScratch {
     pub(crate) fn missing(tag: &str) -> Self {
         let path = unique_path(tag);
         let _ = std::fs::remove_dir_all(&path);
-        Self { path }
+        let root =
+            crate::worktree::ScratchRoot::new(path.parent().unwrap_or_else(|| Path::new(".")));
+        Self {
+            path,
+            subdirs: std::sync::Mutex::new(Vec::new()),
+            root,
+        }
     }
 
     /// The worktree path itself. Create it first for [`own`](Self::own) and
@@ -58,6 +85,10 @@ impl TestScratch {
         let path = self.path.join(name);
         std::fs::create_dir_all(&path)
             .unwrap_or_else(|e| panic!("create test scratch {}: {e}", path.display()));
+        let mut subdirs = self.subdirs.lock().unwrap_or_else(|e| e.into_inner());
+        if !subdirs.iter().any(|(p, _)| *p == path) {
+            subdirs.push((path.clone(), self.root.clone()));
+        }
         path
     }
 }
@@ -75,8 +106,24 @@ impl Drop for TestScratch {
     fn drop(&mut self) {
         // The runner files private scratch next to the scratch base, keyed by
         // the worktree's leaf name, so removing the worktree alone is not
-        // enough. `remove_target_dirs` also tolerates a path that is absent.
-        crate::worktree::remove_target_dirs(&self.path);
+        // enough. `remove_target_dirs_in` also tolerates a path that is absent.
+        //
+        // Every subdirectory this scratch handed out is a path the runner can be
+        // given too, so each one's own `swe-tmp-<leaf>` companion goes with it.
+        // Without this a test that calls [`TestScratch::subdir`] with a fixed
+        // name ("worktree", "target") would leave one `swe-tmp-<name>` entry
+        // behind per run.
+        //
+        // Reclamation is scoped to the root this scratch was created under. The
+        // leaf of a subdirectory is whatever the *test* named it, so resolving
+        // against the default root instead would delete a fixed, predictable
+        // `swe-tmp-worktree` / `swe-tmp-target` in the shared scratch base --
+        // which is where a sibling agent's private scratch lives.
+        let subdirs = std::mem::take(&mut *self.subdirs.lock().unwrap_or_else(|e| e.into_inner()));
+        for (subdir, root) in subdirs {
+            crate::worktree::remove_target_dirs_in(&root, &subdir);
+        }
+        crate::worktree::remove_target_dirs_in(&self.root, &self.path);
         crate::cache::remove_build_dir_leases(&self.path);
         let _ = std::fs::remove_dir_all(&self.path);
     }
