@@ -83,14 +83,20 @@ pub(crate) fn select_security_reviewer(
     manifest: &ModelManifest,
     default_model: &str,
 ) -> ReviewerChoice {
-    match mode_default_reviewer("security", manifest) {
+    // A `default_model` the catalog does not define is a typo, and it must not
+    // silently disarm the audit: `resolve_model` passes an unknown name through
+    // verbatim, so the review would be sent to a model id no provider serves,
+    // fail quietly, and record no findings while the worker completes. An
+    // unresolvable name is therefore ignored and the dispatch default audits
+    // instead; `ModelManifest::validate` names the typo to the operator.
+    match mode_default_reviewer("security", manifest).filter(|alias| manifest.knows_model(alias)) {
         Some(alias) => ReviewerChoice {
             model: manifest.resolve_model(&alias).0,
             reason: "security mode's default_model",
         },
         None => ReviewerChoice {
             model: default_model.to_string(),
-            reason: "security mode declares no default_model; dispatch default",
+            reason: "security mode declares no usable default_model; dispatch default",
         },
     }
 }
@@ -1593,9 +1599,46 @@ mod tests {
         let choice = select_security_reviewer(&manifest, "combo:default");
         assert_eq!(choice.model, "combo:default");
         assert!(
-            choice.reason.contains("no default_model"),
+            choice.reason.contains("no usable default_model"),
             "{}",
             choice.reason
+        );
+    }
+
+    /// A typo in the security mode's `default_model` must not disarm the
+    /// automatic audit: `resolve_model` would send the unknown name straight to
+    /// the provider, so the review would fail quietly and the sensitive diff
+    /// would complete with no adversarial pass at all.
+    #[test]
+    fn an_unknown_security_default_model_falls_back_to_the_dispatch_default() {
+        let manifest = manifest(
+            "default: ninja\nmodels:\n  ninja:\n    id: combo:ninja\n  nerd:\n    id: combo:nerd\nreview_modes:\n  security:\n    default_model: neerd\n",
+        );
+        let choice = select_security_reviewer(&manifest, "combo:default");
+        assert_eq!(
+            choice.model, "combo:default",
+            "a default_model the catalog does not define must not reach the provider"
+        );
+        let warnings = manifest.validate();
+        assert!(
+            warnings.iter().any(|w| w.contains("neerd")),
+            "the typo must be named to the operator: {warnings:?}"
+        );
+    }
+
+    /// A `default_model` given as a full model id, not an alias, is still a
+    /// usable reviewer.
+    #[test]
+    fn a_security_default_model_named_by_id_is_used() {
+        let manifest = manifest(
+            "default: ninja\nmodels:\n  ninja:\n    id: combo:ninja\n  nerd:\n    id: combo:nerd\nreview_modes:\n  security:\n    default_model: combo:nerd\n",
+        );
+        let choice = select_security_reviewer(&manifest, "combo:ninja");
+        assert_eq!(choice.model, "combo:nerd");
+        assert!(
+            manifest.validate().is_empty(),
+            "an id the catalog defines must not warn: {:?}",
+            manifest.validate()
         );
     }
 

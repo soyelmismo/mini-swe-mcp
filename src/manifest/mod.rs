@@ -322,6 +322,17 @@ impl ModelManifest {
             .filter(|block| !block.is_empty())
     }
 
+    /// Whether the catalog defines `model`, as either an alias or a full id.
+    ///
+    /// [`Self::resolve_model`] falls back to passing an unknown name through
+    /// verbatim, so a caller that needs a *usable* model (a review mode's
+    /// `default_model` picking the automatic security reviewer) asks this
+    /// first: a typo must not be sent to a provider that serves no such model.
+    pub fn knows_model(&self, model: &str) -> bool {
+        let name = model.trim();
+        !name.is_empty() && (self.models.contains_key(name) || self.lookup_by_id(name).is_some())
+    }
+
     /// Find the first (sorted-alias) entry whose `id` equals `id`.
     ///
     /// Shared by [`Self::resolve_model`] and [`Self::alias_for_model`], which

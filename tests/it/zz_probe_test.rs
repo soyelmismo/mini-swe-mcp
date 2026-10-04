@@ -74,7 +74,10 @@ async fn probe_bare_security_mode_runs_on_its_default_model() {
     let (_pool, _id, state, _s) =
         dispatch_and_wait(llm.base_url(), repo.path(), Some("security")).await;
     let bodies = llm.request_bodies().await;
-    println!("BARE security -> models={:?} state={state:?}", models_asked_for(&bodies));
+    println!(
+        "BARE security -> models={:?} state={state:?}",
+        models_asked_for(&bodies)
+    );
 }
 
 #[tokio::test]
@@ -89,9 +92,25 @@ async fn probe_model_colon_mode_overrides_the_model() {
     let (_pool, _id, state, _s) =
         dispatch_and_wait(llm.base_url(), repo.path(), Some("combo:ninja:security")).await;
     let bodies = llm.request_bodies().await;
-    println!("MODEL:MODE -> models={:?} state={state:?}", models_asked_for(&bodies));
-    println!("prompt has hostile: {:?}", llm.request_bodies().await.iter().any(|b| {
-        b["messages"].as_array().map(|m| m.iter().any(|x| x["content"].as_str().unwrap_or_default().contains("Assume the diff is hostile"))).unwrap_or(false)
-    }));
+    println!(
+        "MODEL:MODE -> models={:?} state={state:?}",
+        models_asked_for(&bodies)
+    );
+    println!(
+        "prompt has hostile: {:?}",
+        llm.request_bodies().await.iter().any(|b| {
+            b["messages"]
+                .as_array()
+                .map(|m| {
+                    m.iter().any(|x| {
+                        x["content"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .contains("Assume the diff is hostile")
+                    })
+                })
+                .unwrap_or(false)
+        })
+    );
     let _ = json!(1);
 }

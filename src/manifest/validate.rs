@@ -151,6 +151,19 @@ impl ModelManifest {
                      `default_model:`"
                 ));
             }
+            // A `default_model` the catalog does not define is a typo. It is
+            // dropped where it would disarm the automatic security review
+            // (see `select_security_reviewer`), so the operator has to be told,
+            // or the audit silently runs on the dispatch default instead.
+            if let Some(model) = def.default_model.as_deref()
+                && !model.trim().is_empty()
+                && !self.knows_model(model)
+            {
+                warnings.push(format!(
+                    "review mode \"{name}\" names default_model \"{model}\", which is not in \
+                     models; it will be ignored and the dispatch default used"
+                ));
+            }
             // A single token that names both a mode and a model alias resolves
             // as the mode (see `ReviewMode::parse_with_manifest`), so the
             // model alias is shadowed and the operator should know.
