@@ -1663,3 +1663,49 @@ fn a_completed_worker_with_no_commits_beyond_its_base_is_not_integrated() {
         "the branch must survive"
     );
 }
+
+/// A round's consolidator can integrate a worker's *content* rather than its
+/// history: a squash or a re-merge writes the same tree on `main` under a
+/// different commit, so `worker-<id>` is not an ancestor of `main` even though
+/// every line of the work is there. Ancestry alone would leave the completed
+/// worker on the books forever, and the operator has to discard it by hand --
+/// twice, on this repository.
+///
+/// The sweep answers with the same proof a merge uses: the branch is
+/// integrated when it is contained in the base *or* when merging it into the
+/// base would change nothing. A change the base does not carry fails both
+/// proofs and keeps the worker.
+#[test]
+fn the_sweep_retires_a_worker_whose_change_reached_the_base_as_a_squash() {
+    let f = Fixture::new("retire-squashed");
+    // Two completed workers on branches off the same base: one whose content
+    // the base took over as a squash, one whose content it never took.
+    f.commit_on_worker_branch("sq1", "sq1.txt", "squashed work\n");
+    f.record_with_status("sq1", mini_swe_mcp::pool::RegistryStatus::Completed);
+    f.commit_on_worker_branch("nq1", "nq1.txt", "unmerged work\n");
+    f.record_with_status("nq1", mini_swe_mcp::pool::RegistryStatus::Completed);
+
+    // The round took `sq1`'s file onto `main` as its own commit: the content is
+    // on the base, the worker's commit is not an ancestor of it.
+    write(f.repo(), "sq1.txt", "squashed work\n");
+    git(f.repo(), &["add", "."]);
+    git(f.repo(), &["commit", "-m", "consolidate the round"]);
+
+    let sweep = f.sweep();
+
+    assert_eq!(
+        sweep.workers,
+        vec!["sq1".to_string()],
+        "a worker whose change is on the base as a squash is integrated"
+    );
+    assert!(!f.row_exists("sq1"), "the row must be retired");
+    assert!(!f.history_exists("sq1"), "the conversation must be retired");
+    assert!(
+        !git_ref_exists(f.repo(), "worker-sq1"),
+        "the squashed branch must be deleted"
+    );
+    assert!(
+        f.row_exists("nq1") && git_ref_exists(f.repo(), "worker-nq1"),
+        "a change the base does not carry must keep its worker and its branch"
+    );
+}
