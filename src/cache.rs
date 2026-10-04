@@ -928,15 +928,23 @@ mod tests {
             .unwrap_or_else(std::env::temp_dir)
     }
 
-    /// A repository of this test's own, under a base it alone knows.
-    fn slot_cap_repo(tag: &str) -> PathBuf {
+    /// A repository of this test's own, under a base it alone knows, with a
+    /// guard that reclaims the base -- and with it every `swe-target-<key>-<n>`
+    /// slot leased under it -- on *every* exit path, a panic included.
+    ///
+    /// The three cap tests below drive real leases, so a sequential
+    /// `remove_dir_all` at the end of the test body is not enough: a failed
+    /// assertion unwinds straight past it and leaves a `swe-slot-cap-base-*`
+    /// entry in the operator's temp dir, one per run, for as long as nobody
+    /// prunes it. The guard owns the base instead.
+    fn slot_cap_repo(tag: &str) -> (crate::test_support::TestScratch, PathBuf) {
         let base = std::env::temp_dir().join(format!(
             "swe-slot-cap-base-{tag}-{}",
             uuid::Uuid::new_v4().simple()
         ));
         let repo = base.join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
-        repo
+        std::fs::create_dir_all(&repo).expect("create the slot-cap repository");
+        (crate::test_support::TestScratch::own(base), repo)
     }
 
     /// A file that *looks* like `bytes` of build output without occupying them:
@@ -965,7 +973,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_idle_slot_over_the_cap_is_emptied_when_it_is_leased() {
-        let repo = slot_cap_repo("trim");
+        let (_base, repo) = slot_cap_repo("trim");
         let first = BuildDirLease::acquire_in(&repo, &slot_cap_base(&repo), ONE_GIB).unwrap();
         let dir = first.dir().to_path_buf();
         // The worker ends: the slot is idle again, as it is between two.
@@ -991,8 +999,6 @@ mod tests {
             "the lease file must survive: it is what the worker still holds"
         );
         drop(second);
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&repo);
     }
 
     /// The cap is enforced on the slot the caller holds and on nothing else:
@@ -1001,7 +1007,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_slot_another_worker_holds_is_never_emptied() {
-        let repo = slot_cap_repo("held");
+        let (_base, repo) = slot_cap_repo("held");
         let held = BuildDirLease::acquire_in(&repo, &slot_cap_base(&repo), ONE_GIB).unwrap();
         let dir = held.dir().to_path_buf();
         let stale = seed_stale_artifact(&dir, OVER_ONE_GIB);
@@ -1015,8 +1021,6 @@ mod tests {
             "a slot a live worker holds must never be emptied"
         );
         drop((held, other));
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&repo);
     }
 
     /// `MINI_SWE_TARGET_SLOT_MAX_GIB=0` turns the cap off, for a host whose
@@ -1024,7 +1028,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_zero_cap_leaves_an_over_cap_slot_alone() {
-        let repo = slot_cap_repo("off");
+        let (_base, repo) = slot_cap_repo("off");
         let first = BuildDirLease::acquire_in(&repo, &slot_cap_base(&repo), 0).unwrap();
         let dir = first.dir().to_path_buf();
         drop(first);
@@ -1037,8 +1041,6 @@ mod tests {
             "a zero cap must leave the slot exactly as it was"
         );
         drop(second);
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&repo);
     }
 
     #[cfg(unix)]

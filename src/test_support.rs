@@ -128,3 +128,164 @@ impl Drop for TestScratch {
         let _ = std::fs::remove_dir_all(&self.path);
     }
 }
+
+#[cfg(test)]
+mod hygiene_tests {
+    //! Every `swe-*` entry a library unit test creates is reclaimed with it.
+    //!
+    //! A sequential `remove_dir_all` at the tail of a test body is not a
+    //! guarantee: a failed assertion -- the very path these tests exist to
+    //! reach -- unwinds straight past it. The fixtures that used that shape left
+    //! a `swe-slot-cap-base-*` directory in the operator's temp dir and a
+    //! `swe-tmp-<leaf>` private scratch in the real scratch base, one per run,
+    //! for as long as nobody pruned it. Only a `Drop` guard removes on every
+    //! path, so these tests drive the real fixtures through a panic and assert
+    //! the base comes back empty.
+    //!
+    //! Each scan is scoped to the exact directory the guard claims, never the
+    //! whole base: the unit-test binary runs tests in parallel and sibling
+    //! tests legitimately create entries beside it, so a base-wide scan would
+    //! be racy and unfalsifiable. Nothing here spawns a process, touches the
+    //! environment or reaches outside its own unique name.
+
+    use super::TestScratch;
+    use std::path::{Path, PathBuf};
+
+    /// The `swe-*` entries in `dir` whose name mentions `needle`.
+    ///
+    /// A sibling test working under its own unique name is not this guard's
+    /// business, so only the entries derived from the name under test count.
+    fn swe_entries_named(dir: &Path, needle: &str) -> Vec<PathBuf> {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("swe-") && name.contains(needle))
+            })
+            .collect()
+    }
+
+    /// Run `body` and return whether it unwound, with a panic silenced so the
+    /// harness still reports a real failure rather than a spurious backtrace.
+    fn panics<F: FnOnce()>(body: F) -> bool {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).is_err();
+        std::panic::set_hook(previous);
+        unwound
+    }
+
+    /// Variant B's `HOME`/`TMPDIR` are filed as `swe-tmp-<leaf>` under the
+    /// scratch base, keyed on the worktree's leaf name -- not inside the
+    /// worktree. Removing the worktree alone therefore leaves the private
+    /// scratch behind, and a test that panics after building the environment
+    /// leaves it forever.
+    #[test]
+    fn a_panicking_divergent_environment_test_leaves_no_private_scratch() {
+        let guard = TestScratch::new("hygiene-divergent");
+        let worktree = guard.path().to_path_buf();
+        let base = crate::worktree::swe_base_dir();
+        let leaf = worktree
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("the scratch has a leaf name")
+            .to_string();
+
+        let mut derived = PathBuf::new();
+        let unwound = panics(|| {
+            // The real fixture: the production code under test files the
+            // divergent HOME/TMPDIR as it always does.
+            let env = crate::pool::runner::divergent::divergent_environment(&worktree, &[]);
+            derived = env
+                .iter()
+                .find(|(name, _)| name == "HOME")
+                .map(|(_, value)| PathBuf::from(value))
+                .expect("HOME is always set");
+            assert!(derived.is_dir(), "precondition: the scratch exists");
+            panic!("the assertion the fixture exists to provoke");
+        });
+        assert!(unwound, "the fixture must have unwound for this to test anything");
+
+        drop(guard);
+        let leaked = swe_entries_named(&base, &leaf);
+        assert!(
+            leaked.is_empty(),
+            "{} outlived the test that derived it: {leaked:?}",
+            base.display()
+        );
+    }
+
+    /// A build-slot lease files `swe-target-<key>-<n>` under the base the caller
+    /// names. When a test drives the cap against a base of its own, that base --
+    /// and every slot in it -- belongs to the test, on the failure path too.
+    #[test]
+    fn a_panicking_slot_cap_test_leaves_no_base_and_no_slots() {
+        let guard = TestScratch::new("swe-slot-cap-base-hygiene");
+        let base = guard.path().to_path_buf();
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).expect("create the fixture repository");
+
+        let mut unwound = false;
+        let mut leased = PathBuf::new();
+        let body = || {
+            let lease = crate::cache::BuildDirLease::acquire_in(&repo, &base, 0)
+                .expect("lease a build slot under the test's own base");
+            leased = lease.dir().to_path_buf();
+            assert!(leased.is_dir(), "precondition: the slot exists");
+            // The lease is deliberately still held: the guard must reclaim a
+            // base whose slot is live, which is the state a failing cap
+            // assertion leaves behind.
+            panic!("the assertion the fixture exists to provoke");
+        };
+        unwound = panics(body);
+        assert!(unwound, "the fixture must have unwound for this to test anything");
+        assert!(
+            leased.starts_with(&base),
+            "the slot must live under the test's own base, got {}",
+            leased.display()
+        );
+
+        drop(guard);
+        assert!(
+            !base.exists(),
+            "{} outlived the test that created it",
+            base.display()
+        );
+    }
+
+    /// The successful path must be clean too, and the ordinary end of a test
+    /// body -- no panic -- is the path that runs most often, so it is the one a
+    /// regression would most easily keep.
+    #[test]
+    fn a_divergent_environment_test_reclaims_its_scratch_on_the_normal_path() {
+        let guard = TestScratch::new("hygiene-divergent-ok");
+        let worktree = guard.path().to_path_buf();
+        let base = crate::worktree::swe_base_dir();
+        let leaf = worktree
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("the scratch has a leaf name")
+            .to_string();
+
+        let env = crate::pool::runner::divergent::divergent_environment(&worktree, &[]);
+        let home = env
+            .iter()
+            .find(|(name, _)| name == "HOME")
+            .map(|(_, value)| PathBuf::from(value))
+            .expect("HOME is always set");
+        assert!(home.is_dir(), "precondition: the scratch exists");
+
+        drop(guard);
+        let leaked = swe_entries_named(&base, &leaf);
+        assert!(
+            leaked.is_empty(),
+            "{} outlived the test that derived it: {leaked:?}",
+            base.display()
+        );
+    }
+}

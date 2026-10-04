@@ -633,7 +633,7 @@ mod tests {
 
     #[test]
     fn the_divergent_environment_shifts_home_tmpdir_and_tz() {
-        let guard = crate::test_support::TestScratch::own(scratch("env"));
+        let guard = crate::test_support::TestScratch::new("divergent-env");
         let worktree = guard.path().to_path_buf();
         let env = divergent_environment(
             &worktree,
@@ -664,12 +664,14 @@ mod tests {
             Path::new(&home).starts_with(crate::worktree::scratch_dir(&worktree)),
             "the divergent HOME must stay inside the worker's private scratch, got {home:?}"
         );
-        let _ = std::fs::remove_dir_all(&worktree);
+        // `guard` reclaims the worktree and the `swe-tmp-<leaf>` scratch that
+        // `divergent_environment` derived from it, on the success path and on
+        // the failure path alike.
     }
 
     #[test]
     fn a_dispatcher_variable_cannot_override_the_deliberate_divergence() {
-        let guard = crate::test_support::TestScratch::own(scratch("override"));
+        let guard = crate::test_support::TestScratch::new("divergent-override");
         let worktree = guard.path().to_path_buf();
         let env = divergent_environment(
             &worktree,
@@ -687,7 +689,7 @@ mod tests {
             home, "/dispatchers/home",
             "the deliberate divergence must win over the dispatcher's own value"
         );
-        let _ = std::fs::remove_dir_all(&worktree);
+        // `guard` reclaims the worktree and its derived `swe-tmp-<leaf>` scratch.
     }
 
     #[test]
