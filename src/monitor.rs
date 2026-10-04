@@ -1148,10 +1148,8 @@ fn build_list_lines<'a>(
     width: usize,
     expanded: bool,
 ) -> (Vec<ListLine<'a>>, Vec<&'a WorkerRegistryEntry>) {
-    let content = list_content_lines(entries, now, width, false);
     let mut lines = Vec::new();
     let mut order = Vec::new();
-    let mut group_names: Vec<String> = Vec::new();
     let mut groups: BTreeMap<String, Vec<&'a WorkerRegistryEntry>> = BTreeMap::new();
     for entry in entries {
         groups.entry(group_key(entry)).or_default().push(entry);
@@ -1161,9 +1159,7 @@ fn build_list_lines<'a>(
         .map(|e| e.repo_path.as_deref().unwrap_or(DEFAULT_REPO_KEY))
         .collect();
     let show_repo = repos.len() > 1;
-    let _ = content;
     for (name, workers) in &groups {
-        group_names.push(name.clone());
         if show_repo {
             let repo = workers
                 .first()
@@ -1171,7 +1167,14 @@ fn build_list_lines<'a>(
                 .unwrap_or(DEFAULT_REPO_KEY);
             lines.push(ListLine::Header(format!("repo: {repo}")));
         }
-        lines.push(ListLine::Header(name.clone()));
+        let counts = group_counts(workers, false);
+        let header = if counts.is_empty() {
+            name.clone()
+        } else {
+            format!("{name}  {counts}")
+        };
+        let inner = width.saturating_sub(4).max(1);
+        lines.push(ListLine::Header(truncate_visible(&header, inner)));
         if expanded {
             for w in workers {
                 order.push(*w);
