@@ -1163,6 +1163,12 @@ pub async fn run(args: &[String], json_output: bool, admin: bool) -> Result<i32>
             .flatten()
             .filter_map(|v| v.as_str().map(str::to_string))
             .collect();
+        if std::env::var("MINI_SWE_WATCH_DEBUG").is_ok() {
+            eprintln!(
+                "watch-debug: snapshot watching={watching:?} events={} initial={initial}",
+                response["events"].as_array().map(|a| a.len()).unwrap_or(0)
+            );
+        }
         // A `--all` round must keep every selected id until it reports, so its
         // terminal workers are never pruned away mid-round.
         if explicit && !opts.all {
@@ -1198,6 +1204,11 @@ pub async fn run(args: &[String], json_output: bool, admin: bool) -> Result<i32>
         }
         initial = false;
         if watching.is_empty() && (explicit || watched_any) {
+            if std::env::var("MINI_SWE_WATCH_DEBUG").is_ok() {
+                eprintln!(
+                    "watch-debug: ending watching={watching:?} events={events:?} printed_event={printed_event} watched_any={watched_any} initial={initial} reply={response}"
+                );
+            }
             return Ok(end_watch(printed_event, watched_any));
         }
         let wait = match opts.timeout {
