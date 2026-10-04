@@ -205,17 +205,44 @@ mod tests {
 
     /// `--quiet` is a clean id list: one started id per line, in payload order,
     /// and the entries that failed go to the errors side, never into stdout.
+    ///
+    /// When at least one worker started, the watch command is populated so the
+    /// caller can be reminded to keep a watch running; when nothing started,
+    /// it is empty and no reminder is printed.
     #[test]
     fn test_format_dispatch_quiet_lists_ids_and_splits_errors() {
         let single = format_dispatch_quiet(&v(r#"{"worker_id":"w1","status":"dispatched"}"#));
         assert_eq!(single.worker_ids, vec!["w1"]);
         assert!(single.errors.is_empty(), "{:?}", single.errors);
+        // No group means no special watch command; the reminder is absent.
+        assert!(single.watch_command.is_empty(), "{:?}", single.watch_command);
 
         let batch = format_dispatch_quiet(&v(
             r#"{"workers":[{"index":0,"worker_id":"w1"},{"index":1,"error":"'task' is required"},{"index":2,"worker_id":"w2"}]}"#,
         ));
         assert_eq!(batch.worker_ids, vec!["w1", "w2"]);
         assert_eq!(batch.errors, vec!["'task' is required"]);
+        // No group means no special watch command; the reminder is absent.
+        assert!(batch.watch_command.is_empty(), "{:?}", batch.watch_command);
+
+        // When a consolidated dispatch starts workers, the watch command is
+        // built with --group and --all so the caller knows how to wait.
+        let consolidated = format_dispatch_quiet(&v(
+            r#"{"workers":[{"index":0,"worker_id":"w1"}],"group":"round-1"}"#,
+        ));
+        assert_eq!(consolidated.worker_ids, vec!["w1"]);
+        assert_eq!(
+            consolidated.watch_command,
+            "mini-swe-mcp watch --group round-1 --all"
+        );
+
+        // When nothing started, the watch command is empty and no reminder is
+        // printed.
+        let nothing_started = format_dispatch_quiet(&v(
+            r#"{"workers":[{"index":0,"error":"'task' is required"}]}"#,
+        ));
+        assert!(nothing_started.worker_ids.is_empty());
+        assert!(nothing_started.watch_command.is_empty());
     }
 
     #[test]
