@@ -15,8 +15,8 @@ use crate::common::{TempDir, git, git_ref_exists};
 use mini_swe_mcp::agent::{ChatMessage, Role};
 use mini_swe_mcp::pool::{
     MergeApprovedRequest, MergeRequest, RegistryStatus, WorkerApproval, WorkerHistory,
-    WorkerRegistryEntry, append_history_message_in, load_registry_entry_in, merge_approved_in,
-    merge_worker_in, save_registry_entry_in, unintegrated_workers_in,
+    WorkerRegistryEntry, WorkerRole, append_history_message_in, load_registry_entry_in,
+    merge_approved_in, merge_worker_in, save_registry_entry_in, unintegrated_workers_in,
 };
 use mini_swe_mcp::worktree::ScratchRoot;
 use std::path::Path;
@@ -110,6 +110,9 @@ impl Fixture {
             task: "consolidate the round".to_string(),
             status: RegistryStatus::Completed,
             step: 5,
+            // A consolidator's own row carries its role: it is what makes the
+            // round this worker integrated, and what the merge reads it from.
+            role: WorkerRole::Consolidate,
             repo_path: Some(self.repo().to_string_lossy().into_owned()),
             base_branch: Some("main".to_string()),
             base_commit: Some(git(self.repo(), &["rev-parse", "HEAD"]).trim().to_string()),
