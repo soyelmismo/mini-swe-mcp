@@ -692,10 +692,18 @@ impl WorkerPool {
         let requested = match review_after.as_deref() {
             Some(s) => {
                 let (reviewer, mode) = ReviewMode::parse_with_manifest(s, self.manifest())?;
+                // The reviewer is an alias or an id: resolve an alias to the id
+                // the provider is called, exactly as the dispatch handler does
+                // for the `<model>:<mode>` form. An alias sent verbatim is a
+                // model no provider serves, so the review would fail quietly
+                // and the diff would complete unaudited. `resolve_model`
+                // resolves an id to itself, so an already-resolved reviewer is
+                // unchanged, and an unknown name passes through as it always
+                // has.
                 let reviewer = if reviewer.trim().is_empty() {
                     default_model.clone()
                 } else {
-                    reviewer
+                    self.manifest().resolve_model(reviewer.trim()).0
                 };
                 Some((reviewer, mode))
             }

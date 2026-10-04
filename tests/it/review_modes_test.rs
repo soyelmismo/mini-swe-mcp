@@ -472,3 +472,84 @@ async fn an_unknown_mode_is_a_dispatch_error() {
         "{message} must list the declared mode"
     );
 }
+
+// ----------
+// Ambiguity and unusable names
+// ----------
+
+/// Two case variants of a built-in mode must not make the reviewer
+/// nondeterministic: `review_mode` falls back to a case-insensitive scan of a
+/// `HashMap` with a randomly seeded order, so with both `Security:` and
+/// `SECURITY:` declared the automatic adversarial audit would pick its
+/// `default_model` differently from run to run. The catalog must say so, and
+/// the pick must be a fixed one.
+#[test]
+fn two_case_variants_of_a_builtin_mode_warn_and_resolve_deterministically() {
+    let manifest = modes_manifest(
+        "models:\n  nerd:\n    id: combo:nerd\n  weak:\n    id: combo:weak\nreview_modes:\n  Security:\n    default_model: nerd\n  SECURITY:\n    default_model: weak\n",
+    );
+    let warnings = manifest.validate();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("Security") && w.contains("SECURITY")),
+        "two spellings of one built-in mode must warn: {warnings:?}"
+    );
+    // The scan picks the lexicographically first spelling ("SECURITY" sorts
+    // before "Security"), every run, so the reviewer it names is fixed.
+    assert_eq!(
+        manifest
+            .review_mode("security")
+            .and_then(|def| def.default_model.clone()),
+        Some("weak".to_string()),
+        "the case-insensitive lookup must not depend on HashMap order"
+    );
+    let (reviewer, _) = ReviewMode::parse_with_manifest("security", &manifest).expect("security");
+    assert_eq!(reviewer, "weak");
+}
+
+/// A mode name that cannot survive the dispatch -> review-phase round trip
+/// (`<model>:<mode>` is split at the last colon) must be rejected when the
+/// catalog loads, not accepted at dispatch and then fail the worker after the
+/// implementation has already run.
+#[test]
+fn a_mode_name_with_a_colon_is_dropped_with_a_warning() {
+    let manifest = modes_manifest(
+        "models:\n  nerd:\n    id: combo:nerd\nreview_modes:\n  \"a:b\":\n    checklist: Check.\n",
+    );
+    let warnings = manifest.validate();
+    assert!(
+        warnings.iter().any(|w| w.contains("a:b")),
+        "an unselectable mode name must be named to the operator: {warnings:?}"
+    );
+    let normalized = manifest.normalize();
+    assert!(
+        normalized.review_mode("a:b").is_none(),
+        "a mode no `--review-after` spelling can reach must not stay in the catalog"
+    );
+    assert!(
+        ReviewMode::parse_with_manifest("a:b", &normalized).is_err(),
+        "the dispatch must reject it instead of failing the worker's review phase"
+    );
+    assert!(
+        normalized.validate().is_empty(),
+        "{:?}",
+        normalized.validate()
+    );
+}
+
+/// An empty or blank mode name is the same defect: the dispatch accepts it
+/// (the bare-mode path matches the declared key) and the stored
+/// `<model>:<mode>` form then fails to re-parse.
+#[test]
+fn a_mode_name_without_content_is_dropped_with_a_warning() {
+    let manifest = modes_manifest(
+        "models:\n  nerd:\n    id: combo:nerd\nreview_modes:\n  \" \":\n    checklist: Check.\n",
+    );
+    let warnings = manifest.validate();
+    assert!(
+        warnings.iter().any(|w| w.contains("review mode")),
+        "a blank mode name must be named to the operator: {warnings:?}"
+    );
+    assert!(manifest.normalize().review_modes.is_empty());
+}
