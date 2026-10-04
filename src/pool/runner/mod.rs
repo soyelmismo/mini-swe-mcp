@@ -88,6 +88,9 @@ pub struct RunConfig<'a> {
     pub repo_path_str: &'a str,
     /// The dispatcher's ambient environment for the differential verify run.
     pub client_env: &'a [(String, String)],
+    /// Step the loop's monotonic counter starts at: `0` unless this run
+    /// continues an interrupted one, which keeps the counter it had.
+    pub resume_step: usize,
 }
 
 /// Everything the execution loop needs to start one worker.
@@ -117,6 +120,10 @@ pub struct WorkerLaunchConfig {
     /// a fresh one, so a revision keeps its id, its branch and its checkpoints.
     pub resume_base_commit: Option<String>,
     pub resume_base_branch: Option<String>,
+    /// Step counter the run resumes at. `0` for a fresh dispatch and for a
+    /// revision, which both get a whole new budget; an interrupted run that is
+    /// continued keeps the counter it had, so its ceiling stays absolute.
+    pub resume_step: usize,
 }
 
 /// Deletes a worker's steering mailbox when the worker exits.
@@ -257,10 +264,13 @@ impl WorkerPool {
             resume_messages,
             resume_base_commit,
             resume_base_branch,
+            resume_step,
         } = config;
 
         let repo_path_str = repo_path.to_string_lossy().to_string();
+        eprintln!("DBG run_worker entry wid={worker_id}");
         let _permit = self.worker_slots.acquire(&meta.owner).await;
+        eprintln!("DBG slot acquired wid={worker_id}");
         let revision = resume_base_commit.is_some();
         info!(worker = %worker_id, model = %model, revision, "Starting worker execution");
 
@@ -312,6 +322,7 @@ impl WorkerPool {
             })
             .await
             .context("Worktree checkout task failed")??;
+        eprintln!("DBG worktree ready wid={worker_id} initial_sync={:?}", initial_sync);
         // A kill must not lose what this worker leaves uncommitted, and the
         // guard that owns the checkout dies with the task a kill aborts, so the
         // pool keeps the path and commits through it (see `WorkerPool::kill`).
@@ -415,6 +426,7 @@ impl WorkerPool {
                 verify: verify.as_deref(),
                 repo_path_str: &repo_path_str,
                 client_env: &client_env,
+                resume_step,
             },
             meta,
             &mut worktree,
@@ -451,6 +463,7 @@ impl WorkerPool {
         worktree: &mut WorktreeGuard,
         messages: &mut Vec<ChatMessage>,
     ) -> Result<()> {
+        eprintln!("DBG run_phases entry wid={worker_id} resume_step={}", config.resume_step);
         let task = config.task.to_string();
         let model = config.model.to_string();
         let default_model = config.default_model.to_string();
@@ -477,7 +490,10 @@ impl WorkerPool {
             worker_id,
         };
 
-        let mut step = 0;
+        // A continuation of an interrupted run resumes its own counter, so the
+        // ceiling it resumes under stays absolute: 30 turns spent of 250 leaves
+        // 220, not a fresh 250 (or the revision default).
+        let mut step = config.resume_step;
         let mut current_max_turns = max_turns;
         let mut consecutive_no_cmd = 0;
         let mut last_assistant_text = String::new();
@@ -519,6 +535,7 @@ impl WorkerPool {
                     review_after: review_after.as_deref(),
                     network_offline,
                 };
+                eprintln!("DBG before run_turn wid={worker_id} step={step} of max={current_max_turns}");
                 let mut engine = TurnEngine {
                     pool: self,
                     worktree,
@@ -540,7 +557,9 @@ impl WorkerPool {
                     report_text: &mut report_text,
                     verdicts: &mut verdicts,
                 };
-                match engine.run_turn(&turn_config).await? {
+                let turn_result = engine.run_turn(&turn_config).await;
+                eprintln!("DBG after run_turn wid={worker_id} step={step} completed={:?}", turn_result.as_ref().map(|o| matches!(o, TurnOutcome::Completed { .. })));
+                match turn_result? {
                     TurnOutcome::Completed { verified: v } => {
                         // Flush the completion turn too: a reused verify pushes its
                         // disclosure note here, and a crash must not lose it.

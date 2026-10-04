@@ -1132,7 +1132,7 @@ async fn a_checkpointed_worker_survives_hub_sigkill_and_revision() {
     let mut first = command()
         .arg("daemon")
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
         .kill_on_drop(true)
         .spawn()
         .unwrap();
@@ -1217,7 +1217,7 @@ async fn a_checkpointed_worker_survives_hub_sigkill_and_revision() {
     let mut second = command()
         .arg("daemon")
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
         .env("HUB_AUTO_RESUME", "0")
         .kill_on_drop(true)
         .spawn()
