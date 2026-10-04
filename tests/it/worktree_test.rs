@@ -76,6 +76,12 @@ impl TestRepo {
         WorktreeGuard::new_in(&self.scratch(), &self.dir, worker_id)
             .expect("worktree creation failed")
     }
+
+    /// Re-attach to the branch [`Self::guard`] preserved, under the same
+    /// isolated root.
+    fn reopen(&self, worker_id: &str, base_commit: &str) -> anyhow::Result<WorktreeGuard> {
+        WorktreeGuard::reopen_in(&self.scratch(), &self.dir, worker_id, base_commit)
+    }
 }
 
 impl Drop for TestRepo {
@@ -181,7 +187,6 @@ fn concurrent_guards_use_distinct_branches_and_paths() {
 #[test]
 fn get_diff_spans_checkpoint_commits_and_uncommitted_work() {
     let test_repo = TestRepo::new("diff-checkpoint");
-    let repo = test_repo.path();
     let id = unique_worker_id("diff-checkpoint");
     let mut guard = test_repo.guard(&id);
 
@@ -205,7 +210,6 @@ fn get_diff_spans_checkpoint_commits_and_uncommitted_work() {
 #[test]
 fn get_diff_reports_untracked_and_modified_files() {
     let test_repo = TestRepo::new("diff");
-    let repo = test_repo.path();
     let id = unique_worker_id("diff");
     let guard = test_repo.guard(&id);
 
@@ -723,7 +727,6 @@ fn worktree_directory_is_private_to_its_owner() {
     use std::os::unix::fs::PermissionsExt;
 
     let test_repo = TestRepo::new("private");
-    let repo = test_repo.path();
     let id = unique_worker_id("private");
     let guard = test_repo.guard(&id);
 
@@ -768,7 +771,7 @@ fn reopen_reattaches_to_the_preserved_branch() {
         "the finished run must remove its checkout"
     );
 
-    let guard = WorktreeGuard::reopen(repo, &id, &base).expect("reopen must re-attach");
+    let guard = test_repo.reopen(&id, &base).expect("reopen must re-attach");
     assert_eq!(guard.branch, branch, "the revision keeps the same branch");
     assert_eq!(
         guard.base_commit, base,
@@ -788,10 +791,9 @@ fn reopen_reattaches_to_the_preserved_branch() {
 #[test]
 fn reopen_on_a_missing_branch_is_a_clear_error() {
     let test_repo = TestRepo::new("reopen-missing");
-    let repo = test_repo.path();
     let id = unique_worker_id("reopen-missing");
 
-    let err = match WorktreeGuard::reopen(repo, &id, "abc123") {
+    let err = match test_repo.reopen(&id, "abc123") {
         Ok(_) => panic!("no such branch exists"),
         Err(e) => e,
     };

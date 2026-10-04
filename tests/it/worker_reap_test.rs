@@ -78,10 +78,6 @@ impl TestRepo {
         Self { dir }
     }
 
-    fn path(&self) -> &Path {
-        &self.dir
-    }
-
     /// A worker checkout of this repository under an isolated scratch root.
     ///
     /// `WorktreeGuard::new` files the checkout, and the private
