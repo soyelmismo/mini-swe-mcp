@@ -174,7 +174,7 @@ If the second run fails the completion is refused and the model is told which va
 
 - **Admission.** Heavy commands are classified and dosed: at most `BASH_BUILD_LIMIT` (default the core count) heavy builds at once, gated by free memory (`HUB_MEM_RESERVE_MB`, `HUB_BUILD_MEM_MB`) and by Linux pressure-stall information — CPU `some avg10` (`HUB_CPU_PRESSURE_MAX`), memory and IO `full avg10` (`HUB_MEM_PRESSURE_MAX`, `HUB_IO_PRESSURE_MAX`). PSI measures the time tasks actually stalled on a resource, so it is not fooled by I/O wait or unrelated processes the way the 1-minute load average is; when `/proc/pressure` is unavailable the controller falls back to that load average. Light commands use `BASH_CONCURRENT_LIMIT` slots (default one per worker).
 - **Fair scheduling.** `MAX_CONCURRENT_WORKERS` bounds the pool and `MAX_WORKERS_PER_AGENT` caps each agent so one orchestrator cannot starve the others; runnable workers are scheduled across agents.
-- **Shared warm build dirs.** Workers share compiler/package caches under `SWE_CACHE_DIR`, so the second build is warm. `SWE_SHARED_CACHES` adds custom cache binds; `SWE_DISABLE_KACHE=1` (or `KACHE_DISABLED=1`) turns the kache layer off. Shared build slots are pruned by `HUB_TARGET_TTL_HOURS` / `HUB_TARGET_MAX_GB`.
+- **Shared warm build dirs.** Workers share compiler/package caches under `SWE_CACHE_DIR`, so the second build is warm. `SWE_SHARED_CACHES` adds custom cache binds; `SWE_DISABLE_KACHE=1` (or `KACHE_DISABLED=1`) turns the kache layer off. Shared build slots are pruned by `HUB_TARGET_TTL_HOURS` / `HUB_TARGET_MAX_GB`, and a slot that grew past `MINI_SWE_TARGET_SLOT_MAX_GIB` is emptied when the next worker leases it.
 - **Any ecosystem.** The caches, the sandbox grants and the parallelism caps are not Rust-specific: each tool is pointed at a shared cache under `SWE_CACHE_DIR` through its own variable, and the sandbox grants that directory (never the operator's home) with the rights the tool needs.
 
 | Ecosystem | Shared cache (under `SWE_CACHE_DIR`) | Variable the child sees | Credentials kept out |
@@ -251,6 +251,7 @@ Defaults are what the code uses when the variable is unset.
 | `SWE_ALLOW_TOOLCHAIN_CREDENTIALS` | `0` | `1` exposes the credential files beside the shared caches (`~/.npmrc`, `~/.m2/settings.xml`, `~/.gradle/gradle.properties`, `~/.cargo/credentials.toml`). |
 | `SWE_DISABLE_KACHE` / `KACHE_DISABLED` | unset | `1` disables the kache layer. |
 | `KACHE_CACHE_EXECUTABLES` | `0` | kache re-caches a worker's own test executables; worker builds disable it unless the operator sets the variable. |
+| `MINI_SWE_TARGET_SLOT_MAX_GIB` | `4` | Empty a leased build slot over this size; `0` disables the cap. |
 | `HUB_TARGET_TTL_HOURS` | `24` | Prune shared build slots older than this. |
 | `HUB_TARGET_MAX_GB` | `40` | Size cap on shared build slots. |
 | `MONITOR_WIDTH` | terminal size | Width used by `monitor` / `status`. |
