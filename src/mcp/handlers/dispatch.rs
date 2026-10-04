@@ -137,7 +137,7 @@ impl McpServer {
         if let Some(group) = Self::batch_round_group(args, tasks) {
             payload["group"] = json!(group);
         }
-        if crate::mcp::auto_consolidate::consolidate_requested(args) {
+        if auto_consolidate::consolidate_requested(args) {
             payload["consolidate"] = args["consolidate"].clone();
         }
         self.with_watch_command(&mut payload, ctx).await;
@@ -288,7 +288,7 @@ impl McpServer {
                     })?
                     .to_string(),
             ),
-            None if crate::mcp::auto_consolidate::consolidate_requested(args)
+            None if auto_consolidate::consolidate_requested(args)
                 && args.get("role").and_then(Value::as_str) != Some("consolidate") =>
             {
                 crate::pool::detect_cheap_verify_command(&repo_path)
@@ -354,7 +354,7 @@ impl McpServer {
         if let Some(group) = args.get("group").and_then(Value::as_str) {
             payload["group"] = json!(group);
         }
-        if crate::mcp::auto_consolidate::consolidate_requested(args) {
+        if auto_consolidate::consolidate_requested(args) {
             payload["consolidate"] = args["consolidate"].clone();
         }
         self.with_watch_command(&mut payload, ctx).await;

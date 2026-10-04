@@ -2,7 +2,10 @@
 //!
 //! Each test builds a private scratch root: the steer path writes worker
 //! mailboxes and history under the pool's scratch, so an ambient root would let
-//! a parallel test (or the real hub) collide with it.
+//! a parallel test (or the real hub) collide with it. The dispatch tests below
+//! go one step further: they install the watch-token store and the round store
+//! where the hub daemon installs them, but under that scratch root and without
+//! the scheduler loop, so nothing behind a test dispatches a real worker run.
 
 use super::*;
 use crate::hub::WatchTokens;
@@ -21,6 +24,47 @@ fn scratch(tag: &str) -> std::path::PathBuf {
     ));
     std::fs::create_dir_all(&dir).expect("create the scratch root");
     dir
+}
+
+/// A throwaway git repository a dispatched worker can build its worktree from.
+fn scratch_repo(base: &std::path::Path) -> std::path::PathBuf {
+    let repo = base.join("repo");
+    std::fs::create_dir_all(&repo).expect("create the scratch repository");
+    crate::worktree::git(&repo, "init", &["-b", "master"]).expect("init the repository");
+    crate::worktree::git(&repo, "config", &["user.name", "mini-swe-test"]).expect("config");
+    crate::worktree::git(&repo, "config", &["user.email", "test@localhost"]).expect("config");
+    std::fs::write(repo.join("README.md"), "# scratch\n").expect("seed the repository");
+    crate::worktree::git(&repo, "add", &["README.md"]).expect("stage the seed");
+    crate::worktree::git(&repo, "commit", &["-m", "baseline"]).expect("commit the seed");
+    repo
+}
+
+/// A pool on `base`'s own scratch root and a hub-style connection whose watch
+/// token store lives inside it, so a dispatched worker, its registry row and
+/// the token file all stay in the directory the test removes.
+fn dispatch_server(base: &std::path::Path, tag: &str) -> (McpServer, ConnectionContext) {
+    let server = McpServer::new(
+        WorkerPool::with_scratch(
+            4,
+            "http://localhost:1".to_string(),
+            "test-key".to_string(),
+            ScratchRoot::new(base),
+        ),
+        "ninja".to_string(),
+    );
+    let tokens_dir = base.join("watch-tokens");
+    std::fs::create_dir_all(&tokens_dir).expect("create the token directory");
+    let mut ctx = ConnectionContext::hub_connection(1)
+        .with_watch_tokens(Arc::new(WatchTokens::new(tokens_dir)));
+    ctx.agent_id = Some(format!("orchestrator-{tag}"));
+    (server, ctx)
+}
+
+/// Drop the row, the worktree and the directory one dispatched worker left.
+async fn reap_worker(server: &McpServer, base: &std::path::Path, wid: &str) {
+    server.pool.kill(wid).await;
+    crate::pool::remove_registry_entry_in(&ScratchRoot::new(base), wid);
+    let _ = std::fs::remove_dir_all(base);
 }
 
 /// The `watch_command` is only useful to a caller with no watch running: once
@@ -206,6 +250,64 @@ async fn a_second_watch_call_is_covered_or_widens_the_running_one() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// A dispatch that asks to consolidate answers with what a `--quiet` caller has
+/// to wait on: the round's group and the `consolidate` key beside the token-bound
+/// `watch_command`. The flag matters past the answer -- only the hub's scheduler
+/// starts the round's consolidator -- and the token matters past the reminder,
+/// because the round command it names (`watch --group <g> --all`) run without it
+/// would resolve to whichever identity the operator's shell is, and follow that
+/// agent's workers instead of this round.
+#[tokio::test]
+async fn a_consolidated_dispatch_answer_carries_the_round_and_its_token() {
+    let base = scratch("consolidated-round");
+    let repo = scratch_repo(&base);
+    let (server, ctx) = dispatch_server(&base, "round");
+    // The auto-consolidation store, installed where the daemon installs it. The
+    // scheduler loop is deliberately not started: what is under test is the
+    // flag's validation and the answer it rides out on, and nothing behind this
+    // test may dispatch a consolidator.
+    let hub_dir = base.join("hub");
+    std::fs::create_dir_all(&hub_dir).expect("create the hub directory");
+    *server.auto_consolidate.lock().expect("the store mutex") = Some(
+        crate::hub::auto_consolidate::AutoConsolidate::open(hub_dir).expect("open the round store"),
+    );
+
+    let answer = server
+        .execute_tool_for(
+            "worker",
+            json!({
+                "action": "dispatch",
+                "task": "probe",
+                "repo_path": repo.to_string_lossy(),
+                "group": "round-48",
+                "consolidate": "nerd",
+            }),
+            &ctx,
+        )
+        .await
+        .expect("a consolidated dispatch must answer");
+    let wid = answer["worker_id"]
+        .as_str()
+        .expect("a dispatched worker")
+        .to_string();
+    assert_eq!(answer["group"], json!("round-48"), "{answer}");
+    assert_eq!(answer["consolidate"], json!("nerd"), "{answer}");
+    let token = answer["watch_command"]
+        .as_str()
+        .expect("the hub minted a token-bound command")
+        .strip_prefix("MINI_SWE_WATCH_TOKEN=")
+        .and_then(|rest| rest.strip_suffix(" mini-swe-mcp watch"))
+        .expect("token between the assignment and the command")
+        .to_string();
+    assert_eq!(
+        crate::cli::format::format_dispatch_quiet(&answer).watch_command,
+        format!("MINI_SWE_WATCH_TOKEN={token} mini-swe-mcp watch --group round-48 --all"),
+        "the reminder must wait for the round, as this caller: {answer}"
+    );
+
+    reap_worker(&server, &base, &wid).await;
+}
+
 /// `consolidate: false` is the absence of a round, not a round: a dispatch that
 /// spells it out still answers with its group and its token-bound watch, so the
 /// `--quiet` reminder keeps following this caller's own workers instead of being
@@ -213,29 +315,8 @@ async fn a_second_watch_call_is_covered_or_widens_the_running_one() {
 #[tokio::test]
 async fn a_declined_consolidate_round_does_not_rewrite_the_watch_command() {
     let base = scratch("declined-consolidate");
-    let repo = base.join("repo");
-    std::fs::create_dir_all(&repo).expect("create the scratch repository");
-    crate::worktree::git(&repo, "init", &["-b", "master"]).expect("init the scratch repository");
-    crate::worktree::git(&repo, "config", &["user.name", "mini-swe-test"]).expect("config");
-    crate::worktree::git(&repo, "config", &["user.email", "test@localhost"]).expect("config");
-    std::fs::write(repo.join("README.md"), "# scratch\n").expect("seed the repository");
-    crate::worktree::git(&repo, "add", &["README.md"]).expect("stage the seed");
-    crate::worktree::git(&repo, "commit", &["-m", "baseline"]).expect("commit the seed");
-
-    let server = McpServer::new(
-        WorkerPool::with_scratch(
-            4,
-            "http://localhost:1".to_string(),
-            "test-key".to_string(),
-            ScratchRoot::new(&base),
-        ),
-        "ninja".to_string(),
-    );
-    let tokens_dir = base.join("watch-tokens");
-    std::fs::create_dir_all(&tokens_dir).expect("create the token directory");
-    let mut ctx = ConnectionContext::hub_connection(1)
-        .with_watch_tokens(Arc::new(WatchTokens::new(tokens_dir)));
-    ctx.agent_id = Some("orchestrator".to_string());
+    let repo = scratch_repo(&base);
+    let (server, ctx) = dispatch_server(&base, "declined");
 
     let answer = server
         .execute_tool_for(
@@ -257,7 +338,8 @@ async fn a_declined_consolidate_round_does_not_rewrite_the_watch_command() {
         .to_string();
 
     assert_eq!(
-        answer["group"], json!("round-48"),
+        answer["group"],
+        json!("round-48"),
         "the answer still names the group: {answer}"
     );
     assert!(
@@ -266,11 +348,11 @@ async fn a_declined_consolidate_round_does_not_rewrite_the_watch_command() {
     );
     assert_eq!(
         crate::cli::format::format_dispatch_quiet(&answer).watch_command,
-        answer["watch_command"].as_str().expect("the hub minted a token-bound command"),
+        answer["watch_command"]
+            .as_str()
+            .expect("the hub minted a token-bound command"),
         "a declined round keeps the command that follows this caller's workers: {answer}"
     );
 
-    server.pool.kill(&wid).await;
-    crate::pool::remove_registry_entry_in(&ScratchRoot::new(&base), &wid);
-    let _ = std::fs::remove_dir_all(&base);
+    reap_worker(&server, &base, &wid).await;
 }
