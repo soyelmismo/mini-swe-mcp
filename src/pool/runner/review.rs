@@ -1207,6 +1207,54 @@ fn own_history_args(branch: &str, exclusions: Vec<String>, reverse: bool) -> Vec
     args
 }
 
+/// The files the pre-2.36 own-history fallback reports for a consolidator
+/// (test support).
+///
+/// The fallback only runs when git rejects `--remerge-diff`, which a current git
+/// never does, so the query it builds would otherwise be unreachable from a test.
+/// Exposing it lets the pre-2.36 behaviour be asserted on the git in hand.
+#[doc(hidden)]
+pub(super) async fn __test_own_files_fallback(
+    path: &Path,
+    branch: &str,
+    merged: &[String],
+    base_tip: Option<&str>,
+) -> Vec<String> {
+    let path = path.to_path_buf();
+    let branch = branch.to_string();
+    let merged = merged.to_vec();
+    let base_tip = base_tip.map(str::to_string);
+    tokio::task::spawn_blocking(move || {
+        let mut exclusions: Vec<String> = merged
+            .iter()
+            .filter(|merged_branch| *merged_branch != &branch)
+            .flat_map(|merged_branch| rev_list(&path, merged_branch))
+            .collect();
+        exclude_base_tip(&mut exclusions, base_tip.as_deref());
+        exclusions.sort();
+        exclusions.dedup();
+        let args = own_history_args(&branch, exclusions, false);
+        let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+        let mut files: Vec<String> = crate::worktree::git(&path, "log", &borrowed)
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| {
+                String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        files.sort();
+        files.dedup();
+        files
+    })
+    .await
+    .unwrap_or_default()
+}
+
 /// Run the own-history query and split its output into commits and files.
 ///
 /// A commit is the consolidator's own only when it carries a change of its own,
