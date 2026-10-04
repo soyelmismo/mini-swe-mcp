@@ -264,7 +264,13 @@ fn a_retired_strongest_key_is_ignored_with_a_warning() {
         warnings.iter().any(|w| w.contains("strongest")),
         "a `strongest:` key must warn: {warnings:?}"
     );
-    assert!(manifest.normalize().validate().iter().any(|w| w.contains("strongest")));
+    assert!(
+        manifest
+            .normalize()
+            .validate()
+            .iter()
+            .any(|w| w.contains("strongest"))
+    );
 }
 
 // ----------

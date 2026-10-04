@@ -245,11 +245,7 @@ impl ModelManifest {
             {
                 Some((name, def)) => {
                     let mut def = def.clone();
-                    if def
-                        .checklist
-                        .as_deref()
-                        .is_none_or(|c| c.trim().is_empty())
-                    {
+                    if def.checklist.as_deref().is_none_or(|c| c.trim().is_empty()) {
                         def.checklist = Self::builtin_review_checklist(builtin);
                     }
                     out.push((name.clone(), def, "models.yaml"));
@@ -272,7 +268,7 @@ impl ModelManifest {
                 !name.eq_ignore_ascii_case("quality") && !name.eq_ignore_ascii_case("security")
             })
             .collect();
-        extra.sort_by(|(a, _), (b, _)| a.cmp(b));
+        extra.sort_by_key(|(a, _)| *a);
         for (name, def) in extra {
             out.push((name.clone(), def.clone(), "models.yaml"));
         }

@@ -1592,7 +1592,11 @@ mod tests {
         let manifest = manifest("default: ninja\nmodels:\n  ninja:\n    id: combo:ninja\n");
         let choice = select_security_reviewer(&manifest, "combo:default");
         assert_eq!(choice.model, "combo:default");
-        assert!(choice.reason.contains("no default_model"), "{}", choice.reason);
+        assert!(
+            choice.reason.contains("no default_model"),
+            "{}",
+            choice.reason
+        );
     }
 
     #[test]

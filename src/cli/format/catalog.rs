@@ -86,7 +86,10 @@ fn push_review_modes(out: &mut String, val: &serde_json::Value) {
                     .get("source")
                     .and_then(|v| v.as_str())
                     .unwrap_or("models.yaml");
-                out.push_str(&format!("  - {name} ({source}{})\n", review_mode_suffix(def)));
+                out.push_str(&format!(
+                    "  - {name} ({source}{})\n",
+                    review_mode_suffix(def)
+                ));
             }
             None => out.push_str(&format!("  - {name} (built-in)\n")),
         }

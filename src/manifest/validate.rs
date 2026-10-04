@@ -134,8 +134,8 @@ impl ModelManifest {
         // `normalize`; a built-in override may set only `default_model`, in
         // which case the built-in checklist stays.
         for (name, def) in self.sorted_review_modes() {
-            let builtin = name.eq_ignore_ascii_case("quality")
-                || name.eq_ignore_ascii_case("security");
+            let builtin =
+                name.eq_ignore_ascii_case("quality") || name.eq_ignore_ascii_case("security");
             match def.checklist.as_deref() {
                 None if !builtin => warnings.push(format!(
                     "review mode \"{name}\" has no checklist; it will be ignored"
@@ -287,16 +287,25 @@ impl ModelManifest {
         // built-in one (the warning already named it); a user mode with an
         // empty or missing checklist is dropped.
         for (name, def) in self.review_modes.iter_mut() {
-            let builtin = name.eq_ignore_ascii_case("quality")
-                || name.eq_ignore_ascii_case("security");
-            if builtin && def.checklist.as_deref().is_some_and(|c| c.trim().is_empty()) {
+            let builtin =
+                name.eq_ignore_ascii_case("quality") || name.eq_ignore_ascii_case("security");
+            if builtin
+                && def
+                    .checklist
+                    .as_deref()
+                    .is_some_and(|c| c.trim().is_empty())
+            {
                 def.checklist = None;
             }
         }
         self.review_modes.retain(|name, def| {
-            let builtin = name.eq_ignore_ascii_case("quality")
-                || name.eq_ignore_ascii_case("security");
-            builtin || def.checklist.as_deref().is_some_and(|c| !c.trim().is_empty())
+            let builtin =
+                name.eq_ignore_ascii_case("quality") || name.eq_ignore_ascii_case("security");
+            builtin
+                || def
+                    .checklist
+                    .as_deref()
+                    .is_some_and(|c| !c.trim().is_empty())
         });
 
         self

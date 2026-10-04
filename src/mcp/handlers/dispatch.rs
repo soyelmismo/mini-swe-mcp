@@ -260,8 +260,8 @@ impl McpServer {
                 // else names its mode explicitly.
                 let builtin_quality = mode.name.eq_ignore_ascii_case("quality")
                     && self.manifest.review_mode("quality").is_none();
-                let builtin_security = mode.is_security()
-                    && self.manifest.review_mode("security").is_none();
+                let builtin_security =
+                    mode.is_security() && self.manifest.review_mode("security").is_none();
                 if builtin_quality {
                     Ok(resolved)
                 } else if builtin_security {
@@ -378,7 +378,7 @@ pub(in crate::mcp) const REPO_PATH_DESCRIPTION: &str =
     "Repository root (alias: 'path'). Required for 'dispatch'.";
 
 pub(in crate::mcp) const REVIEW_AFTER_DESCRIPTION: &str =
-    "Reviewer `<mode>`, `<model>:<mode>`, or (as quality) `<model>`; see `manifest`.";
+    "`<mode>` or `<model>:<mode>` review; see `manifest`.";
 
 pub(in crate::mcp) const AUTO_CONSOLIDATE_DESCRIPTION: &str =
     "Auto-consolidate the group when it stops: boolean or model.";
