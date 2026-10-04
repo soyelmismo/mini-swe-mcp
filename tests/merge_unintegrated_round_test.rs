@@ -852,3 +852,33 @@ fn an_uncountable_member_is_refused_without_a_number() {
         "a refused merge must not land the round"
     );
 }
+
+#[test]
+fn probe_force_leaves_worker_unretired() {
+    let f = Fixture::new("probe-force-unretired");
+    f.consolidator("c1", &["wa"]);
+    f.left_out_member("wb");
+    f.force_merge("c1").expect("--force lands the round");
+    println!("PROBE round.md landed={}", f.repo().join("round.md").exists());
+    println!("PROBE wb branch kept={}", git_ref_exists(f.repo(), "worker-wb"));
+    println!("PROBE wb row kept={}", load_registry_entry_in(&f.root(), "wb").is_some());
+    println!("PROBE wa row kept={}", load_registry_entry_in(&f.root(), "wa").is_some());
+}
+
+#[test]
+fn probe_empty_snapshot_suppresses() {
+    let f = Fixture::new("probe-empty-snapshot");
+    f.consolidator("c1", &["wa"]);
+    f.left_out_member("wb");
+    // A snapshot file that exists but names nobody: a truncated write, or an
+    // orchestrator that wrote it before the manifest was complete.
+    std::fs::write(f.scratch.path().join("swe-wt-c1.round-members"), "").unwrap();
+    let reported: Vec<String> = unintegrated_workers_in(&f.root(), "c1")
+        .into_iter()
+        .map(|w| w.worker_id)
+        .collect();
+    println!("PROBE reported={reported:?}");
+    let res = f.merge("c1", false);
+    println!("PROBE merge={:?}", res.as_ref().err().map(|e| e.to_string()));
+    println!("PROBE round.md landed={}", f.repo().join("round.md").exists());
+}

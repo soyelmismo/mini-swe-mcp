@@ -1176,14 +1176,19 @@ fn branch_unresolvable(repo: &Path, branch: &str) -> bool {
 /// round. A member with no branch (discarded, pruned, never dispatched) has
 /// nothing left to land and is filtered by the probe in the caller.
 ///
-/// A consolidator dispatched before the snapshot existed falls back to the
-/// registry scan, which is the best reconstruction available for it.
+/// A consolidator dispatched before the snapshot existed -- or whose snapshot
+/// names nobody, which an interrupted or hostile write can produce -- falls back
+/// to the registry scan, the best reconstruction available for it.
 fn round_members(root: &ScratchRoot, row: &WorkerRegistryEntry) -> Vec<String> {
     let mut members: BTreeSet<String> = row.integrated.iter().cloned().collect();
     // A dispatch-time snapshot: exactly the round, as it was, in one repository.
-    // Its absence (a consolidator dispatched before the snapshot existed) is the
-    // only thing that sends the caller to the reconstruction below.
-    if let Some(ids) = read_round_members(root, &row.id) {
+    // A snapshot that names nobody is not a snapshot: the file is written
+    // without an atomic rename, and any writer that is interrupted (or any other
+    // agent with scratch access) can leave it empty or truncated. Treating that
+    // as "the round had no members" would skip the reconstruction below and
+    // wave through a member the round really had -- the stale-master failure
+    // this check exists to prevent. So the fallback below reconstructs instead.
+    if let Some(ids) = read_round_members(root, &row.id).filter(|ids| !ids.is_empty()) {
         members.extend(ids);
         members.retain(|id| !row.absorbed.contains(id));
         return members.into_iter().collect();
