@@ -290,8 +290,10 @@ fn print_quiet_dispatch(result: &serde_json::Value) -> Result<()> {
     for id in &view.worker_ids {
         println!("{id}");
     }
-    // Print the watch reminder on stderr when at least one worker started
-    if !view.worker_ids.is_empty() && !view.watch_command.is_empty() {
+    // The reminder is gated on a worker having started and nothing else: a
+    // caller that dispatched quietly still has to arm a watch, whether or not
+    // the hub minted a token-bound command for it.
+    if !view.worker_ids.is_empty() {
         eprintln!(
             "Remember to keep a watch running for these workers: {} (in the background; re-run it after each event).",
             view.watch_command

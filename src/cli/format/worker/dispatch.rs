@@ -120,16 +120,11 @@ pub(super) fn format_batch_dispatch(
 ///
 /// Keeping the two apart here, in a pure formatter, is what lets the binary
 /// keep stdout a clean id list for a script while the failure stays visible.
-#[derive(Debug)]
 pub struct QuietDispatch {
     /// The `worker_id` of every entry that started, in payload order.
     pub worker_ids: Vec<String>,
     /// The error of every entry that never started, in payload order.
     pub errors: Vec<String>,
-    /// The watch command to use when waiting for these workers, if any.
-    /// This is computed from the payload's `watch_command` field or,
-    /// when the dispatch was consolidated (`--consolidate`), built as
-    /// `mini-swe-mcp watch --group <group> --all`.
     pub watch_command: String,
 }
 
@@ -140,11 +135,6 @@ pub struct QuietDispatch {
 pub fn format_dispatch_quiet(val: &serde_json::Value) -> QuietDispatch {
     let mut worker_ids = Vec::new();
     let mut errors = Vec::new();
-    let mut watch_command = String::new();
-
-    // Determine if this was a consolidated dispatch
-    let is_consolidated = val.get("group").is_some();
-
     if let Some(workers) = val.get("workers").and_then(|v| v.as_array()) {
         for worker in workers {
             if let Some(wid) = worker.get("worker_id").and_then(|v| v.as_str()) {
@@ -153,42 +143,10 @@ pub fn format_dispatch_quiet(val: &serde_json::Value) -> QuietDispatch {
                 errors.push(error.to_string());
             }
         }
-        // For batch dispatch with consolidation, the watch command uses --group --all
-        if is_consolidated
-            && !worker_ids.is_empty()
-            && let Some(group) = val.get("group").and_then(|v| v.as_str())
-        {
-            watch_command = format!("mini-swe-mcp watch --group {} --all", group);
-        }
     } else if let Some(wid) = val.get("worker_id").and_then(|v| v.as_str()) {
         worker_ids.push(wid.to_string());
-        // For single dispatch with consolidation
-        if is_consolidated && let Some(group) = val.get("group").and_then(|v| v.as_str()) {
-            watch_command = format!("mini-swe-mcp watch --group {} --all", group);
-        } else {
-            // Use the watch_command from the payload, or build MINI_SWE_WATCH_TOKEN form
-            if let Some(wc) = val.get("watch_command").and_then(|v| v.as_str()) {
-                watch_command = wc.to_string();
-            } else {
-                // Build the default MINI_SWE_WATCH_TOKEN form
-                // (the token will be minted by the hub; we include the format hint)
-                watch_command = String::new();
-            }
-        }
     }
-
-    // Fallback: if no workers but payload has watch_command, carry it through
-    if watch_command.is_empty()
-        && let Some(wc) = val.get("watch_command").and_then(|v| v.as_str())
-    {
-        watch_command = wc.to_string();
-    }
-
-    QuietDispatch {
-        worker_ids,
-        errors,
-        watch_command,
-    }
+    QuietDispatch { worker_ids, errors, watch_command: String::new() }
 }
 
 #[cfg(test)]
@@ -209,48 +167,91 @@ mod tests {
 
     /// `--quiet` is a clean id list: one started id per line, in payload order,
     /// and the entries that failed go to the errors side, never into stdout.
-    ///
-    /// When at least one worker started, the watch command is populated so the
-    /// caller can be reminded to keep a watch running; when nothing started,
-    /// it is empty and no reminder is printed.
     #[test]
     fn test_format_dispatch_quiet_lists_ids_and_splits_errors() {
         let single = format_dispatch_quiet(&v(r#"{"worker_id":"w1","status":"dispatched"}"#));
         assert_eq!(single.worker_ids, vec!["w1"]);
         assert!(single.errors.is_empty(), "{:?}", single.errors);
-        // No group means no special watch command; the reminder is absent.
-        assert!(
-            single.watch_command.is_empty(),
-            "{:?}",
-            single.watch_command
-        );
 
         let batch = format_dispatch_quiet(&v(
             r#"{"workers":[{"index":0,"worker_id":"w1"},{"index":1,"error":"'task' is required"},{"index":2,"worker_id":"w2"}]}"#,
         ));
         assert_eq!(batch.worker_ids, vec!["w1", "w2"]);
         assert_eq!(batch.errors, vec!["'task' is required"]);
-        // No group means no special watch command; the reminder is absent.
-        assert!(batch.watch_command.is_empty(), "{:?}", batch.watch_command);
+    }
 
-        // When a consolidated dispatch starts workers, the watch command is
-        // built with --group and --all so the caller knows how to wait.
-        let consolidated = format_dispatch_quiet(&v(
-            r#"{"workers":[{"index":0,"worker_id":"w1"}],"group":"round-1"}"#,
-        ));
-        assert_eq!(consolidated.worker_ids, vec!["w1"]);
+    /// A `--quiet` dispatch that started a worker always names a watch: the
+    /// reminder is the whole point of the flag, so withholding it because the
+    /// hub minted no token-bound command is exactly the failure it exists to
+    /// prevent. It is withheld only when nothing started.
+    #[test]
+    fn a_started_worker_always_gets_a_watch_command() {
+        // No token store (the in-process stdio server): still a usable command,
+        // since a watch with no ids follows every worker the caller owns.
+        let single = format_dispatch_quiet(&v(r#"{"worker_id":"w1","status":"dispatched"}"#));
         assert_eq!(
-            consolidated.watch_command,
-            "mini-swe-mcp watch --group round-1 --all"
+            single.watch_command, "mini-swe-mcp watch",
+            "a token-less caller must still be told how to wait"
         );
 
-        // When nothing started, the watch command is empty and no reminder is
-        // printed.
-        let nothing_started = format_dispatch_quiet(&v(
+        let batch = format_dispatch_quiet(&v(r#"{"workers":[{"index":0,"worker_id":"w1"}]}"#));
+        assert_eq!(batch.watch_command, "mini-swe-mcp watch", "{batch:?}");
+
+        // The hub's token-bound command wins: it is what binds the watch to
+        // this caller's identity.
+        let tokenized = format_dispatch_quiet(&v(
+            r#"{"worker_id":"w1","watch_command":"MINI_SWE_WATCH_TOKEN=abc mini-swe-mcp watch"}"#,
+        ));
+        assert_eq!(
+            tokenized.watch_command,
+            "MINI_SWE_WATCH_TOKEN=abc mini-swe-mcp watch"
+        );
+
+        // A consolidated round waits for the whole round, not one worker.
+        let round = format_dispatch_quiet(&v(
+            r#"{"workers":[{"index":0,"worker_id":"w1"}],"group":"round-1"}"#,
+        ));
+        assert_eq!(
+            round.watch_command, "mini-swe-mcp watch --group round-1 --all",
+            "{round:?}"
+        );
+
+        // Nothing started: no watch command, so no reminder is printed.
+        let nothing = format_dispatch_quiet(&v(
             r#"{"workers":[{"index":0,"error":"'task' is required"}]}"#,
         ));
-        assert!(nothing_started.worker_ids.is_empty());
-        assert!(nothing_started.watch_command.is_empty());
+        assert!(nothing.worker_ids.is_empty());
+        assert!(
+            nothing.watch_command.is_empty(),
+            "no worker means no watch to remind about: {:?}",
+            nothing.watch_command
+        );
+    }
+
+    /// A group name is caller-supplied text that reaches the command line the
+    /// reminder tells the operator to run, so it must be quoted: an unquoted
+    /// name would let whoever named the group choose what that shell executes.
+    #[test]
+    fn a_hostile_group_name_stays_inside_one_shell_word() {
+        let hostile = format_dispatch_quiet(&v(
+            r#"{"workers":[{"index":0,"worker_id":"w1"}],"group":"r; touch /tmp/pwned"}"#,
+        ));
+        assert_eq!(
+            hostile.watch_command,
+            "mini-swe-mcp watch --group 'r; touch /tmp/pwned' --all",
+            "{hostile:?}"
+        );
+
+        // An embedded quote must not close the quoting either: the quoted word
+        // has to come back as the operator typed it, and nothing beside it.
+        let quoting = format_dispatch_quiet(&v(
+            r#"{"workers":[{"index":0,"worker_id":"w1"}],"group":"r'x"}"#,
+        ));
+        assert_eq!(
+            quoting.watch_command,
+            format!("mini-swe-mcp watch --group {} --all", "'r'\\''x'"),
+            "{quoting:?}"
+        );
     }
 
     #[test]

@@ -134,8 +134,38 @@ impl McpServer {
             "failed": failed,
             "message": "Remember to keep a watch running: workers are executing in isolated worktrees in background. Use 'watch' (or mini-swe-mcp watch) to wait for them.",
         });
+        if let Some(group) = Self::batch_round_group(args, tasks) {
+            payload["group"] = json!(group);
+        }
         self.with_watch_command(&mut payload, ctx).await;
         Ok(payload)
+    }
+
+    /// The one round a batch dispatches into, when every started entry names
+    /// the same group.
+    ///
+    /// The answer is what tells a `--quiet` caller to wait with
+    /// `watch --group <g> --all` instead of the per-worker watch, so it is only
+    /// reported when the entries agree: a batch that split across two groups has
+    /// no single round command, and naming one of them would silently leave the
+    /// other group unwatched.
+    fn batch_round_group(args: &Value, tasks: &[Value]) -> Option<String> {
+        let mut groups = tasks
+            .iter()
+            .filter_map(|entry| Self::batch_entry_args(args, entry).ok())
+            .filter_map(|entry| {
+                entry
+                    .get("group")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|group| !group.is_empty())
+                    .map(str::to_string)
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        match groups.len() {
+            1 => groups.pop_first(),
+            _ => None,
+        }
     }
 
     /// Dispatch exactly one worker from a `dispatch` argument object.
