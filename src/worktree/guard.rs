@@ -1129,16 +1129,24 @@ impl WorktreeGuard {
     /// Every harness commit goes through here, so the staging rules of
     /// [`stage_commitable_changes_at`] hold for auto-checkpoints, the final
     /// commit and the checkpoint before a merge alike.
-    pub(crate) fn commit_all(
+    pub(crate) fn commit_all(path: &Path, base_commit: &str, message: &str) -> Result<CommitReport> {
+        Self::commit_all_capped(path, base_commit, commit_file_cap_bytes(), message)
+    }
+
+    /// [`WorktreeGuard::commit_all`] with the per-file cap in bytes supplied
+    /// instead of read from [`MAX_COMMIT_FILE_MB_ENV`], so a test can lower it
+    /// without touching process state. `0` disables the cap.
+    fn commit_all_capped(
         path: &Path,
         base_commit: &str,
+        cap_bytes: u64,
         message: &str,
     ) -> Result<CommitReport> {
         // Completion owns merge resolution; checkpoints must not commit markers.
         if Self::merge_in_progress_at(path)? {
             anyhow::bail!("Base merge is still in progress; resolve it and request completion");
         }
-        let staging = Self::stage_commitable_changes_at(path, base_commit)?;
+        let staging = Self::stage_commitable_changes_at(path, base_commit, cap_bytes)?;
         let skipped = staging.skipped;
         if !staging.staged {
             // Nothing the rules allowed reached the index, so a commit here
@@ -1182,11 +1190,19 @@ impl WorktreeGuard {
     /// Commit all dirty changes in the worktree to preserve work in git history,
     /// marking the branch to be retained upon worktree cleanup.
     pub fn commit_changes(&mut self, message: &str) -> Result<CommitReport> {
-        let report = Self::commit_changes_at(
+        self.commit_changes_capped(message, commit_file_cap_bytes())
+    }
+
+    /// [`WorktreeGuard::commit_changes`] with the per-file cap in bytes
+    /// supplied instead of read from [`MAX_COMMIT_FILE_MB_ENV`], so a test can
+    /// lower it without touching process state. `0` disables the cap.
+    pub fn commit_changes_capped(&mut self, message: &str, cap_bytes: u64) -> Result<CommitReport> {
+        let report = Self::commit_changes_capped_at(
             &self.path,
             &self.repo_root,
             &self.branch,
             &self.base_commit,
+            cap_bytes,
             message,
         )?;
         if report.committed() {
@@ -1206,7 +1222,28 @@ impl WorktreeGuard {
         base_commit: &str,
         message: &str,
     ) -> Result<CommitReport> {
-        let mut report = Self::commit_all(path, base_commit, message)?;
+        Self::commit_changes_capped_at(
+            path,
+            repo_root,
+            branch,
+            base_commit,
+            commit_file_cap_bytes(),
+            message,
+        )
+    }
+
+    /// [`WorktreeGuard::commit_changes_at`] with the per-file cap in bytes
+    /// supplied instead of read from [`MAX_COMMIT_FILE_MB_ENV`], so a test can
+    /// lower it without touching process state. `0` disables the cap.
+    pub fn commit_changes_capped_at(
+        path: &Path,
+        repo_root: &Path,
+        branch: &str,
+        base_commit: &str,
+        cap_bytes: u64,
+        message: &str,
+    ) -> Result<CommitReport> {
+        let mut report = Self::commit_all_capped(path, base_commit, cap_bytes, message)?;
         if report.committed() || Self::branch_has_commits_at(repo_root, base_commit, branch) {
             report.branch = Some(branch.to_string());
         }
@@ -1232,7 +1269,11 @@ impl WorktreeGuard {
     /// A refused path is never staged, so its content never reaches the object
     /// database, and anything an earlier pass left staged for it is unstaged.
     /// The caller reports the refusals to the worker.
-    fn stage_commitable_changes_at(path: &Path, base_commit: &str) -> Result<Staging> {
+    fn stage_commitable_changes_at(
+        path: &Path,
+        base_commit: &str,
+        cap_bytes: u64,
+    ) -> Result<Staging> {
         let status = git(
             path,
             "status",
@@ -1248,7 +1289,6 @@ impl WorktreeGuard {
         if changed.is_empty() {
             return Ok(Staging::default());
         }
-        let cap = commit_file_cap_bytes();
         let base = base_tree_at(path, base_commit)?;
         let mut keep: Vec<String> = Vec::new();
         let mut skipped: Vec<SkippedPath> = Vec::new();
@@ -1258,7 +1298,7 @@ impl WorktreeGuard {
                 keep.push(rel);
                 continue;
             }
-            match Self::commit_refusal(path, &rel, cap, &base) {
+            match Self::commit_refusal(path, &rel, cap_bytes, &base) {
                 Some((reason, bytes)) => skipped.push(SkippedPath {
                     path: rel,
                     bytes,
