@@ -38,7 +38,7 @@
             "type": "boolean"
           },
           "consolidate": {
-            "description": "Auto-consolidate the group when it stops.",
+            "description": "Auto-consolidate the group when it stops: boolean or model.",
             "type": [
               "boolean",
               "string"
@@ -66,7 +66,7 @@
             "type": "array"
           },
           "force": {
-            "description": "Land a stale round.",
+            "description": "Skip only the round check; unintegrated workers stay unretired.",
             "type": "boolean"
           },
           "full": {
@@ -128,7 +128,7 @@
             "type": "string"
           },
           "role": {
-            "description": "'consolidate': integrate this group.",
+            "description": "'consolidate': integrate this group's completed workers.",
             "type": "string"
           },
           "scope": {
@@ -202,7 +202,7 @@
             "type": "integer"
           },
           "topic": {
-            "description": "Help topic; omitted: index",
+            "description": "Help topic; omitted: the index",
             "type": "string"
           },
           "verify": {

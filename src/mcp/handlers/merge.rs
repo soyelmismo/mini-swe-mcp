@@ -1,8 +1,16 @@
 use super::*;
 
 /// Description of the `merge` `force` property, beside the handler that reads
-/// it: what the property overrides and what a forced merge still does.
-pub(in crate::mcp) const FORCE_DESCRIPTION: &str = "Land a stale round.";
+/// it.
+///
+/// The override is deliberately narrow, so it is spelled out rather than left to
+/// a one-liner: `force` skips *only* the round-provenance check, and says
+/// nothing about the gate, the clean-tree requirement or the branch-conflict
+/// refusal. It also does not throw the unintegrated work away -- those workers
+/// are left unretired, with their branches and conversations intact -- so
+/// overriding is recoverable rather than destructive.
+pub(in crate::mcp) const FORCE_DESCRIPTION: &str =
+    "Skip only the round check; unintegrated workers stay unretired.";
 
 impl McpServer {
     /// `merge` action: land one finished worker's branch on its base branch.

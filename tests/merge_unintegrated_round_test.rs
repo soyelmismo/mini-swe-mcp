@@ -654,11 +654,8 @@ fn the_round_is_the_dispatch_snapshot_not_the_live_group() {
     f.consolidator("c1", &["wa"]);
     f.left_out_member("wb");
     // The dispatch recorded this round's membership.
-    std::fs::write(
-        f.scratch.path().join("swe-wt-c1.round-members"),
-        "wa\nwb\n",
-    )
-    .expect("the dispatch snapshot must be writable");
+    std::fs::write(f.scratch.path().join("swe-wt-c1.round-members"), "wa\nwb\n")
+        .expect("the dispatch snapshot must be writable");
 
     // A worker dispatched into the SAME group AFTER this consolidator ran: it
     // is in the group now and was not in the round.
@@ -690,7 +687,10 @@ fn the_round_is_the_dispatch_snapshot_not_the_live_group() {
         .merge("c1", false)
         .expect_err("the round's own unintegrated member still refuses");
     let message = format!("{err:#}");
-    assert!(message.contains("wb"), "the refusal names the member: {message}");
+    assert!(
+        message.contains("wb"),
+        "the refusal names the member: {message}"
+    );
     assert!(
         !message.contains("later") && !message.contains("old"),
         "a worker outside the dispatch snapshot must not be named: {message}"

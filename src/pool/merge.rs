@@ -1180,15 +1180,13 @@ fn branch_unresolvable(repo: &Path, branch: &str) -> bool {
 /// registry scan, which is the best reconstruction available for it.
 fn round_members(root: &ScratchRoot, row: &WorkerRegistryEntry) -> Vec<String> {
     let mut members: BTreeSet<String> = row.integrated.iter().cloned().collect();
-    match read_round_members(root, &row.id) {
-        // A dispatch-time snapshot: exactly the round, in one repository.
-        Some(ids) => {
-            members.extend(ids);
-            members.retain(|id| !row.absorbed.contains(id));
-            return members.into_iter().collect();
-        }
-        // No snapshot: fall through to the reconstruction below.
-        None => {}
+    // A dispatch-time snapshot: exactly the round, as it was, in one repository.
+    // Its absence (a consolidator dispatched before the snapshot existed) is the
+    // only thing that sends the caller to the reconstruction below.
+    if let Some(ids) = read_round_members(root, &row.id) {
+        members.extend(ids);
+        members.retain(|id| !row.absorbed.contains(id));
+        return members.into_iter().collect();
     }
     let (Some(owner), Some(group)) = (row.owner.as_deref(), row.group.as_deref()) else {
         // Without an owner and a group the round cannot be enumerated at all;

@@ -1044,7 +1044,8 @@ impl WorkerPool {
                     .map(|worker| worker.id.clone())
                     .collect();
                 std::fs::write(
-                    self.scratch.join(format!("swe-wt-{worker_id}.round-members")),
+                    self.scratch
+                        .join(format!("swe-wt-{worker_id}.round-members")),
                     members.join("\n"),
                 )?;
             }
