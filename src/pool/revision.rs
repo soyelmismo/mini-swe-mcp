@@ -1066,7 +1066,7 @@ pub(crate) fn branch_tip(repo: &Path, branch: &str) -> Option<String> {
             "rev-parse",
             "--verify",
             "--quiet",
-            branch,
+            &format!("refs/heads/{branch}"),
         ],
     )
     .ok()?;

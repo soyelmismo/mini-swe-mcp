@@ -1275,10 +1275,13 @@ pub(crate) fn work_already_in(repo: &Path, target: &str, branch: &str) -> bool {
         Ok(true) => {}
         Err(_) => return false,
     }
-    if is_ancestor(repo, branch, target).unwrap_or(false) {
+    // `branch_exists` above already pins the name under `refs/heads/`; these two
+    // resolve a bare name, so they get the full ref themselves.
+    let branch = format!("refs/heads/{branch}");
+    if is_ancestor(repo, &branch, target).unwrap_or(false) {
         return true;
     }
-    tree_already_in(repo, target, branch)
+    tree_already_in(repo, target, &branch)
 }
 
 /// Whether merging `member` into `branch` would change nothing, i.e. whether

@@ -1756,22 +1756,29 @@ fn echo_commit(repo: &std::path::Path, message: &str) {
     git(repo, &["commit", "-q", "--allow-empty", "-m", message]);
 }
 
-/// The same shadowing, with the branch still there and the work still
-/// unlanded: a worker whose `worker-<id>` branch carries a commit the base does
-/// not have must not be retired.
+/// The same shadowing, with the branch still there and its work still
+/// unlanded: the base has moved on independently, so the commit the worker
+/// branched from is an ancestor of the base, and a tag left under the worker's
+/// name points at exactly that commit.
 ///
-/// `is_ancestor` and `merge-tree` take the bare name, and git resolves the tag
-/// first, so the content and ancestry proofs were both being answered about a
-/// commit that is in the base while the branch next to it holds work nobody
-/// landed. Only `refs/heads/` can answer the question the sweep is asking.
+/// With the bare name, git resolves the tag first and `is_ancestor` answers
+/// "yes, the work is in the base" about a commit the branch has nothing to do
+/// with -- while the branch beside it holds a commit nobody landed. Pinning the
+/// ref under `refs/heads/` is what makes the answer be about the branch.
 #[test]
 fn a_tag_shadowing_a_live_worker_branch_does_not_retire_unlanded_work() {
     let f = Fixture::new("retire-tag-shadow-live");
-    // A real branch with a real commit that `main` does not contain.
+    // The worker branched from `base` and committed work of its own.
     f.commit_on_worker_branch("tg2", "tg2.txt", "unlanded work\n");
     f.record_with_status("tg2", mini_swe_mcp::pool::RegistryStatus::Completed);
-    // A tag under the same name, pointing at the base: git resolves it first.
-    git(f.repo(), &["tag", "worker-tg2", "main"]);
+    // `main` then moved on by itself, so the worker's base commit is now an
+    // ancestor of `main` while its own commit is not.
+    git(f.repo(), &["checkout", "-q", "main"]);
+    write(f.repo(), "unrelated.txt", "unrelated\n");
+    git(f.repo(), &["add", "."]);
+    git(f.repo(), &["commit", "-m", "main moves on"]);
+    // A tag under the worker's name, at that ancestor commit.
+    git(f.repo(), &["tag", "worker-tg2", "refs/heads/worker-tg2~1"]);
     assert!(
         git_ref_exists(f.repo(), "refs/heads/worker-tg2"),
         "the branch must still carry the unlanded work"
@@ -1788,5 +1795,15 @@ fn a_tag_shadowing_a_live_worker_branch_does_not_retire_unlanded_work() {
     assert!(
         git_ref_exists(f.repo(), "refs/heads/worker-tg2"),
         "the branch must survive"
+    );
+    // The work really is unlanded, so nothing is lost by keeping the worker.
+    assert_eq!(
+        git(
+            f.repo(),
+            &["rev-list", "--count", "main..refs/heads/worker-tg2"]
+        )
+        .trim(),
+        "1",
+        "the branch must still carry its one unlanded commit"
     );
 }
