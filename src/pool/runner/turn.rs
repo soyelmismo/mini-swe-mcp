@@ -69,6 +69,7 @@ use super::degenerate::{
 };
 use super::history::compact_history;
 use super::pause::PauseRequest;
+use super::whole_file::{WholeFileGuard, WholeFileReply, already_shown_note, whole_file_reply};
 use super::sentinels::{
     COMPLETION_SENTINEL, REPORT_FIELD_BYTES, REPORT_FOLLOWUP, is_completion_request,
     parse_ask_orchestrator, parse_consolidate_merge, parse_consolidate_steer,
@@ -1450,6 +1451,9 @@ pub(super) struct ProgressWatch {
     /// reasoning until the model produces a sound one, so the next request
     /// has to know whether the drop is still in force.
     degenerate_guard_step: Option<usize>,
+    /// Files the whole-file expansion has already shown, so a slice of an
+    /// unchanged one is not answered with the same payload again.
+    whole_files: WholeFileGuard,
 }
 
 impl ProgressWatch {
@@ -1614,6 +1618,34 @@ impl ProgressWatch {
         // identical value is the echo the observed run looped on.
         self.degenerate_turns += 1;
         (self.degenerate_turns >= DEGENERATE_REPEAT_TURNS).then_some(self.degenerate_turns)
+    }
+
+    /// Replace a small range read's observation with the whole file, or leave
+    /// the output alone.
+    ///
+    /// Cross-turn state lives here rather than in the engine because this is
+    /// the same per-worker detector as the guards above: which files have
+    /// already been shown whole is a fact about the run, not about one turn.
+    fn whole_file_output(
+        &mut self,
+        command: &str,
+        worktree: &Path,
+        step: usize,
+        succeeded: bool,
+    ) -> Option<String> {
+        // A failed command keeps its error: the harness read runs only after
+        // the sandboxed command itself succeeded, so a model sees what went
+        // wrong rather than a file the harness substituted for it.
+        if !succeeded {
+            return None;
+        }
+        match whole_file_reply(command, worktree, &mut self.whole_files, step) {
+            WholeFileReply::Keep => None,
+            WholeFileReply::Whole { text } => Some(text),
+            WholeFileReply::AlreadyShown { step: shown_at } => {
+                Some(already_shown_note(shown_at))
+            }
+        }
     }
 
     /// The recent-history summary the budget-extension decision is pure over.
@@ -2099,6 +2131,19 @@ impl<'a> TurnEngine<'a> {
         let (output, code) = self
             .run_gated(&cmd_str, AdmissionClass::Exploratory)
             .await?;
+
+        // --- Whole-file expansion ---
+        // A small file asked for by line range is answered with all of it,
+        // numbered like `cat -n`: one answer where the slice plus its
+        // remainder cost two turns. A repeat slice of an unchanged file keeps
+        // its range with a note pointing at the step that already showed it.
+        let output = match self
+            .watch
+            .whole_file_output(&cmd_str, &self.worktree.path, *self.step, code == Some(0))
+        {
+            Some(whole) => format!("{output}\n{whole}"),
+            None => output,
+        };
 
         // --- Consolidator verbs (harness side, never bash) ---
         // The sandbox holds no git credentials, so these run here, on the
