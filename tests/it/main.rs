@@ -94,6 +94,7 @@ mod watch_widen_test;
 mod worker_id_prefix_test;
 mod worker_reap_test;
 mod worker_report_test;
+mod zz_probe_test;
 mod worktree_prune_test;
 mod worktree_recreate_test;
 mod worktree_test;
