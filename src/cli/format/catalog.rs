@@ -64,7 +64,14 @@ fn push_review_modes(out: &mut String, val: &serde_json::Value) {
         .cloned()
         .unwrap_or_default();
     out.push_str("\n\nReview modes:\n");
-    let mut names: Vec<&String> = declared.keys().collect();
+    // Built-ins are always listed, even when the manifest declares none;
+    // a declared entry of the same name overrides the built-in fields.
+    let mut names: Vec<String> = declared.keys().cloned().collect();
+    for builtin in ["quality", "security"] {
+        if !names.iter().any(|n| n == builtin) {
+            names.push(builtin.to_string());
+        }
+    }
     names.sort();
     // Built-ins first for a stable, scannable listing.
     names.sort_by_key(|name| match name.as_str() {
@@ -72,13 +79,17 @@ fn push_review_modes(out: &mut String, val: &serde_json::Value) {
         "security" => 1,
         _ => 2,
     });
-    for name in names {
-        let def = &declared[name];
-        let source = def
-            .get("source")
-            .and_then(|v| v.as_str())
-            .unwrap_or("models.yaml");
-        out.push_str(&format!("  - {name} ({source}{})\n", review_mode_suffix(def)));
+    for name in &names {
+        match declared.get(name) {
+            Some(def) => {
+                let source = def
+                    .get("source")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("models.yaml");
+                out.push_str(&format!("  - {name} ({source}{})\n", review_mode_suffix(def)));
+            }
+            None => out.push_str(&format!("  - {name} (built-in)\n")),
+        }
     }
 }
 
