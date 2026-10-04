@@ -370,7 +370,20 @@ fn no_test_mutates_the_process_environment() {
             if trimmed.starts_with("//") {
                 continue;
             }
-            if line.contains("set_var(") || line.contains("remove_var(") {
+            // String literals are not call sites: this file's own matcher
+            // below names both calls inside quotes, and must not flag itself.
+            let mut code = String::new();
+            let mut in_string = false;
+            for ch in line.chars() {
+                if ch == '"' {
+                    in_string = !in_string;
+                    continue;
+                }
+                if !in_string {
+                    code.push(ch);
+                }
+            }
+            if code.contains("set_var(") || code.contains("remove_var(") {
                 let relative = path
                     .strip_prefix(&root)
                     .unwrap_or(&path)
@@ -386,7 +399,7 @@ fn no_test_mutates_the_process_environment() {
     offenders.sort();
     assert!(
         offenders.is_empty(),
-        "these call sites mutate the process environment; give the code under          test an explicit input instead (see this test's docs): {}",
+        "these call sites mutate the process environment; give the code under test an explicit input instead (see this test's docs): {}",
         offenders.join(", "),
     );
     for (file, why) in ALLOWLIST {

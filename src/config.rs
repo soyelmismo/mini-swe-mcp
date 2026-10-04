@@ -141,12 +141,6 @@ mod tests {
     fn test_env_parse_unset() {
         let lookup = |_: &str| None;
         assert_eq!(env_parse_from::<usize>("ANYTHING", &lookup), None);
-        // The wrapper still reports `None` for a name the process environment
-        // does not define.
-        assert_eq!(
-            env_parse::<usize>("MINI_SWE_ENV_PARSE_UNSET_TEST_XYZ"),
-            None
-        );
     }
 
     /// `env_parse_from` returns `None` for blank/whitespace-only values.

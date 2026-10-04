@@ -734,6 +734,7 @@ mod tests {
     fn test_build_dir_naming_is_stable_and_bounded() {
         let base = std::env::temp_dir().join(format!("swe-naming-test-{}", uuid::Uuid::new_v4()));
         let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).expect("create fake repo root");
         let first = super::repo_key(&repo).expect("Repository root must be usable");
         let second = super::repo_key(&repo).expect("Repository root must be usable");
         assert_eq!(first, second, "The same repository must keep one key");
