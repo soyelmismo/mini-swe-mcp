@@ -1709,3 +1709,49 @@ fn the_sweep_retires_a_worker_whose_change_reached_the_base_as_a_squash() {
         "a change the base does not carry must keep its worker and its branch"
     );
 }
+
+/// A worker runs git inside the repository, so it can leave *any* ref behind
+/// under its own name -- including a tag, which shares the name of its branch.
+///
+/// `branch_tip` resolves the bare name `worker-<id>`, and git resolves a tag
+/// before a branch. A worker whose `worker-<id>` branch is gone therefore still
+/// reads a tip, and `is_ancestor` resolves the tag the same way, so the sweep
+/// gets a proof about a commit the branch never pointed at. Only a ref under
+/// `refs/heads/` can answer "is this worker's branch in the base".
+#[test]
+fn a_tag_named_after_a_deleted_worker_branch_does_not_prove_integration() {
+    let f = Fixture::new("retire-tag-shadow");
+    // The worker committed, so its branch was real and did carry work...
+    f.commit_on_worker_branch("tg1", "tg1.txt", "work\n");
+    f.record_with_status("tg1", mini_swe_mcp::pool::RegistryStatus::Completed);
+
+    // ...but the branch is gone and a tag carries the name instead. The tag
+    // points at a commit the base does not contain: nothing was ever integrated.
+    git(f.repo(), &["branch", "-D", "worker-tg1"]);
+    git(f.repo(), &["checkout", "-q", "main"]);
+    echo_commit(f.repo(), "tag-only");
+    git(f.repo(), &["tag", "worker-tg1"]);
+    assert!(
+        !git_ref_exists(f.repo(), "refs/heads/worker-tg1"),
+        "the branch must really be gone: only the tag remains"
+    );
+    assert!(
+        git_ref_exists(f.repo(), "refs/tags/worker-tg1"),
+        "the shadowing tag must exist for this to prove anything"
+    );
+
+    let sweep = f.sweep();
+
+    assert!(
+        sweep.workers.is_empty(),
+        "a tag must not stand in for the branch: {:?}",
+        sweep.workers
+    );
+    assert!(f.row_exists("tg1"), "the row must survive");
+    assert!(f.history_exists("tg1"), "the conversation must survive");
+}
+
+/// Commit an empty change so the tag lands on a commit past the base commit.
+fn echo_commit(repo: &std::path::Path, message: &str) {
+    git(repo, &["commit", "-q", "--allow-empty", "-m", message]);
+}
