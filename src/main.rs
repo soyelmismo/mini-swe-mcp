@@ -282,10 +282,22 @@ fn print_result(
 /// `dispatch --quiet`: the started worker ids on stdout, one per line, and each
 /// entry error on stderr. A batch that lost an entry fails after printing the
 /// ids it did start, so a pipe never reads a partial batch as a clean success.
+///
+/// When at least one worker started, a reminder line is printed on stderr
+/// telling the caller to keep a watch running for those workers.
 fn print_quiet_dispatch(result: &serde_json::Value) -> Result<()> {
     let view = format_dispatch_quiet(result);
     for id in &view.worker_ids {
         println!("{id}");
+    }
+    // The reminder is gated on a worker having started and nothing else: a
+    // caller that dispatched quietly still has to arm a watch, whether or not
+    // the hub minted a token-bound command for it.
+    if !view.worker_ids.is_empty() {
+        eprintln!(
+            "Remember to keep a watch running for these workers: {} (in the background; re-run it after each event).",
+            view.watch_command
+        );
     }
     if !view.errors.is_empty() {
         anyhow::bail!("{}", view.errors.join("\n"));
