@@ -280,6 +280,7 @@ async fn a_planted_approval_is_not_an_object_id() {
         &base,
         Some(planted),
         &[],
+        None,
     )
     .await;
     assert_eq!(

@@ -16,6 +16,11 @@
 //! * **A consolidator reviews its own commits.** The worker branches it merged,
 //!   each already reviewed at its own approved commit, are excluded from its
 //!   security scope; only its interaction fixes and conflict resolutions remain.
+//! * **A consolidator does not re-audit the base branch it merged in.** The base
+//!   branch's current tip is subtracted the same way, so work that landed on it
+//!   after the dispatch -- already reviewed where it came from -- stays out; a
+//!   resolution the consolidator wrote itself is a commit the base does not
+//!   contain and stays in, and a base tip git cannot resolve subtracts nothing.
 //!
 //! Every repository is a temporary directory this test creates and removes; no
 //! registry, hub or real repository is written.
@@ -74,7 +79,7 @@ async fn worker_scope(
     base: &str,
     approved: Option<String>,
 ) -> mini_swe_mcp::pool::SecurityScope {
-    scope_for(repo, branch, WorkerRole::Worker, base, approved, &[]).await
+    scope_for(repo, branch, WorkerRole::Worker, base, approved, &[], None).await
 }
 
 #[tokio::test]
@@ -187,6 +192,7 @@ async fn a_consolidator_reviews_only_its_own_commits() {
         &base,
         None,
         &merged,
+        Some("master"),
     )
     .await;
 
@@ -396,6 +402,7 @@ async fn the_approval_names_the_commit_that_carries_the_reviewed_tree() {
         &base,
         Some(harness_commit.clone()),
         &[],
+        None,
     )
     .await;
     assert_eq!(
@@ -415,6 +422,7 @@ async fn the_approval_names_the_commit_that_carries_the_reviewed_tree() {
         &base,
         Some(reviewer_head.clone()),
         &[],
+        None,
     )
     .await;
     assert_ne!(
@@ -460,6 +468,7 @@ async fn a_tree_changed_after_the_review_is_not_approved_by_the_newer_commit() {
         &base,
         Some(reviewer_head),
         &[],
+        None,
     )
     .await;
     assert_eq!(
@@ -545,6 +554,7 @@ async fn a_merged_branch_beyond_its_approval_stays_in_the_consolidators_scope() 
         &base,
         None,
         &approved_merged_branches(&["w1".to_string()], |_| Some(approved.clone())),
+        Some("master"),
     )
     .await;
 
@@ -679,6 +689,7 @@ async fn a_conflict_resolved_in_a_merge_commit_stays_in_the_consolidators_scope(
         &base,
         None,
         &merged,
+        Some("master"),
     )
     .await;
 
@@ -758,6 +769,7 @@ async fn a_planted_non_object_id_approval_never_reaches_git_in_the_consolidator_
         &base,
         None,
         &approved_merged_branches(&["w1".to_string()], |_| Some(planted.clone())),
+        Some("master"),
     )
     .await;
 
@@ -777,6 +789,214 @@ async fn a_planted_non_object_id_approval_never_reaches_git_in_the_consolidator_
     assert!(
         scope.reviewed_commits().contains(&own),
         "the consolidator's own commit is still its to audit"
+    );
+    assert_eq!(scope.skip_log(), None);
+}
+
+// ----------
+// The base branch a consolidator merged in
+// ----------
+
+/// A consolidator that resolved its conflicts against the base branch's current
+/// state: `master` gained sensitive work after the workers branched off, one
+/// worker's branch is security-approved, and the consolidator's merge of the
+/// updated base conflicts in the sensitive file the worker had edited too.
+///
+/// Returns the temporary directory, the base commit the consolidator was
+/// dispatched from, the merged worker's approved commit, the commits the
+/// updated base gained, and the merge commit carrying the resolution.
+fn repo_with_updated_base(tag: &str) -> (common::TempDir, String, String, Vec<String>, String) {
+    let (dir, base) = repo(tag);
+    let socket = "src/hub/socket.rs";
+    // The worker edits the sensitive file and is security-approved there.
+    let w1 = commit(dir.path(), "worker-w1", socket, "worker's handshake");
+    // The base branch gains its own sensitive work after the dispatch: work that
+    // was reviewed on the branch that landed it, not on the consolidator's.
+    let env_change = commit(dir.path(), "master", "src/agent/env.rs", "base gains ENV1");
+    let socket_change = commit(dir.path(), "master", socket, "base rewrites the handshake");
+
+    // The consolidator, dispatched from the old base, merges the worker and then
+    // the updated base. The two sides of the sensitive file conflict, and the
+    // resolution lands in the merge commit -- the consolidator's own decision.
+    common::git(dir.path(), &["checkout", "-q", "-b", "worker-c1", &base]);
+    common::git(
+        dir.path(),
+        &["merge", "-q", "--no-ff", "-m", "merge w1", "worker-w1"],
+    );
+    let conflict = std::process::Command::new("git")
+        .args(["merge", "--no-ff", "-m", "merge the updated base", "master"])
+        .current_dir(dir.path())
+        .output()
+        .expect("run the conflicting merge against the updated base");
+    assert!(
+        !conflict.status.success(),
+        "the base and the worker must really conflict, or this fixture proves nothing"
+    );
+    std::fs::write(dir.path().join(socket), "the resolved handshake")
+        .expect("write the resolution");
+    common::git(dir.path(), &["add", socket]);
+    common::git(dir.path(), &["commit", "-q", "--no-edit"]);
+    let resolution = common::git(dir.path(), &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
+    (dir, base, w1, vec![env_change, socket_change], resolution)
+}
+
+/// Merging the updated base must not drag the base's own history back into the
+/// consolidator's audit: that history was reviewed where it landed, and the
+/// round that produced it was already merged. The resolution the consolidator
+/// wrote is a commit the base does not contain, so it stays in scope.
+#[tokio::test]
+async fn a_consolidator_that_merged_the_updated_base_does_not_re_audit_the_base_change() {
+    let (dir, base, w1, base_changes, resolution) = repo_with_updated_base("scope_base_merge");
+    let scope = scope_for(
+        dir.path(),
+        "worker-c1",
+        WorkerRole::Consolidate,
+        &base,
+        None,
+        std::slice::from_ref(&w1),
+        Some("master"),
+    )
+    .await;
+
+    for change in &base_changes {
+        assert!(
+            !scope.reviewed_commits().contains(change),
+            "{change} came in with the base branch and was reviewed there; it must not be \
+             audited again: {:?}",
+            scope.reviewed_commits()
+        );
+    }
+    assert!(
+        scope.reviewed_commits().contains(&resolution),
+        "the conflict resolution is the consolidator's own unaudited work and must stay in scope"
+    );
+    let files = scope.reviewed_files(dir.path()).await;
+    assert_eq!(
+        files,
+        vec!["src/hub/socket.rs".to_string()],
+        "the base branch's own sensitive file must not re-enter the sensitive-path probe; \
+         got {files:?}"
+    );
+    let diff = scope.reviewed_diff(dir.path()).await;
+    assert!(
+        diff.contains("the resolved handshake") && !diff.contains("base gains ENV1"),
+        "the reviewer is handed the resolution, not the base branch's change; diff was:\n{diff}"
+    );
+    assert_eq!(scope.skip_log(), None);
+}
+
+/// The exclusion is only as wide as the evidence: a base branch git cannot
+/// resolve subtracts nothing, so the scope stays exactly as wide as it was
+/// before base branches were excluded at all.
+#[tokio::test]
+async fn an_unresolvable_base_branch_never_shrinks_the_consolidators_scope() {
+    let (dir, base, w1, base_changes, _resolution) = repo_with_updated_base("scope_base_unknown");
+    let scope = scope_for(
+        dir.path(),
+        "worker-c1",
+        WorkerRole::Consolidate,
+        &base,
+        None,
+        std::slice::from_ref(&w1),
+        Some("no-such-base"),
+    )
+    .await;
+
+    for change in &base_changes {
+        assert!(
+            scope.reviewed_commits().contains(change),
+            "a base branch git cannot resolve must not subtract anything from the audit, yet \
+             {change} left it: {:?}",
+            scope.reviewed_commits()
+        );
+    }
+    assert!(
+        scope
+            .reviewed_files(dir.path())
+            .await
+            .contains(&"src/agent/env.rs".to_string()),
+        "with no resolvable base tip the base's sensitive change stays in the probe"
+    );
+}
+
+/// A file name a commit carries is data, never a pattern. Git reads a pathspec
+/// that starts with `:` as magic, so a file planted as `:(exclude)<sensitive>`
+/// in the same commit as a real edit to that sensitive file must not act as an
+/// exclusion: the probe still names the sensitive path (it compares names), and
+/// the diff handed to the reviewer must still carry the sensitive change.
+#[tokio::test]
+async fn a_planted_pathspec_name_cannot_exclude_a_sensitive_change_from_the_diff() {
+    let (dir, base) = repo("scope_pathspec_plant");
+    let env_file = "src/agent/env.rs";
+    let planted = ":(exclude)src/agent/env.rs";
+    let w1 = commit(
+        dir.path(),
+        "worker-w1",
+        "src/hub/socket.rs",
+        "worker's handshake",
+    );
+
+    // The consolidator merges the approved worker, then commits its own change
+    // to the sensitive file together with a file whose *name* is the pathspec
+    // that excludes that very file.
+    common::git(dir.path(), &["checkout", "-q", "-b", "worker-c1", &base]);
+    common::git(
+        dir.path(),
+        &["merge", "-q", "--no-ff", "-m", "merge w1", "worker-w1"],
+    );
+    std::fs::create_dir_all(
+        dir.path()
+            .join(env_file)
+            .parent()
+            .expect("the sensitive file has a parent"),
+    )
+    .expect("create the sensitive file's directory");
+    std::fs::write(dir.path().join(env_file), "the consolidator's ENV edit")
+        .expect("write the sensitive edit");
+    std::fs::create_dir_all(
+        dir.path()
+            .join(planted)
+            .parent()
+            .expect("the planted name has a parent"),
+    )
+    .expect("create the planted file's directory");
+    std::fs::write(dir.path().join(planted), "harmless looking filler")
+        .expect("write the planted file");
+    common::git(dir.path(), &["add", "-A"]);
+    common::git(
+        dir.path(),
+        &["commit", "-q", "-m", "the consolidator's own work"],
+    );
+    let _own = common::git(dir.path(), &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
+
+    let scope = scope_for(
+        dir.path(),
+        "worker-c1",
+        WorkerRole::Consolidate,
+        &base,
+        None,
+        std::slice::from_ref(&w1),
+        Some("master"),
+    )
+    .await;
+
+    // The probe compares names, so the planted name cannot hide the sensitive
+    // file from it and the review still fires over the sensitive path.
+    let files = scope.reviewed_files(dir.path()).await;
+    assert!(
+        files.contains(&env_file.to_string()),
+        "the sensitive file must stay in the probe; got {files:?}"
+    );
+    // And the diff the reviewer reads must still carry the sensitive change.
+    let diff = scope.reviewed_diff(dir.path()).await;
+    assert!(
+        diff.contains("the consolidator's ENV edit"),
+        "a planted pathspec name must not exclude the sensitive change from the reviewer's \
+         diff; diff was:\n{diff}"
     );
     assert_eq!(scope.skip_log(), None);
 }
