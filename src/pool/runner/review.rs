@@ -1315,7 +1315,13 @@ pub(super) async fn incremental_diff(path: &Path, range: &str, working_tree: boo
 ///
 /// An empty `paths` names every path, which is the whole range diff. The paths
 /// follow a `--` separator, so a value from a git listing can never be parsed
-/// as an option.
+/// as an option, and each is prefixed with the `:(literal)` pathspec magic: a
+/// name a commit carries is data, not a pattern. Git reads a pathspec that
+/// starts with `:` as magic, so a planted file called `:!src/agent/env.rs` or
+/// `:(exclude)src/agent/env.rs` -- committed alongside a real edit to that
+/// sensitive file -- would otherwise exclude exactly the change the reviewer
+/// must see from the diff this hands over. `:(literal)` turns every name back
+/// into the path it names.
 pub(super) async fn incremental_diff_in(
     path: &Path,
     range: &str,
@@ -1330,7 +1336,7 @@ pub(super) async fn incremental_diff_in(
         let mut args: Vec<String> = vec!["diff".to_string(), range.clone()];
         if !paths.is_empty() {
             args.push("--".to_string());
-            args.extend(paths.iter().cloned());
+            args.extend(paths.iter().map(|p| format!(":(literal){p}")));
         }
         let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
         let mut diff = crate::worktree::git(&path, "diff", &borrowed)
