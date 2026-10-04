@@ -1836,6 +1836,33 @@ mod tests {
         assert!(text.contains("round50"), "missing group header:\n{text}");
     }
 
+    /// The interactive list view's group headers carry the same per-status
+    /// counts as the plain dashboard, so both views stay consistent.
+    #[test]
+    fn test_interactive_list_group_headers_carry_counts() {
+        let entries = sample_entries();
+        let (lines, _) = build_list_lines(&entries, 1060, 80, true);
+        let headers: Vec<String> = lines
+            .iter()
+            .filter_map(|l| match l {
+                ListLine::Header(h) => Some(h.clone()),
+                ListLine::Worker(_) => None,
+            })
+            .collect();
+        assert!(
+            headers
+                .iter()
+                .any(|h| h.contains("round52") && h.contains("\u{25cf}1")),
+            "round52 header must carry counts: {headers:?}"
+        );
+        assert!(
+            headers
+                .iter()
+                .any(|h| h.contains("round50") && h.contains("\u{2713}1")),
+            "round50 header must carry counts: {headers:?}"
+        );
+    }
+
     /// The status glyphs match the task's legend.
     #[test]
     fn test_status_glyphs_match_legend() {
