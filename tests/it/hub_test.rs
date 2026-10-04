@@ -1166,15 +1166,18 @@ async fn a_checkpointed_worker_survives_hub_sigkill_and_revision() {
     // The log is seeded with the opening messages and then grows one line per
     // message, so wait for the checkpoint's worth of exchanges rather than for
     // the file to appear.
+    let mut final_lines = 0;
     for _ in 0..400 {
         let lines = std::fs::read_to_string(&history_path)
             .map(|raw| raw.lines().filter(|l| !l.trim().is_empty()).count())
             .unwrap_or(0);
+        final_lines = lines;
         if lines >= 40 {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
+    eprintln!("DBG history lines at kill decision = {final_lines}");
     // Read the log directly: it lives under this test's `SWE_TEMP_DIR`, which
     // the test process itself does not share with the daemon that wrote it.
     let raw =
