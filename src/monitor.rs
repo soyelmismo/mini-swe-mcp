@@ -904,6 +904,13 @@ pub struct TurnView {
     pub exit_code: Option<i32>,
     /// The last few lines of the tool output, newest last.
     pub output_lines: Vec<String>,
+    /// How long the turn's command took, in seconds, when the history records
+    /// it. The append-only log carries no timestamp, so this stays `None`
+    /// unless a future writer records one; the separator omits it then.
+    pub duration_secs: Option<u64>,
+    /// Whether this turn belongs to the review phase (a `[review]`-prefixed
+    /// command), shown on the separator as `(review)`.
+    pub review: bool,
 }
 
 /// Incremental reader over a worker's append-only history log.
@@ -1073,9 +1080,11 @@ fn parse_turn_line(line: &str, step: usize) -> Option<TurnView> {
         });
     Some(TurnView {
         step: step + 1,
-        command,
+        command: command.clone(),
         exit_code: None,
         output_lines: Vec::new(),
+        duration_secs: None,
+        review: command.starts_with(REVIEW_PREFIX),
     })
 }
 
@@ -1183,6 +1192,11 @@ pub struct UiState {
     pub follow: bool,
     /// Scroll offset (in turns) of the detail view.
     pub scroll: usize,
+    /// Index of the turn the detail view's selection cursor points at
+    /// (0 = newest). Enter expands/collapses its output.
+    pub selected_turn: usize,
+    /// Steps of the turns whose full (width-clipped) output is expanded.
+    pub expanded: std::collections::HashSet<usize>,
 }
 
 impl Default for UiState {
@@ -1193,6 +1207,8 @@ impl Default for UiState {
             groups_expanded: true,
             follow: true,
             scroll: 0,
+            selected_turn: 0,
+            expanded: std::collections::HashSet::new(),
         }
     }
 }
@@ -1451,7 +1467,7 @@ fn render_list(
     now: u64,
     width: usize,
     height: usize,
-) -> String {
+) -> Vec<String> {
     let (lines, order) = build_list_lines(entries, now, width, state.groups_expanded);
     // Decided once over the rows this frame shows, so the rows on screen line
     // up with each other rather than each picking its own columns.
@@ -1477,8 +1493,8 @@ fn render_list(
     };
     let total = format!("{} workers", entries.len());
     let counts = header_counts(entries, use_color);
-    let mut out = String::new();
-    out.push_str(&box_top(
+    let mut out = Vec::new();
+    out.push(box_top(
         "mini-swe",
         &total,
         &counts,
@@ -1486,23 +1502,20 @@ fn render_list(
         width,
         use_color,
     ));
-    out.push('\n');
     for line in lines.iter().skip(start).take(body_height) {
         match line {
-            ListLine::Header(h) => out.push_str(&box_line(h, width)),
+            ListLine::Header(h) => out.push(box_line(h, width)),
             ListLine::Worker(w) => {
                 let row = compact_row(w, now, inner, use_color, false, &layout);
                 if Some(w.id.as_str()) == selected_id {
-                    out.push_str(&box_line(&format!("\x1b[7m{row}\x1b[0m"), width));
+                    out.push(box_line(&format!("\x1b[7m{row}\x1b[0m"), width));
                 } else {
-                    out.push_str(&box_line(&row, width));
+                    out.push(box_line(&row, width));
                 }
             }
         }
-        out.push('\n');
     }
-    out.push_str(&box_bottom(key_hint(View::List), width, use_color));
-    out.push('\n');
+    out.push(box_bottom(key_hint(View::List), width, use_color));
     out
 }
 
