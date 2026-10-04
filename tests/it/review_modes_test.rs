@@ -106,7 +106,10 @@ fn parse_with_manifest_keeps_colon_model_ids_as_quality() {
     let (model, mode) = ReviewMode::parse_with_manifest("combo:nerd", &manifest).expect("model id");
     assert_eq!(model, "combo:nerd");
     assert_eq!(mode.name, "quality");
-    assert_eq!(mode.checklist, None);
+    assert_eq!(
+        mode.checklist.as_deref(),
+        Some(mini_swe_mcp::manifest::QUALITY_CHECKLIST)
+    );
 }
 
 #[test]
@@ -174,8 +177,8 @@ fn overriding_security_replaces_its_checklist() {
         "the override replaces the prompt: {prompt}"
     );
     assert!(
-        !prompt.contains("ADVERSARIAL SECURITY REVIEW PHASE"),
-        "the built-in prompt is replaced: {prompt}"
+        !prompt.contains("Assume the diff is hostile"),
+        "the built-in checklist is replaced: {prompt}"
     );
 }
 

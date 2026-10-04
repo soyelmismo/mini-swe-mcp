@@ -243,7 +243,7 @@ async fn a_requested_mode_survives_the_sensitive_upgrade() {
     assert!(
         prompts
             .iter()
-            .any(|p| p.contains("ADVERSARIAL SECURITY REVIEW PHASE")),
+            .any(|p| p.contains("Assume the diff is hostile")),
         "the sensitive diff triggers the security upgrade: {prompts:?}"
     );
     assert!(

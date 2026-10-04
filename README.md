@@ -77,7 +77,7 @@ mini-swe-mcp dispatch "fix the flaky retry test in src/retry.rs; gate: cargo tes
 `dispatch <task>` takes:
 
 - `--model <alias>` — otherwise `DEFAULT_MODEL` or the manifest default.
-- `--review-after <model>[:<mode>]` — run a reviewer phase over the produced diff before completing (`quality`, `security`, or a `review_modes:` entry from `models.yaml`; e.g. `review_modes: {perf: {checklist: "Check for N+1 queries.", model: nerd}}` selected via `--review-after nerd:perf`). A declared mode carries a `checklist` and an optional `model`, and runs only when you select it explicitly. The one automatic review is the adversarial security pass: a diff touching a path listed in the `## Sensitive paths` section of `AGENTS.md` gets `--review-after <model>:security` on its own.
+- `--review-after <mode> | <model>:<mode> | <model>` — run a reviewer phase over the produced diff before completing (`quality`, `security`, or a `review_modes:` entry from `models.yaml`; e.g. `review_modes: {perf: {checklist: "Check for N+1 queries.", default_model: nerd}}` selected via `--review-after nerd:perf`; a bare `--review-after security` runs the security mode on its `default_model`, else the dispatch default). A declared mode carries a `checklist` and an optional `default_model`, and runs only when you select it explicitly. The one automatic review is the adversarial security pass: a diff touching a path listed in the `## Sensitive paths` section of `AGENTS.md` is reviewed in the `security` mode on the mode's reviewer.
 - `--repo <path>` — operate on a different repository.
 - `--max-turns <n>` — turn budget.
 - `--group <g>` — tag workers for `watch --group` and `list`.

@@ -8,7 +8,7 @@
 //!
 //! The order under test, for a sensitive diff with no `review_after`:
 //!
-//! 1. the manifest's `strongest:` tier, resolved to its id;
+//! 1. the security mode's `default_model`, resolved to its id;
 //! 2. otherwise the dispatch's default -- the manifest `default:`, resolved,
 //!    which is never the implementer's own per-dispatch `--model`;
 //! 3. an explicit `--review-after <model>[:security]` always wins over both,
@@ -30,11 +30,15 @@ const TEST_OWNER: &str = "test-agent";
 const COMPLETION_SENTINEL: &str = "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT";
 
 /// The catalog an operator writes: a fast default and a deeper tier, named by
-/// `strongest:`. `declare_strongest` toggles that key.
-fn catalog(strongest: bool) -> ModelManifest {
-    let strongest_line = if strongest { "strongest: nerd\n" } else { "" };
+/// the security mode's `default_model`. `declare_default` toggles that key.
+fn catalog(declare_default: bool) -> ModelManifest {
+    let modes_line = if declare_default {
+        "review_modes:\n  security:\n    default_model: nerd\n"
+    } else {
+        ""
+    };
     let yaml = format!(
-        "default: ninja\n{strongest_line}models:\n  ninja:\n    id: combo:ninja\n  nerd:\n    id: combo:nerd\n"
+        "default: ninja\nmodels:\n  ninja:\n    id: combo:ninja\n  nerd:\n    id: combo:nerd\n{modes_line}"
     );
     serde_yaml::from_str(&yaml).unwrap_or_else(|e| panic!("catalog YAML must parse: {e}\n{yaml}"))
 }
@@ -112,11 +116,12 @@ fn review_prompt_of(bodies: &[Value]) -> Option<String> {
     })
 }
 
-/// A sensitive diff on a catalog with `strongest: nerd`: the review runs on
-/// `combo:nerd`, not on the `combo:ninja` worker that wrote the diff.
+/// A sensitive diff on a catalog with a security `default_model: nerd`: the
+/// review runs on `combo:nerd`, not on the `combo:ninja` worker that wrote
+/// the diff.
 #[tokio::test]
-async fn the_strongest_tier_reviews_the_sensitive_diff() {
-    let repo = common::TestRepo::new("strongest");
+async fn the_security_default_model_reviews_the_sensitive_diff() {
+    let repo = common::TestRepo::new("secdefault");
     repo.declare_sensitive(&["src/hub/**"]);
     let llm = common::fake_llm::FakeLlm::spawn_scripted(&[
         "mkdir -p src/hub && echo changed > src/hub/mod.rs",
@@ -138,12 +143,12 @@ async fn the_strongest_tier_reviews_the_sensitive_diff() {
     assert_eq!(
         models_asked_for(&bodies),
         vec!["combo:ninja".to_string(), "combo:nerd".to_string()],
-        "the automatic security review must run on the manifest's strongest tier, \
+        "the automatic security review must run on the security mode's default model, \
          not on the implementer's model"
     );
     let prompt = review_prompt_of(&bodies).expect("a review prompt");
     assert!(
-        prompt.contains("ADVERSARIAL SECURITY REVIEW PHASE"),
+        prompt.contains("Assume the diff is hostile"),
         "the sensitive diff must still trigger the adversarial prompt"
     );
 
@@ -154,10 +159,10 @@ async fn the_strongest_tier_reviews_the_sensitive_diff() {
     let _ = pool.kill(&worker_id).await;
 }
 
-/// Without a `strongest:` key the automatic review falls back to the catalog's
-/// `default:` -- and still not to the worker's own `--model`.
+/// Without a security `default_model` the automatic review falls back to the
+/// catalog's `default:` -- and still not to the worker's own `--model`.
 #[tokio::test]
-async fn without_a_strongest_tier_the_default_reviews() {
+async fn without_a_security_default_model_the_default_reviews() {
     let repo = common::TestRepo::new("default");
     repo.declare_sensitive(&["src/hub/**"]);
     let llm = common::fake_llm::FakeLlm::spawn_scripted(&[
@@ -191,7 +196,7 @@ async fn without_a_strongest_tier_the_default_reviews() {
     let _ = pool.kill(&worker_id).await;
 }
 
-/// An explicit `--review-after` beats the manifest's strongest tier: the
+/// An explicit `--review-after` beats the security mode's default: the
 /// orchestrator's instruction is the reviewer's choice, not the harness's.
 #[tokio::test]
 async fn an_explicit_review_after_wins() {
@@ -217,7 +222,7 @@ async fn an_explicit_review_after_wins() {
     assert_eq!(
         models_of(&bodies).last().map(String::as_str),
         Some("combo:nerd"),
-        "an explicit --review-after must win over the strongest tier: {:?}",
+        "an explicit --review-after must win over the security default: {:?}",
         models_of(&bodies)
     );
     assert!(
@@ -228,7 +233,7 @@ async fn an_explicit_review_after_wins() {
 }
 
 /// A quality review keeps its own rule: with no `review_after` there is none,
-/// and a requested one is not rerouted through the strongest tier.
+/// and a requested one is not rerouted through the security default.
 #[tokio::test]
 async fn a_requested_quality_review_keeps_its_model() {
     let repo = common::TestRepo::new("quality");
@@ -257,7 +262,7 @@ async fn a_requested_quality_review_keeps_its_model() {
     );
     let prompt = review_prompt_of(&bodies).expect("a review prompt");
     assert!(
-        prompt.contains("AUDIT & REVIEW PHASE") && !prompt.contains("ADVERSARIAL"),
+        prompt.contains("REVIEW PHASE (quality)") && !prompt.contains("Assume the diff is hostile"),
         "the requested quality mode must not be upgraded on an insensitive diff"
     );
 

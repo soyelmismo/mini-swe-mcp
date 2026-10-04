@@ -289,7 +289,7 @@ fn an_explicitly_requested_security_review_is_never_downgraded() {
             true,
             Some(("nerd".to_string(), ReviewMode::security())),
             false,
-            "strongest",
+            "automatic",
             &ReviewMode::security()
         ),
         Some(("nerd".to_string(), ReviewMode::security())),
@@ -300,7 +300,7 @@ fn an_explicitly_requested_security_review_is_never_downgraded() {
             true,
             Some(("nerd".to_string(), ReviewMode::quality())),
             false,
-            "strongest",
+            "automatic",
             &ReviewMode::security()
         ),
         Some(("nerd".to_string(), ReviewMode::quality())),
@@ -308,18 +308,18 @@ fn an_explicitly_requested_security_review_is_never_downgraded() {
     );
     // The skip still does its job: nothing asked for, so nothing runs twice.
     assert_eq!(
-        plan_review(true, None, false, "strongest", &ReviewMode::security()),
+        plan_review(true, None, false, "automatic", &ReviewMode::security()),
         None
     );
     assert_eq!(
-        plan_review(true, None, true, "strongest", &ReviewMode::security()),
+        plan_review(true, None, true, "automatic", &ReviewMode::security()),
         None
     );
 }
 
 /// Without a skip, the pre-existing rules must be unchanged: a requested review
 /// on a sensitive diff is upgraded to the adversarial mode, and the automatic
-/// sensitive-path trigger audits on the manifest's strongest tier.
+/// sensitive-path trigger audits on the security mode's reviewer.
 #[test]
 fn without_a_skip_the_trigger_and_the_upgrade_are_unchanged() {
     assert_eq!(
@@ -327,7 +327,7 @@ fn without_a_skip_the_trigger_and_the_upgrade_are_unchanged() {
             false,
             Some(("nerd".to_string(), ReviewMode::quality())),
             true,
-            "strongest",
+            "automatic",
             &ReviewMode::security()
         ),
         Some(("nerd".to_string(), ReviewMode::quality()))
@@ -337,21 +337,21 @@ fn without_a_skip_the_trigger_and_the_upgrade_are_unchanged() {
             false,
             Some(("nerd".to_string(), ReviewMode::quality())),
             false,
-            "strongest",
+            "automatic",
             &ReviewMode::security()
         ),
         Some(("nerd".to_string(), ReviewMode::security())),
         "a requested review on a sensitive diff is upgraded to the adversarial mode"
     );
     assert_eq!(
-        plan_review(false, None, true, "strongest", &ReviewMode::security()),
+        plan_review(false, None, true, "automatic", &ReviewMode::security()),
         None,
         "no request and nothing sensitive means no review"
     );
     assert_eq!(
-        plan_review(false, None, false, "strongest", &ReviewMode::security()),
-        Some(("strongest".to_string(), ReviewMode::security())),
-        "the automatic sensitive trigger audits on the manifest's strongest tier"
+        plan_review(false, None, false, "automatic", &ReviewMode::security()),
+        Some(("automatic".to_string(), ReviewMode::security())),
+        "the automatic sensitive trigger audits on the security mode's reviewer"
     );
 }
 
