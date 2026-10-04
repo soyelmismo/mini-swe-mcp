@@ -45,7 +45,7 @@
             ]
           },
           "consolidate_verify": {
-            "description": "Consolidator's gate.",
+            "description": "Consolidator's gate; `sh -n` checked.",
             "type": "string"
           },
           "diff": {
