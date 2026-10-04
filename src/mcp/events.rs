@@ -2252,6 +2252,30 @@ impl EventRouter {
                 }
             }
         }
+        if watching.is_empty()
+            && let Ok(path) = std::env::var("MINI_SWE_WATCH_DEBUG_FILE")
+        {
+            use std::io::Write;
+            let line = format!(
+                "watch_reply initial={initial} events={} watch_current=[{}]\n",
+                events.len(),
+                self.watch_current
+                    .keys()
+                    .map(|k| format!(
+                        "{k}:{}",
+                        self.watch_current[k]["status"].as_str().unwrap_or("?")
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
+                let _ = f.write_all(line.as_bytes());
+            }
+        }
         let mut reply = json!({"watching":watching,"events":events});
         if let Some(union) = widen_to {
             reply["widen_to"] = union;
