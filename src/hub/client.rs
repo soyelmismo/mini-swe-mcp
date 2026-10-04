@@ -60,6 +60,11 @@ pub async fn connect_or_spawn() -> Result<UnixStream> {
 /// same helper on a path the daemon is already known to run), so no caller has
 /// to remember that a replaced binary is reported as ` (deleted)`.
 pub(crate) fn spawn_daemon(paths: &HubPaths, exe: &std::path::Path) -> Result<()> {
+    // The daemon writes its whole life through this file, so the cap is
+    // enforced where the log is opened: a hub started on an oversized log
+    // begins in a fresh one, with the previous generation kept as
+    // `hub.log.1`.
+    let _ = super::daemon::rotate_log(&paths.log());
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
