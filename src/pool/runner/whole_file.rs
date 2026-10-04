@@ -25,10 +25,17 @@
 //! * the worktree root is canonicalized, and the file's resolved path must stay
 //!   under it, so a `..` escape, an absolute path outside the worktree, or a
 //!   symlink pointing out of the worktree is refused rather than followed;
-//! * the file is opened with `O_NOFOLLOW`, so the final component cannot be
-//!   swapped for a link between the check and the read, and the opened handle's
-//!   own type must be a regular file -- a directory, a FIFO or a device is
-//!   refused;
+//! * the file is opened with `O_NOFOLLOW` and `O_NONBLOCK`, so the final
+//!   component cannot be swapped for a link or a FIFO that would block in
+//!   `open(2)`, and the opened handle's own type must be a regular file -- a
+//!   directory or a device is refused;
+//! * the *opened descriptor* is then proved to be the file that was resolved,
+//!   by reading its own path back from `/proc/self/fd` and requiring it to still
+//!   be under the root, and by matching its `(dev, ino)` against the identity
+//!   taken from the resolved name before the open. `O_NOFOLLOW` covers only the
+//!   last component, so without this a worker with a background job could
+//!   swap an intermediate directory for a symlink out of the worktree between
+//!   the resolution and the open -- see [`descriptor_is_inside`];
 //! * the substitution happens only after the sandboxed command itself exited
 //!   zero, so a failed read keeps its error and the model sees what happened.
 //!
