@@ -48,6 +48,6 @@ pub use client::{
 };
 pub use daemon::{
     HubConfig, HubEndpoint, HubPaths, HubServer, LOG_ROTATE_BYTES, LOG_ROTATE_INTERVAL,
-    WatchTokens, connect_endpoint, hub_dir, hub_dir_in, run_daemon, rotated_log_path,
+    WatchTokens, connect_endpoint, hub_dir, hub_dir_in, rotated_log_path, run_daemon,
     watch_token_identity,
 };

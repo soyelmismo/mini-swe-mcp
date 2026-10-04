@@ -948,15 +948,10 @@ impl HubServer {
         loop {
             tokio::time::sleep(LOG_ROTATE_INTERVAL).await;
             let path = path.clone();
-            if let Err(e) =
-                tokio::task::spawn_blocking(move || rotate_log(&path))
-                    .await
-                    .unwrap_or_else(|e| {
-                        warn!(error = %e, "Hub log rotation task failed");
-                        Ok(false)
-                    })
-            {
-                debug!(error = %e, "Hub log rotation failed; trying again later");
+            match tokio::task::spawn_blocking(move || rotate_log(&path)).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => debug!(error = %e, "Hub log rotation failed; trying again later"),
+                Err(e) => warn!(error = %e, "Hub log rotation task failed; trying again later"),
             }
         }
     }
@@ -1504,7 +1499,9 @@ mod tests {
         std::fs::write(&log, vec![b'y'; (LOG_ROTATE_BYTES + 1) as usize]).expect("seed again");
         assert!(rotate_log(&log).expect("rotate the second time"));
         assert_eq!(
-            std::fs::metadata(&previous).expect("stat the generation").len(),
+            std::fs::metadata(&previous)
+                .expect("stat the generation")
+                .len(),
             LOG_ROTATE_BYTES + 1,
             "hub.log.1 must hold the newest oversized log"
         );

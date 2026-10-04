@@ -474,7 +474,10 @@ pub(super) fn log_output_tail(output: &str) -> String {
         }
         kept.push_back(line);
     }
-    bounded_tail(&kept.into_iter().collect::<Vec<_>>().join("\n"), LOG_OUTPUT_BYTES)
+    bounded_tail(
+        &kept.into_iter().collect::<Vec<_>>().join("\n"),
+        LOG_OUTPUT_BYTES,
+    )
 }
 
 /// The nudge a first loop detection injects: name the loop, name what the
@@ -3686,14 +3689,14 @@ impl<'a> TurnEngine<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        EDIT_PLAN_FILES, EDIT_PLAN_PATH_BYTES, LlmResponse, LoopDetector, LoopVerdict,
-        MAX_TURNS_LIMIT, ProgressSummary, ProgressWatch, READ_ONLY_NUDGE_TURNS, REPEAT_BLOCK_LIMIT,
-        LOG_OUTPUT_BYTES, LOG_OUTPUT_LINES, REPORT_SCAN_BYTES, ReadOnlyNudge, ReadOnlyStreak,
-        ReadOnlyThresholds, STAGNATION_SAMPLE_TURNS, TASK_QUESTION_BYTES, append_report_text,
-        edit_plan, edit_plan_text, extension_budget, grant_extension, isolation_block,
-        log_output_tail, loop_nudge_text, loop_pause_question, named_file_defaults,
-        normalize_command_base, output_digest, parse_shortstat, parse_threshold,
-        read_only_nudge_text, read_only_pause_question, read_only_plan_text,
+        EDIT_PLAN_FILES, EDIT_PLAN_PATH_BYTES, LOG_OUTPUT_BYTES, LOG_OUTPUT_LINES, LlmResponse,
+        LoopDetector, LoopVerdict, MAX_TURNS_LIMIT, ProgressSummary, ProgressWatch,
+        READ_ONLY_NUDGE_TURNS, REPEAT_BLOCK_LIMIT, REPORT_SCAN_BYTES, ReadOnlyNudge,
+        ReadOnlyStreak, ReadOnlyThresholds, STAGNATION_SAMPLE_TURNS, TASK_QUESTION_BYTES,
+        append_report_text, edit_plan, edit_plan_text, extension_budget, grant_extension,
+        isolation_block, log_output_tail, loop_nudge_text, loop_pause_question,
+        named_file_defaults, normalize_command_base, output_digest, parse_shortstat,
+        parse_threshold, read_only_nudge_text, read_only_pause_question, read_only_plan_text,
         read_only_thresholds, summarized_task, task_names_files,
     };
 
@@ -3723,9 +3726,9 @@ mod tests {
         );
 
         // Blank lines carry nothing, so they never consume one of the five.
-        let padded = format!("a\n\n   \nb\n\nc\n\nd\n\ne\n\nf\n");
+        let padded = "a\n\n   \nb\n\nc\n\nd\n\ne\n\nf\n";
         assert_eq!(
-            log_output_tail(&padded),
+            log_output_tail(padded),
             "b\nc\nd\ne\nf",
             "the tail must be the last {LOG_OUTPUT_LINES} non-empty lines"
         );
