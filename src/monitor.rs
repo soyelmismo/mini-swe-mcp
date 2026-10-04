@@ -1038,9 +1038,9 @@ pub fn parse_key(bytes: &[u8]) -> Option<Key> {
 /// Fit one worker to a single compact line of at most `width` visible columns.
 ///
 /// Layout: `glyph id model step/max elapsed op`, columns dropping in the
-/// stated order as the terminal narrows. Delegates to [`compact_row`] so the
-/// interactive list and the plain dashboard share one layout; plain (no ANSI
-/// codes) like the non-TTY output.
+/// stated order as the terminal narrows. Delegates to the shared `compact_row`
+/// helper so the interactive list and the plain dashboard share one layout;
+/// plain (no ANSI codes) like the non-TTY output.
 pub fn fit_compact_row(w: &WorkerRegistryEntry, now: u64, width: usize) -> String {
     compact_row(w, now, width.saturating_sub(4).max(1), false)
 }
@@ -1568,7 +1568,6 @@ pub async fn run_monitor(once: bool) -> Result<()> {
 mod tests {
     use super::*;
     use crate::pool::WorkerMetrics;
-    use serde_json::json;
 
     /// Builder for registry rows: the tests below touch every field, so a
     /// positional 8-argument helper would be unreadable.
@@ -1634,12 +1633,6 @@ mod tests {
 
         fn updated_at(mut self, updated_at: u64) -> Self {
             self.updated_at = updated_at;
-            self
-        }
-
-        fn metrics(mut self, repeat_blocks: usize, stagnation_nudges: usize) -> Self {
-            self.metrics.repeat_blocks = repeat_blocks;
-            self.metrics.stagnation_nudges = stagnation_nudges;
             self
         }
 
