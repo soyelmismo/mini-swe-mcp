@@ -3023,6 +3023,13 @@ mod tests {
 
     impl Drop for LandlockScratch {
         fn drop(&mut self) {
+            // A step run against either root makes the runner derive its private
+            // `swe-tmp-<leaf>` scratch next to the scratch *base*. These leaves
+            // are the fixed names `worktree` and `target`, so removing the base
+            // alone would leave one `swe-tmp-worktree` and `swe-tmp-target`
+            // entry in the real base, shared by every run of this suite.
+            crate::worktree::remove_target_dirs(&self.worktree);
+            crate::worktree::remove_target_dirs(&self.target);
             if let Some(base) = self.worktree.parent() {
                 let _ = std::fs::remove_dir_all(base);
             }

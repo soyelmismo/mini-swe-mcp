@@ -184,8 +184,7 @@ async fn wait_for_refusal(pool: &WorkerPool, worker_id: &str, needle: &str) -> S
                 WorkerState::Completed { .. } | WorkerState::Failed { .. }
             )
         {
-            let path =
-                mini_swe_mcp::pool::history_log_path_in(pool.scratch_root(), worker_id);
+            let path = mini_swe_mcp::pool::history_log_path_in(pool.scratch_root(), worker_id);
             let raw = std::fs::read_to_string(&path).unwrap_or_default();
             panic!(
                 "worker {worker_id} finished before refusing with {needle:?}: {state:?}\n--- log ---\n{raw}"

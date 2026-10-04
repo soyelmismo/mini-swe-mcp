@@ -76,6 +76,7 @@ mod review_security_scope_test;
 mod review_security_test;
 mod review_test;
 mod round_ack_restart_test;
+mod scratch_hygiene_test;
 mod round_base_start_test;
 mod sensitive_paths_declaration_test;
 mod session_identity_test;
