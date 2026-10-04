@@ -1136,12 +1136,19 @@ fn parse_tool_output(line: &str) -> Option<(Option<i32>, Vec<String>)> {
     Some((exit_code, tail_lines(output)))
 }
 
+/// Whether a line is a markdown code fence: only backticks (optionally with
+/// trailing whitespace already trimmed). The harness wraps command output in a
+/// ``` fence, so those lines are framing, not output, and are dropped.
+fn is_fence_line(line: &str) -> bool {
+    line.trim_start().chars().all(|c| c == '`') && line.contains('`')
+}
+
 /// Keep the last [`TURN_KEPT_LINES`] non-blank lines of a tool output.
 fn tail_lines(output: &str) -> Vec<String> {
     output
         .lines()
         .map(str::trim_end)
-        .filter(|l| !l.is_empty())
+        .filter(|l| !l.is_empty() && !is_fence_line(l))
         .map(str::to_string)
         .collect::<Vec<_>>()
         .into_iter()
@@ -1369,13 +1376,21 @@ pub fn fit_compact_row(w: &WorkerRegistryEntry, now: u64, width: usize) -> Strin
 }
 
 /// One line of the key hint shown at the bottom of the interactive views.
-pub fn key_hint(view: View) -> &'static str {
-    match view {
+///
+/// The hint is shortened to fit `width` so the bottom border is never clipped:
+/// `box_bottom` truncates with an ellipsis, which would eat the right border,
+/// so a narrow terminal gets a compact hint instead.
+pub fn key_hint(view: View, width: usize) -> String {
+    let hint = match view {
         View::List => "\u{2191}\u{2193} select  \u{23ce} turns  g groups  q quit",
         View::Detail => {
             "\u{2191}\u{2193} turn  \u{23ce} expand  PgUp/PgDn scroll  f follow  Esc/q back"
         }
-    }
+    };
+    // `╰─ ` and ` ─╯` take four columns around the hint; anything beyond the
+    // inner width is dropped so the border survives at any width.
+    let budget = width.saturating_sub(4).max(1);
+    truncate_visible(hint, budget)
 }
 
 // ----------
@@ -1573,7 +1588,7 @@ fn render_list(
             }
         }
     }
-    out.push(box_bottom(key_hint(View::List), width, use_color));
+    out.push(box_bottom(&key_hint(View::List, width), width, use_color));
     out
 }
 
@@ -1621,7 +1636,9 @@ fn render_detail(
     // Render each turn's block: a separator line carrying the turn number, a
     // coloured ✓/✗ with the exit code, the duration when known and the review
     // phase, then the bold command and (for the tail) the dim output lines.
-    // The newest turn is at the bottom of the list, so we walk newest-last.
+    // Turns are walked oldest-first so the newest lands at the bottom of the
+    // list; the view then shows the last `turn_height` blocks, i.e. the newest
+    // turns, which is where follow mode and the initial open must point.
     let mut blocks: Vec<String> = Vec::new();
     // `selected_turn` counts back from the newest turn the reader holds, so it
     // names the turn at that index from the end of `reader.turns`. `turns` is a
@@ -1631,7 +1648,7 @@ fn render_detail(
         .len()
         .saturating_sub(1)
         .saturating_sub(state.selected_turn);
-    for (off, turn) in turns.iter().enumerate().rev() {
+    for (off, turn) in turns.iter().enumerate() {
         let is_selected = off == selected_idx;
         blocks.push(turn_separator(turn, width, use_color, is_selected));
         let indent = "  ";
@@ -1711,7 +1728,7 @@ fn render_detail(
     for l in blocks.iter().skip(start).take(turn_height) {
         out.push(l.clone());
     }
-    out.push(box_bottom(key_hint(View::Detail), width, use_color));
+    out.push(box_bottom(&key_hint(View::Detail, width), width, use_color));
     out
 }
 
@@ -1751,7 +1768,17 @@ fn turn_separator(turn: &TurnView, width: usize, use_color: bool, selected: bool
         "── turn {} \u{b7} {mark}{code}{duration}{review}{cursor}",
         turn.step
     );
-    let dashes = inner.saturating_sub(visible_width(&prefix)).max(1);
+    // Build the separator to exactly `inner` columns so `box_line` never has
+    // to clip it (which would leave an ellipsis and break the right border).
+    // Leave room for a separating space and at least one dash; if the prefix
+    // is too long, clip it to fit instead of clipping the whole line.
+    let max_prefix = inner.saturating_sub(2);
+    let prefix = if visible_width(&prefix) > max_prefix {
+        truncate_visible(&prefix, max_prefix)
+    } else {
+        prefix
+    };
+    let dashes = inner.saturating_sub(visible_width(&prefix) + 1).max(1);
     let line = format!("{prefix} {}", "─".repeat(dashes));
     box_line(&line, width)
 }
