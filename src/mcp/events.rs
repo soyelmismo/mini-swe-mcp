@@ -1844,6 +1844,19 @@ async fn watch_snapshot(pool: &WorkerPool) -> crate::cli::watch::Snapshot {
             if let Some(last) = row["state"]["last_command"].as_str() {
                 view["last_ops"] = json!([clamp_string(last, 256)]);
             }
+            // The seeded status re-arms the terminal transitions, so this
+            // skeleton must face the same replay-suppression proof the rows
+            // loaded above do: a completion whose branch is already merged or
+            // gone is never replayed. The guard needs the registry entry (the
+            // branch is derived from its id, and the repository and base ref
+            // from its row), which the summary payload does not carry, so it
+            // is read back here rather than guessed from the summary.
+            if crate::pool::load_registry_entry_in(pool.scratch_root(), id)
+                .as_ref()
+                .is_some_and(branch_replay_suppressed)
+            {
+                view[BRANCH_GONE_OR_MERGED] = json!(true);
+            }
             view
         });
         view["owner"] = row["owner"].clone();
