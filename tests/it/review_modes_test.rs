@@ -2,9 +2,10 @@
 //!
 //! The manifest may declare its own auditors the same way it declares models:
 //! each entry carries a `checklist` (focus instructions appended to the common
-//! review frame) and an optional default `model`. Built-in modes `quality`
-//! and `security` keep their prompts and can be overridden by declaring the
-//! same name. `--review-after <model>:<mode>` accepts any declared mode; an
+//! review frame) and an optional `default_model`. Built-in modes `quality`
+//! and `security` keep their built-in checklists and can be overridden by
+//! declaring the same name. `--review-after <mode>` and
+//! `--review-after <model>:<mode>` accept any declared mode; an
 //! unknown mode is a dispatch error listing the available ones.
 
 use crate::common;
@@ -31,12 +32,16 @@ fn a_manifest_without_review_modes_parses_to_empty() {
 #[test]
 fn a_declared_mode_parses_its_checklist_and_model() {
     let manifest = modes_manifest(
-        "models:\n  nerd:\n    id: combo:nerd\nreview_modes:\n  perf:\n    checklist: Check for N+1 queries.\n    model: nerd\n",
+        "models:\n  nerd:\n    id: combo:nerd\nreview_modes:\n  perf:\n    checklist: Check for N+1 queries.\n    default_model: nerd\n",
     );
     let def = manifest.review_mode("perf").expect("perf mode");
-    assert_eq!(def.checklist, "Check for N+1 queries.");
-    assert_eq!(def.model.as_deref(), Some("nerd"));
-    assert!(manifest.validate().is_empty());
+    assert_eq!(def.checklist.as_deref(), Some("Check for N+1 queries."));
+    assert_eq!(def.default_model.as_deref(), Some("nerd"));
+    assert!(
+        manifest.validate().is_empty(),
+        "the current `default_model:` spelling must not warn: {:?}",
+        manifest.validate()
+    );
 }
 
 #[test]
@@ -45,7 +50,7 @@ fn a_declared_mode_without_a_model_has_none() {
         "models:\n  nerd:\n    id: combo:nerd\nreview_modes:\n  style:\n    checklist: Check naming.\n",
     );
     let def = manifest.review_mode("style").expect("style mode");
-    assert_eq!(def.model, None);
+    assert_eq!(def.default_model, None);
     assert!(manifest.validate().is_empty());
 }
 
@@ -79,7 +84,7 @@ fn an_empty_checklist_warns_and_is_dropped_by_normalize() {
 #[test]
 fn parse_with_manifest_resolves_a_custom_mode() {
     let manifest = modes_manifest(
-        "models:\n  nerd:\n    id: combo:nerd\nreview_modes:\n  perf:\n    checklist: Check for N+1 queries.\n    model: nerd\n",
+        "models:\n  nerd:\n    id: combo:nerd\nreview_modes:\n  perf:\n    checklist: Check for N+1 queries.\n    default_model: nerd\n",
     );
     let (model, mode) =
         ReviewMode::parse_with_manifest("some-reviewer:perf", &manifest).expect("perf mode");
@@ -91,7 +96,7 @@ fn parse_with_manifest_resolves_a_custom_mode() {
 #[test]
 fn parse_with_manifest_uses_the_mode_default_for_an_empty_model() {
     let manifest = modes_manifest(
-        "models:\n  nerd:\n    id: combo:nerd\nreview_modes:\n  perf:\n    checklist: Check for N+1 queries.\n    model: nerd\n",
+        "models:\n  nerd:\n    id: combo:nerd\nreview_modes:\n  perf:\n    checklist: Check for N+1 queries.\n    default_model: nerd\n",
     );
     let (model, mode) = ReviewMode::parse_with_manifest(":perf", &manifest).expect("perf mode");
     assert_eq!(model, "nerd");
@@ -106,7 +111,10 @@ fn parse_with_manifest_keeps_colon_model_ids_as_quality() {
     let (model, mode) = ReviewMode::parse_with_manifest("combo:nerd", &manifest).expect("model id");
     assert_eq!(model, "combo:nerd");
     assert_eq!(mode.name, "quality");
-    assert_eq!(mode.checklist, None);
+    assert_eq!(
+        mode.checklist.as_deref(),
+        Some(mini_swe_mcp::manifest::QUALITY_CHECKLIST)
+    );
 }
 
 #[test]
@@ -174,8 +182,94 @@ fn overriding_security_replaces_its_checklist() {
         "the override replaces the prompt: {prompt}"
     );
     assert!(
-        !prompt.contains("ADVERSARIAL SECURITY REVIEW PHASE"),
-        "the built-in prompt is replaced: {prompt}"
+        !prompt.contains("Assume the diff is hostile"),
+        "the built-in checklist is replaced: {prompt}"
+    );
+}
+
+#[test]
+fn a_bare_mode_name_resolves_to_its_default_reviewer() {
+    let manifest = modes_manifest(
+        "models:\n  nerd:\n    id: combo:nerd\nreview_modes:\n  perf:\n    checklist: Check for N+1 queries.\n    default_model: nerd\n",
+    );
+    let (model, mode) = ReviewMode::parse_with_manifest("perf", &manifest).expect("perf mode");
+    assert_eq!(model, "nerd");
+    assert_eq!(mode.name, "perf");
+}
+
+#[test]
+fn a_bare_builtin_mode_keeps_the_builtin_checklist() {
+    let manifest = ModelManifest::default();
+    let (model, mode) = ReviewMode::parse_with_manifest("security", &manifest).expect("security");
+    assert_eq!(model, "");
+    assert_eq!(mode.name, "security");
+    assert_eq!(
+        mode.checklist.as_deref(),
+        Some(mini_swe_mcp::manifest::SECURITY_CHECKLIST)
+    );
+}
+
+#[test]
+fn a_security_override_with_only_a_default_model_keeps_the_builtin_checklist() {
+    let manifest = modes_manifest(
+        "models:\n  nerd:\n    id: combo:nerd\nreview_modes:\n  security:\n    default_model: nerd\n",
+    );
+    assert!(manifest.validate().is_empty());
+    let mode = ReviewMode::resolve_declared("security", &manifest);
+    assert_eq!(mode.name, "security");
+    assert_eq!(
+        mode.checklist.as_deref(),
+        Some(mini_swe_mcp::manifest::SECURITY_CHECKLIST)
+    );
+    let (model, _) = ReviewMode::parse_with_manifest("security", &manifest).expect("security");
+    assert_eq!(model, "nerd");
+}
+
+#[test]
+fn the_deprecated_model_key_still_parses_with_a_warning() {
+    let manifest = modes_manifest(
+        "models:\n  nerd:\n    id: combo:nerd\nreview_modes:\n  perf:\n    checklist: Check.\n    model: nerd\n",
+    );
+    let def = manifest.review_mode("perf").expect("perf mode");
+    assert_eq!(def.default_model.as_deref(), Some("nerd"));
+    let warnings = manifest.validate();
+    assert!(
+        warnings.iter().any(|w| w.contains("deprecated")),
+        "the old `model:` spelling must warn: {warnings:?}"
+    );
+}
+
+#[test]
+fn a_mode_name_that_collides_with_a_model_warns() {
+    let manifest = modes_manifest(
+        "models:\n  perf:\n    id: combo:perf\nreview_modes:\n  perf:\n    checklist: Check.\n",
+    );
+    let warnings = manifest.validate();
+    assert!(
+        warnings.iter().any(|w| w.contains("shadows")),
+        "a mode/model collision must warn: {warnings:?}"
+    );
+    let (model, mode) = ReviewMode::parse_with_manifest("perf", &manifest).expect("perf mode");
+    assert_eq!(mode.name, "perf");
+    assert_eq!(model, "");
+}
+
+#[test]
+fn a_retired_strongest_key_is_ignored_with_a_warning() {
+    let manifest = modes_manifest(
+        "default: ninja\nstrongest: nerd\nmodels:\n  ninja:\n    id: combo:ninja\n  nerd:\n    id: combo:nerd\n",
+    );
+    let warnings = manifest.validate();
+    assert!(
+        warnings.iter().any(|w| w.contains("strongest")),
+        "a `strongest:` key must warn: {warnings:?}"
+    );
+    assert!(
+        manifest
+            .normalize()
+            .validate()
+            .iter()
+            .any(|w| w.contains("strongest"))
     );
 }
 
@@ -281,6 +375,71 @@ async fn a_custom_mode_uses_its_checklist_and_reviewer() {
     let _ = pool.kill(&worker_id).await;
 }
 
+/// A bare `security` runs the security mode on the mode's `default_model`,
+/// resolved to the model id the provider is called -- not on the alias
+/// verbatim, which no provider serves, and not on the implementer's model.
+#[tokio::test]
+async fn a_bare_security_mode_runs_on_its_default_model() {
+    let repo = common::TestRepo::new("bare-security");
+    let manifest: ModelManifest = serde_yaml::from_str(
+        "models:\n  test-model:\n    id: test-model\n  nerd:\n    id: combo:nerd\nreview_modes:\n  security:\n    default_model: nerd\n",
+    )
+    .expect("manifest with a security default model");
+    let server = FakeLlm::spawn_sse(vec![
+        turn("call_write", "", "echo changed > src/ordinary.rs"),
+        completion_turn("call_impl", "REPORT\ndone: impl\nrisks: none"),
+        completion_turn("call_review", "REPORT\ndone: reviewed\nrisks: none"),
+    ])
+    .await;
+
+    let scratch = common::TempDir::new_in_tmp("review-modes-bare-security");
+    let pool = WorkerPool::with_scratch(
+        1,
+        server.base_url().to_string(),
+        "test-key".to_string(),
+        ScratchRoot::new(scratch.path()),
+    )
+    .with_manifest(Arc::new(manifest));
+    let worker_id = pool
+        .dispatch(
+            TEST_OWNER.to_string(),
+            "audit me".to_string(),
+            "test-model".to_string(),
+            None,
+            repo.path().to_path_buf(),
+            5,
+            Some("review-modes".to_string()),
+            Some("security".to_string()),
+            false,
+            None,
+            Vec::new(),
+        )
+        .await
+        .expect("dispatch the worker");
+    let state = common::wait_for_terminal(&pool, &worker_id).await;
+
+    let requests = server.request_bodies().await;
+    assert_eq!(requests.len(), 3, "write, implementer, security review");
+    assert_eq!(
+        requests[2]["model"],
+        json!("combo:nerd"),
+        "the bare mode runs on its default_model, resolved to its id: {:?}",
+        requests[2]["model"]
+    );
+    let prompt = common::review_prompt_of(&server)
+        .await
+        .expect("a review prompt");
+    assert!(
+        prompt.contains("Assume the diff is hostile"),
+        "the bare mode selects the adversarial prompt: {prompt}"
+    );
+
+    let WorkerState::Completed { .. } = &state else {
+        panic!("worker must complete, got {state:?}")
+    };
+    let _ = pool.kill(&worker_id).await;
+}
+
 /// An unknown mode is a dispatch error, not a worker failure.
 #[tokio::test]
 async fn an_unknown_mode_is_a_dispatch_error() {
@@ -312,4 +471,85 @@ async fn an_unknown_mode_is_a_dispatch_error() {
         message.contains("perf"),
         "{message} must list the declared mode"
     );
+}
+
+// ----------
+// Ambiguity and unusable names
+// ----------
+
+/// Two case variants of a built-in mode must not make the reviewer
+/// nondeterministic: `review_mode` falls back to a case-insensitive scan of a
+/// `HashMap` with a randomly seeded order, so with both `Security:` and
+/// `SECURITY:` declared the automatic adversarial audit would pick its
+/// `default_model` differently from run to run. The catalog must say so, and
+/// the pick must be a fixed one.
+#[test]
+fn two_case_variants_of_a_builtin_mode_warn_and_resolve_deterministically() {
+    let manifest = modes_manifest(
+        "models:\n  nerd:\n    id: combo:nerd\n  weak:\n    id: combo:weak\nreview_modes:\n  Security:\n    default_model: nerd\n  SECURITY:\n    default_model: weak\n",
+    );
+    let warnings = manifest.validate();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("Security") && w.contains("SECURITY")),
+        "two spellings of one built-in mode must warn: {warnings:?}"
+    );
+    // The scan picks the lexicographically first spelling ("SECURITY" sorts
+    // before "Security"), every run, so the reviewer it names is fixed.
+    assert_eq!(
+        manifest
+            .review_mode("security")
+            .and_then(|def| def.default_model.clone()),
+        Some("weak".to_string()),
+        "the case-insensitive lookup must not depend on HashMap order"
+    );
+    let (reviewer, _) = ReviewMode::parse_with_manifest("security", &manifest).expect("security");
+    assert_eq!(reviewer, "weak");
+}
+
+/// A mode name that cannot survive the dispatch -> review-phase round trip
+/// (`<model>:<mode>` is split at the last colon) must be rejected when the
+/// catalog loads, not accepted at dispatch and then fail the worker after the
+/// implementation has already run.
+#[test]
+fn a_mode_name_with_a_colon_is_dropped_with_a_warning() {
+    let manifest = modes_manifest(
+        "models:\n  nerd:\n    id: combo:nerd\nreview_modes:\n  \"a:b\":\n    checklist: Check.\n",
+    );
+    let warnings = manifest.validate();
+    assert!(
+        warnings.iter().any(|w| w.contains("a:b")),
+        "an unselectable mode name must be named to the operator: {warnings:?}"
+    );
+    let normalized = manifest.normalize();
+    assert!(
+        normalized.review_mode("a:b").is_none(),
+        "a mode no `--review-after` spelling can reach must not stay in the catalog"
+    );
+    assert!(
+        ReviewMode::parse_with_manifest("a:b", &normalized).is_err(),
+        "the dispatch must reject it instead of failing the worker's review phase"
+    );
+    assert!(
+        normalized.validate().is_empty(),
+        "{:?}",
+        normalized.validate()
+    );
+}
+
+/// An empty or blank mode name is the same defect: the dispatch accepts it
+/// (the bare-mode path matches the declared key) and the stored
+/// `<model>:<mode>` form then fails to re-parse.
+#[test]
+fn a_mode_name_without_content_is_dropped_with_a_warning() {
+    let manifest = modes_manifest(
+        "models:\n  nerd:\n    id: combo:nerd\nreview_modes:\n  \" \":\n    checklist: Check.\n",
+    );
+    let warnings = manifest.validate();
+    assert!(
+        warnings.iter().any(|w| w.contains("review mode")),
+        "a blank mode name must be named to the operator: {warnings:?}"
+    );
+    assert!(manifest.normalize().review_modes.is_empty());
 }

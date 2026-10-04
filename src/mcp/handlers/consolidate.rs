@@ -10,8 +10,9 @@ impl McpServer {
     /// when there is nothing to integrate, and embeds the manifest plus
     /// [`crate::agent::CONSOLIDATOR_INSTRUCTIONS`] in the consolidator's task.
     ///
-    /// Defaults differ from a plain dispatch on purpose: the consolidator runs
-    /// on the manifest's strongest tier when one is marked, and its gate is the
+    /// Defaults differ from a plain dispatch on purpose: the consolidator
+    /// runs on the dispatch default model unless `--model` (or the round's
+    /// `consolidate: "<model>"`) names one, and its gate is the
     /// project's *full* gate (the explicit `verify`, else the auto-detected
     /// one), because it is the only worker that runs the whole suite. A
     /// consolidated round (`consolidate` set, no explicit worker `verify`)
@@ -71,12 +72,11 @@ impl McpServer {
             );
         }
 
-        // The strongest tier when the manifest marks one, else the dispatch
-        // default: integrating a round is the deepest job in the pool.
+        // The named model, else the dispatch default: integrating a round is
+        // the deepest job in the pool, and the caller picks its model.
         let requested_model = args
             .get("model")
             .and_then(|v| v.as_str())
-            .or_else(|| self.manifest.strongest_alias())
             .unwrap_or(&self.default_model);
 
         // The explicit gate wins; an absent one auto-detects, so a consolidator

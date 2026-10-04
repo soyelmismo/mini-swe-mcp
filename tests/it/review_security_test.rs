@@ -73,7 +73,7 @@ fn security_prompt_is_used_for_the_suffix_and_generic_otherwise() {
         &["src/hub/mod.rs".to_string()],
     );
     assert!(
-        security.contains("ADVERSARIAL SECURITY REVIEW PHASE"),
+        security.contains("Assume the diff is hostile"),
         "the security mode must use the adversarial prompt"
     );
     assert!(
@@ -88,7 +88,7 @@ fn security_prompt_is_used_for_the_suffix_and_generic_otherwise() {
         &[],
     );
     assert!(
-        quality.contains("AUDIT & REVIEW PHASE"),
+        quality.contains("REVIEW PHASE (quality)"),
         "the default mode must keep the generic prompt"
     );
     assert!(
@@ -325,10 +325,10 @@ async fn a_sensitive_diff_triggers_the_security_review_automatically() {
         "write turn, implementer completion, automatic security review"
     );
     let reviewer_request = &requests[2];
-    // The default catalog marks no `strongest:` tier, so the automatic
-    // reviewer is the dispatch default (`ninja`), never the implementer's own
-    // `test-model`. See `review_reviewer_choice_test.rs` for the rule and its
-    // strongest-tier case.
+    // The default catalog declares no security `default_model`, so the
+    // automatic reviewer is the dispatch default (`ninja`), never the
+    // implementer's own `test-model`. See `review_reviewer_choice_test.rs`
+    // for the rule and its security-default case.
     assert_eq!(
         reviewer_request["model"],
         json!("combo:ninja"),
@@ -338,7 +338,7 @@ async fn a_sensitive_diff_triggers_the_security_review_automatically() {
         .await
         .expect("a review prompt");
     assert!(
-        prompt.contains("ADVERSARIAL SECURITY REVIEW PHASE"),
+        prompt.contains("Assume the diff is hostile"),
         "the automatic trigger must run the adversarial prompt"
     );
     assert!(
@@ -461,7 +461,7 @@ async fn the_security_suffix_selects_the_adversarial_review() {
     let prompt = common::review_prompt_of(&server)
         .await
         .expect("a review prompt");
-    assert!(prompt.contains("ADVERSARIAL SECURITY REVIEW PHASE"));
+    assert!(prompt.contains("Assume the diff is hostile"));
     // Nothing sensitive was touched, so the trigger adds no paths.
     assert!(!prompt.contains("declared sensitive"));
 
@@ -496,7 +496,7 @@ async fn a_bare_review_after_keeps_the_generic_prompt() {
     let prompt = common::review_prompt_of(&server)
         .await
         .expect("a review prompt");
-    assert!(prompt.contains("AUDIT & REVIEW PHASE"));
+    assert!(prompt.contains("REVIEW PHASE (quality)"));
     assert!(!prompt.contains("ADVERSARIAL"));
 
     let WorkerState::Completed { .. } = &state else {
@@ -535,7 +535,7 @@ async fn a_sensitive_diff_upgrades_a_requested_review() {
     let prompt = common::review_prompt_of(&server)
         .await
         .expect("a review prompt");
-    assert!(prompt.contains("ADVERSARIAL SECURITY REVIEW PHASE"));
+    assert!(prompt.contains("Assume the diff is hostile"));
     assert!(prompt.contains("src/hub/mod.rs"));
 
     let WorkerState::Completed { .. } = &state else {

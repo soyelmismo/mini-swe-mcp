@@ -50,15 +50,17 @@ impl ModelManifest {
             ));
         }
 
-        // `strongest` is looked up by alias too, so a dangling reference would
-        // silently leave the consolidator on the dispatch default.
-        if let Some(name) = &self.strongest
-            && !self.models.contains_key(name.trim())
-        {
-            warnings.push(format!(
-                "strongest model \"{name}\" not found in models; it will be ignored and the \
-                 dispatch default used"
-            ));
+        // The retired `strongest:` key is ignored, but the operator should
+        // hear that: the consolidator and the automatic security reviewer no
+        // longer read it.
+        if self.strongest_ignored {
+            warnings.push(
+                "`strongest:` is no longer supported and is ignored; pick the consolidator model \
+                 with `--consolidate=<model>` (MCP `consolidate: \"<model>\"`) and the automatic \
+                 security reviewer with the security mode's `default_model`, else both use the \
+                 dispatch default"
+                    .to_string(),
+            );
         }
 
         // Duplicate ids are ambiguous for id-based resolution. The policy in
@@ -126,13 +128,83 @@ impl ModelManifest {
             }
         }
 
-        // Review modes are iterated in sorted name order so the output is
-        // stable across runs. A mode with an empty checklist is an auditor
-        // with nothing to say, so it is reported and dropped by `normalize`.
-        for (name, def) in self.sorted_review_modes() {
-            if def.checklist.trim().is_empty() {
+        // Two spellings of one built-in mode are one mode to every lookup, and
+        // which of them wins is fixed (the lexicographically first, see
+        // `declared_review_mode`), but the catalog is still ambiguous and the
+        // operator should keep one.
+        for builtin in ["quality", "security"] {
+            let spellings: Vec<&str> = self
+                .review_modes
+                .keys()
+                .filter(|name| name.eq_ignore_ascii_case(builtin))
+                .map(String::as_str)
+                .collect();
+            if spellings.len() > 1 {
+                let mut sorted = spellings;
+                sorted.sort();
                 warnings.push(format!(
+                    "review modes {} all name the built-in `{builtin}`; only \"{}\" is used",
+                    join_known(&sorted),
+                    sorted[0]
+                ));
+            }
+        }
+
+        // Review modes are iterated in sorted name order so the output is
+        // stable across runs. A non-built-in mode with no checklist is an
+        // auditor with nothing to say, so it is reported and dropped by
+        // `normalize`; a built-in override may set only `default_model`, in
+        // which case the built-in checklist stays.
+        for (name, def) in self.sorted_review_modes() {
+            let builtin =
+                name.eq_ignore_ascii_case("quality") || name.eq_ignore_ascii_case("security");
+            match def.checklist.as_deref() {
+                None if !builtin => warnings.push(format!(
+                    "review mode \"{name}\" has no checklist; it will be ignored"
+                )),
+                Some(c) if c.trim().is_empty() => warnings.push(format!(
                     "review mode \"{name}\" has an empty checklist; it will be ignored"
+                )),
+                _ => {}
+            }
+            // A mode name no `--review-after` spelling can reach is dead
+            // config: the dispatch stores `<model>:<mode>`, split at the last
+            // colon, so a name holding a colon (or none at all) is accepted by
+            // the bare `<mode>` form and then fails to re-parse in the review
+            // phase -- after the implementation has already run. It is dropped
+            // by `normalize`, so the dispatch rejects the spelling instead.
+            if name.trim().is_empty() || name.contains(':') {
+                warnings.push(format!(
+                    "review mode \"{name}\" cannot be selected by `--review-after` because its \
+                     name is empty or holds a colon; it will be ignored"
+                ));
+            }
+            if def.model_key_deprecated {
+                warnings.push(format!(
+                    "review mode \"{name}\" uses the deprecated `model:` key; rename it to \
+                     `default_model:`"
+                ));
+            }
+            // A `default_model` the catalog does not define is a typo. It is
+            // dropped where it would disarm the automatic security review
+            // (see `select_security_reviewer`), so the operator has to be told,
+            // or the audit silently runs on the dispatch default instead.
+            if let Some(model) = def.default_model.as_deref()
+                && !model.trim().is_empty()
+                && !self.knows_model(model)
+            {
+                warnings.push(format!(
+                    "review mode \"{name}\" names default_model \"{model}\", which is not in \
+                     models; it will be ignored and the dispatch default used"
+                ));
+            }
+            // A single token that names both a mode and a model alias resolves
+            // as the mode (see `ReviewMode::parse_with_manifest`), so the
+            // model alias is shadowed and the operator should know.
+            if self.models.contains_key(name.trim()) {
+                warnings.push(format!(
+                    "review mode \"{name}\" shadows the model alias \"{name}\"; \
+                     `--review-after {name}` resolves as the mode"
                 ));
             }
         }
@@ -248,9 +320,6 @@ impl ModelManifest {
         self.default = self
             .default
             .filter(|name| self.models.contains_key(name.trim()));
-        self.strongest = self
-            .strongest
-            .filter(|name| self.models.contains_key(name.trim()));
 
         for def in self.models.values_mut() {
             def.temperature = Self::sanitize_temperature(def.temperature);
@@ -261,8 +330,35 @@ impl ModelManifest {
             Self::normalize_instructions(&mut def.instructions);
         }
 
-        self.review_modes
-            .retain(|_, def| !def.checklist.trim().is_empty());
+        // A built-in override with an empty checklist falls back to the
+        // built-in one (the warning already named it); a user mode with an
+        // empty or missing checklist is dropped.
+        for (name, def) in self.review_modes.iter_mut() {
+            let builtin =
+                name.eq_ignore_ascii_case("quality") || name.eq_ignore_ascii_case("security");
+            if builtin
+                && def
+                    .checklist
+                    .as_deref()
+                    .is_some_and(|c| c.trim().is_empty())
+            {
+                def.checklist = None;
+            }
+        }
+        self.review_modes.retain(|name, def| {
+            // A name the `--review-after` round trip cannot carry is dropped
+            // with the warning that names it, so a dispatch rejects the
+            // spelling instead of failing the worker's review phase.
+            let selectable = !name.trim().is_empty() && !name.contains(':');
+            let builtin =
+                name.eq_ignore_ascii_case("quality") || name.eq_ignore_ascii_case("security");
+            selectable
+                && (builtin
+                    || def
+                        .checklist
+                        .as_deref()
+                        .is_some_and(|c| !c.trim().is_empty()))
+        });
 
         self
     }

@@ -56,7 +56,7 @@ pub fn format_manifest(val: &serde_json::Value) -> String {
 /// A declared mode names its default reviewer when one is set; the built-ins
 /// `quality` and `security` are always available even when the manifest
 /// declares none, and a declared entry of the same name overrides the
-/// built-in prompt.
+/// built-in fields (its `default_model` alone keeps the built-in checklist).
 fn push_review_modes(out: &mut String, val: &serde_json::Value) {
     let declared = val
         .get("review_modes")
@@ -64,21 +64,35 @@ fn push_review_modes(out: &mut String, val: &serde_json::Value) {
         .cloned()
         .unwrap_or_default();
     out.push_str("\n\nReview modes:\n");
+    // Built-ins are always listed, even when the manifest declares none;
+    // a declared entry of the same name overrides the built-in fields.
+    let mut names: Vec<String> = declared.keys().cloned().collect();
     for builtin in ["quality", "security"] {
-        if let Some(def) = declared.get(builtin) {
-            out.push_str(&format!("  - {builtin}{}\n", review_mode_suffix(def)));
-        } else {
-            out.push_str(&format!("  - {builtin} (built-in)\n"));
+        if !names.iter().any(|n| n == builtin) {
+            names.push(builtin.to_string());
         }
     }
-    let mut extra: Vec<&String> = declared
-        .keys()
-        .filter(|name| *name != "quality" && *name != "security")
-        .collect();
-    extra.sort();
-    for name in extra {
-        let def = &declared[name];
-        out.push_str(&format!("  - {name}{}\n", review_mode_suffix(def)));
+    names.sort();
+    // Built-ins first for a stable, scannable listing.
+    names.sort_by_key(|name| match name.as_str() {
+        "quality" => 0,
+        "security" => 1,
+        _ => 2,
+    });
+    for name in &names {
+        match declared.get(name) {
+            Some(def) => {
+                let source = def
+                    .get("source")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("models.yaml");
+                out.push_str(&format!(
+                    "  - {name} ({source}{})\n",
+                    review_mode_suffix(def)
+                ));
+            }
+            None => out.push_str(&format!("  - {name} (built-in)\n")),
+        }
     }
 }
 
@@ -86,10 +100,10 @@ fn push_review_modes(out: &mut String, val: &serde_json::Value) {
 /// one is set.
 fn review_mode_suffix(def: &serde_json::Value) -> String {
     let mut suffix = String::new();
-    if let Some(model) = def.get("model").and_then(|v| v.as_str())
+    if let Some(model) = def.get("default_model").and_then(|v| v.as_str())
         && !model.trim().is_empty()
     {
-        suffix.push_str(&format!(" (model: {model})"));
+        suffix.push_str(&format!(", default model: {model}"));
     }
     suffix
 }
@@ -299,7 +313,7 @@ mod tests {
     #[test]
     fn test_format_manifest_lists_review_modes_with_defaults() {
         let out = format_manifest(&v(r#"{"default_model":"z","models":{"a":{"id":"a-model"}},
-                 "review_modes":{"perf":{"checklist":"Check.","model":"nerd"},"style":{"checklist":"Names."}}}"#));
+                 "review_modes":{"quality":{"checklist":"Built-in.","source":"built-in"},"security":{"checklist":"Built-in.","source":"built-in"},"perf":{"checklist":"Check.","default_model":"nerd","source":"models.yaml"},"style":{"checklist":"Names.","source":"models.yaml"}}}"#));
         assert!(out.contains("Review modes:"), "modes are listed: {out}");
         assert!(
             out.contains("- quality (built-in)"),
@@ -310,7 +324,7 @@ mod tests {
             "built-ins are listed: {out}"
         );
         assert!(
-            out.contains("- perf (model: nerd)"),
+            out.contains("- perf (models.yaml, default model: nerd)"),
             "default model is shown: {out}"
         );
         assert!(

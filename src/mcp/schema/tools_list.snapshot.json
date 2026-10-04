@@ -124,7 +124,7 @@
             "type": "string"
           },
           "review_after": {
-            "description": "Reviewer `<model>:<mode>`; see `manifest`.",
+            "description": "`<mode>`/`<model>:<mode>`; manifest.",
             "type": "string"
           },
           "role": {

@@ -26,7 +26,7 @@ fn single(definition: ModelDefinition) -> ModelManifest {
     models.insert("solo".to_string(), definition);
     ModelManifest {
         default: Some("solo".to_string()),
-        strongest: None,
+        strongest_ignored: false,
         sensitive_paths: Vec::new(),
         review_modes: std::collections::HashMap::new(),
         models,
@@ -104,7 +104,7 @@ fn test_resolve_model() {
     );
     let sparse = ModelManifest {
         default: None,
-        strongest: None,
+        strongest_ignored: false,
         sensitive_paths: Vec::new(),
         review_modes: std::collections::HashMap::new(),
         models,
@@ -158,7 +158,7 @@ fn test_tool_description_role_fallback() {
     );
     let manifest = ModelManifest {
         default: None,
-        strongest: None,
+        strongest_ignored: false,
         sensitive_paths: Vec::new(),
         review_modes: std::collections::HashMap::new(),
         models,
@@ -257,7 +257,7 @@ fn test_normalize_repairs_every_fixable_warning() {
     );
     let manifest = ModelManifest {
         default: Some("ghost".to_string()),
-        strongest: None,
+        strongest_ignored: false,
         sensitive_paths: Vec::new(),
         review_modes: std::collections::HashMap::new(),
         models,
@@ -337,7 +337,7 @@ fn test_normalize_drops_a_padded_default_that_names_nothing() {
     );
     let manifest = ModelManifest {
         default: Some("  ghost  ".to_string()),
-        strongest: None,
+        strongest_ignored: false,
         sensitive_paths: Vec::new(),
         review_modes: std::collections::HashMap::new(),
         models,
@@ -368,7 +368,7 @@ fn test_validate_order_is_stable_regardless_of_insertion_order() {
         }
         ModelManifest {
             default: None,
-            strongest: None,
+            strongest_ignored: false,
             sensitive_paths: Vec::new(),
             review_modes: std::collections::HashMap::new(),
             models,
@@ -422,7 +422,7 @@ fn test_resolve_model_duplicate_id_uses_first_alias_in_sorted_order() {
     );
     let manifest = ModelManifest {
         default: None,
-        strongest: None,
+        strongest_ignored: false,
         sensitive_paths: Vec::new(),
         review_modes: std::collections::HashMap::new(),
         models,
@@ -461,7 +461,7 @@ fn test_validate_flags_duplicate_model_ids() {
     }
     let manifest = ModelManifest {
         default: None,
-        strongest: None,
+        strongest_ignored: false,
         sensitive_paths: Vec::new(),
         review_modes: std::collections::HashMap::new(),
         models,
@@ -494,7 +494,7 @@ fn test_tool_description_lists_aliases_in_sorted_order() {
     }
     let manifest = ModelManifest {
         default: None,
-        strongest: None,
+        strongest_ignored: false,
         sensitive_paths: Vec::new(),
         review_modes: std::collections::HashMap::new(),
         models,
@@ -821,7 +821,7 @@ fn test_every_declared_network_policy_value_is_accepted_verbatim() {
     };
     let manifest = ModelManifest {
         default: None,
-        strongest: None,
+        strongest_ignored: false,
         sensitive_paths: Vec::new(),
         review_modes: std::collections::HashMap::new(),
         models: [
@@ -1088,7 +1088,7 @@ fn test_instructions_reach_the_prompt_of_their_own_model_only() {
     );
     let manifest = ModelManifest {
         default: Some("small".to_string()),
-        strongest: None,
+        strongest_ignored: false,
         sensitive_paths: Vec::new(),
         models,
         review_modes: std::collections::HashMap::new(),
@@ -1154,5 +1154,53 @@ fn test_truncating_an_instructions_block_is_idempotent_and_marked() {
         twice.validate().is_empty(),
         "a repaired manifest must stop warning: {:?}",
         twice.validate()
+    );
+}
+/// A built-in mode overridden under a different case is still listed under its
+/// canonical name.
+///
+/// Every lookup of `quality`/`security` is case insensitive, so a `Security:`
+/// entry overrides the built-in wherever it is read. The listing that feeds the
+/// MCP `manifest` action and `mini-swe-mcp manifest` keys the entry by the name
+/// the catalog happened to spell, which removes `security` from the manifest
+/// view entirely and offers a name no documented `--review-after` spelling
+/// carries: an orchestrator reads the listing, cannot find `security`, and so
+/// never triggers the adversarial review it is told is available.
+#[test]
+fn a_case_variant_builtin_override_is_listed_under_its_canonical_name() {
+    let manifest: ModelManifest = serde_yaml::from_str(
+        "models:\n  nerd:\n    id: combo:nerd\nreview_modes:\n  Security:\n    default_model: nerd\n",
+    )
+    .expect("catalog with a case-variant security override");
+    let listed: Vec<String> = manifest
+        .effective_review_modes()
+        .into_iter()
+        .map(|(name, _, _)| name)
+        .collect();
+
+    assert!(
+        listed.contains(&"security".to_string()),
+        "the built-in security mode must stay in the listing under its canonical name: {listed:?}"
+    );
+    assert!(
+        !listed.contains(&"Security".to_string()),
+        "the catalog's spelling must not become a second, separately-named mode: {listed:?}"
+    );
+
+    // The entry still carries the override the catalog declared, so the
+    // listing keeps naming the reviewer the automatic trigger will use.
+    let entry = manifest
+        .effective_review_modes()
+        .into_iter()
+        .find(|(name, _, _)| name == "security")
+        .expect("security is listed");
+    assert_eq!(
+        entry.1.default_model.as_deref(),
+        Some("nerd"),
+        "the override's default_model must reach the listing: {entry:?}"
+    );
+    assert_eq!(
+        entry.2, "models.yaml",
+        "an override is a models.yaml entry, not a bare built-in: {entry:?}"
     );
 }
