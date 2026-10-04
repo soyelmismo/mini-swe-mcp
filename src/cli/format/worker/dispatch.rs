@@ -120,6 +120,7 @@ pub(super) fn format_batch_dispatch(
 ///
 /// Keeping the two apart here, in a pure formatter, is what lets the binary
 /// keep stdout a clean id list for a script while the failure stays visible.
+#[derive(Debug)]
 pub struct QuietDispatch {
     /// The `worker_id` of every entry that started, in payload order.
     pub worker_ids: Vec<String>,
@@ -153,18 +154,17 @@ pub fn format_dispatch_quiet(val: &serde_json::Value) -> QuietDispatch {
             }
         }
         // For batch dispatch with consolidation, the watch command uses --group --all
-        if is_consolidated && !worker_ids.is_empty() {
-            if let Some(group) = val.get("group").and_then(|v| v.as_str()) {
-                watch_command = format!("mini-swe-mcp watch --group {} --all", group);
-            }
+        if is_consolidated
+            && !worker_ids.is_empty()
+            && let Some(group) = val.get("group").and_then(|v| v.as_str())
+        {
+            watch_command = format!("mini-swe-mcp watch --group {} --all", group);
         }
     } else if let Some(wid) = val.get("worker_id").and_then(|v| v.as_str()) {
         worker_ids.push(wid.to_string());
         // For single dispatch with consolidation
-        if is_consolidated {
-            if let Some(group) = val.get("group").and_then(|v| v.as_str()) {
-                watch_command = format!("mini-swe-mcp watch --group {} --all", group);
-            }
+        if is_consolidated && let Some(group) = val.get("group").and_then(|v| v.as_str()) {
+            watch_command = format!("mini-swe-mcp watch --group {} --all", group);
         } else {
             // Use the watch_command from the payload, or build MINI_SWE_WATCH_TOKEN form
             if let Some(wc) = val.get("watch_command").and_then(|v| v.as_str()) {
@@ -178,13 +178,17 @@ pub fn format_dispatch_quiet(val: &serde_json::Value) -> QuietDispatch {
     }
 
     // Fallback: if no workers but payload has watch_command, carry it through
-    if watch_command.is_empty() {
-        if let Some(wc) = val.get("watch_command").and_then(|v| v.as_str()) {
-            watch_command = wc.to_string();
-        }
+    if watch_command.is_empty()
+        && let Some(wc) = val.get("watch_command").and_then(|v| v.as_str())
+    {
+        watch_command = wc.to_string();
     }
 
-    QuietDispatch { worker_ids, errors, watch_command }
+    QuietDispatch {
+        worker_ids,
+        errors,
+        watch_command,
+    }
 }
 
 #[cfg(test)]
@@ -215,7 +219,11 @@ mod tests {
         assert_eq!(single.worker_ids, vec!["w1"]);
         assert!(single.errors.is_empty(), "{:?}", single.errors);
         // No group means no special watch command; the reminder is absent.
-        assert!(single.watch_command.is_empty(), "{:?}", single.watch_command);
+        assert!(
+            single.watch_command.is_empty(),
+            "{:?}",
+            single.watch_command
+        );
 
         let batch = format_dispatch_quiet(&v(
             r#"{"workers":[{"index":0,"worker_id":"w1"},{"index":1,"error":"'task' is required"},{"index":2,"worker_id":"w2"}]}"#,
