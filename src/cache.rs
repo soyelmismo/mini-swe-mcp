@@ -694,6 +694,7 @@ fn sweep_targets(base: &Path, ttl: std::time::Duration, max_bytes: u64) -> std::
     let now = std::time::SystemTime::now();
     for path in target_evictions(&entries, now, ttl, max_bytes) {
         if let Err(error) = std::fs::remove_dir_all(&path) {
+            let _ = std::fs::write("/var/tmp/swe-wt-e4d84396/sweeperr.txt", format!("EVICT-ERR {path:?}: {error}\n"));
             // The lock file lives inside the directory, so the global lock keeps
             // acquisitions out until the whole name is gone.
             tracing::warn!(%error, path = %path.display(), "Failed to evict idle build target");
@@ -904,13 +905,29 @@ mod tests {
         drop(lease);
         sweep_targets(&base, std::time::Duration::ZERO, 0).unwrap();
         if target.exists() {
+            let mut diag = String::new();
+            let mut entries = Vec::new();
             for e in std::fs::read_dir(&base).unwrap().flatten() {
                 let p = e.path();
                 let lf = lock_file(&build_dir_lock_path(&p));
-                let got = lf.as_ref().map(|f| flock(f, true, true).is_ok());
-                eprintln!("DIAG entry={p:?} lock={lf:?} flock_ok={got:?}");
+                let ok = lf.as_ref().map(|f| flock(f, true, true).is_ok());
+                let idle = ok.unwrap_or(false);
+                let lu = lf.as_ref().and_then(|f| f.metadata().ok()).and_then(|m| m.modified().ok());
+                let size = target_size(&p);
+                diag.push_str(&format!("DIAG entry={p:?} flock_ok={ok:?} idle={idle} last_used={lu:?} size={size:?}\n"));
+                if let (Some(lu), Ok(size)) = (lu, size) {
+                    entries.push(TargetEntry { dir: p, last_used: lu, size, idle });
+                }
             }
-            eprintln!("DIAG still exists: {:?}\n contents: {:?}", target, std::fs::read_dir(&target).map(|d| d.flatten().map(|x| x.path().to_string_lossy().into_owned()).collect::<Vec<_>>()));
+            let now = std::time::SystemTime::now();
+            for e in &entries {
+                let since = now.duration_since(e.last_used).unwrap_or_default();
+                diag.push_str(&format!("DIAG repo={:?} idle={} since={since:?} >=ZERO={} active={}\n",
+                    build_dir_repo(&e.dir), e.idle, since >= std::time::Duration::ZERO,
+                    entries.iter().any(|o| build_dir_repo(&o.dir) == build_dir_repo(&e.dir) && !o.idle)));
+            }
+            diag.push_str(&format!("DIAG evictions={:?}\n", target_evictions(&entries, now, std::time::Duration::ZERO, 0)));
+            let _ = std::fs::write("/var/tmp/swe-wt-e4d84396/diag.txt", diag);
         }
         assert!(
             !target.exists(),
