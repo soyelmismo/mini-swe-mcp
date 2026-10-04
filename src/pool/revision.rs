@@ -1504,7 +1504,7 @@ impl super::WorkerPool {
     /// (the [`REVISION_PREFIX`] path after a completed review, the
     /// [`CONTINUE_PREFIX`] path after anything else). Without one -- a legacy
     /// worker, or one whose log was lost -- it is continued cold: the same id
-    /// and the branch, a fresh conversation that names the work the branch already
+    /// and branch, a fresh conversation that names the work the branch already
     /// holds. Only a missing branch is an error.
     ///
     /// `revision_turns` is the fresh budget of a revision (`None` takes

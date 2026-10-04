@@ -877,13 +877,13 @@ mod tests {
             let lease = BuildDirLease::acquire(base).unwrap();
             let target = lease.dir().to_path_buf();
             std::fs::write(target.join("artifact"), b"build").unwrap();
-            sweep_targets(&base, std::time::Duration::ZERO, 0).unwrap();
+            sweep_targets(base, std::time::Duration::ZERO, 0).unwrap();
             assert!(
                 target.join("artifact").exists(),
                 "A leased dir must never be swept"
             );
             drop(lease);
-            sweep_targets(&base, std::time::Duration::ZERO, 0).unwrap();
+            sweep_targets(base, std::time::Duration::ZERO, 0).unwrap();
             assert!(
                 !target.exists(),
                 "A released dir must be swept once it is idle"
