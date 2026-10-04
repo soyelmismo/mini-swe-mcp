@@ -1107,8 +1107,7 @@ pub fn rotated_log_path(path: &Path) -> PathBuf {
 /// then redirect a stderr the caller never pointed at the log -- and silently,
 /// because the descriptor is the process's own output.
 fn is_same_file(fd_dev: u64, fd_ino: u64, path_dev: u64, path_ino: u64) -> bool {
-    let _ = path_dev;
-    fd_ino == path_ino
+    fd_dev == path_dev && fd_ino == path_ino
 }
 
 /// Point this process's stderr at `fresh` when it is the file `rotated` names.
