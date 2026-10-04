@@ -683,7 +683,7 @@ impl WorkerPool {
     ///
     /// A revision resumes on the model of the run it continues, so the value
     /// is only read when a *new* run picks an automatic reviewer: without a
-    /// `strongest:` tier in the manifest that fallback is the dispatch
+    /// `default_model` on the security mode that fallback is the dispatch
     /// default, never the implementer's own model.
     pub fn default_model(&self) -> String {
         self.manifest
