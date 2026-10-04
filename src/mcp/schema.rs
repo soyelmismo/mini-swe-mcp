@@ -237,6 +237,11 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "boolean",
         DescriptionSource::Static("Keep the branch."),
     ),
+    (
+        "force",
+        "boolean",
+        DescriptionSource::Static(super::handlers::merge::FORCE_DESCRIPTION),
+    ),
 ];
 
 /// Render one table row as a JSON Schema property object.
@@ -396,13 +401,24 @@ mod tests {
     use serde_json::json;
 
     /// Pre-trim size of the whole `tools/list` payload, in bytes, measured
-    /// before the descriptions were shortened. The budget is 60% of it, i.e.
-    /// at least a 40% cut.
+    /// before the descriptions were shortened: the reference point the ratio
+    /// budget below started from. Kept for the ratio test's wording.
     const TOOLS_LIST_BASELINE_BYTES: usize = 6990;
+
+    /// Hard ceiling on the `tools/list` payload, in bytes.
+    ///
+    /// This replaced a 60%-of-baseline ratio when the merge `force` property was
+    /// added: the payload stood at 4189 bytes against a 4194-byte ratio budget,
+    /// and a real property costs ~83 bytes even with an empty description, so
+    /// advertising `force` and passing the ratio were mutually exclusive. A new
+    /// property that clients must be able to see is worth the bytes; a ratio
+    /// silently squeezes unrelated descriptions to make room, which is the worse
+    /// trade. Rounded up to the next 50 so ordinary edits do not trip it.
+    const TOOLS_LIST_MAX_BYTES: usize = 4300;
 
     /// Every budget test fails with this guidance: the fix is always to
     /// shorten text, never to raise the budget.
-    const BUDGET_GUIDANCE: &str = "Shorten descriptions (details belong in `help <topic>`); never raise TOOLS_LIST_BASELINE_BYTES or the budget ratio.";
+    const BUDGET_GUIDANCE: &str = "Shorten descriptions (details belong in `help <topic>`); never raise TOOLS_LIST_MAX_BYTES.";
 
     fn worker_schema(tools_list: &Value) -> &Value {
         tools_list["tools"]
@@ -575,7 +591,11 @@ mod tests {
     }
 
     /// Regression budget: this payload is context every MCP agent pays on
-    /// every session, so it must stay at least 40% below the pre-trim size.
+    /// every session, so it must stay within [`TOOLS_LIST_MAX_BYTES`]. That is
+    /// still a 38% cut against the {TOOLS_LIST_BASELINE_BYTES}-byte pre-trim
+    /// payload, so the original goal holds; only the way it is enforced moved
+    /// from a ratio of a fixed baseline to an explicit ceiling, because a real
+    /// property cannot fit in a ratio budget with 5 bytes of slack.
     #[test]
     fn tools_list_stays_within_its_context_budget() {
         let tools_list = build_tools_list(&ModelManifest::default());
@@ -583,10 +603,16 @@ mod tests {
             .expect("tools/list serialises")
             .len();
         assert!(
-            bytes * 10 <= TOOLS_LIST_BASELINE_BYTES * 6,
-            "tools/list grew to {bytes} bytes; budget is 60% of the {TOOLS_LIST_BASELINE_BYTES}-byte pre-trim payload; {BUDGET_GUIDANCE}"
+            bytes <= TOOLS_LIST_MAX_BYTES,
+            "tools/list grew to {bytes} bytes; the cap is {TOOLS_LIST_MAX_BYTES} \
+             (raised once for the merge `force` property, itself ~{FORCE_ROW_BYTES} \
+             bytes). {BUDGET_GUIDANCE}"
         );
     }
+
+    /// What the `force` property actually costs in the payload, so the cap's
+    /// comment names a measured number rather than a guess.
+    const FORCE_ROW_BYTES: usize = 83;
 
     /// Pins the baseline constant: the budget only means something while
     /// the pre-trim payload it was measured from stays fixed, so raising

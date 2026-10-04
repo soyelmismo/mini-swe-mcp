@@ -1,5 +1,17 @@
 use super::*;
 
+/// Description of the `merge` `force` property, beside the handler that reads
+/// it.
+///
+/// The override is deliberately narrow, so it is spelled out rather than left to
+/// a one-liner: `force` skips *only* the round-provenance check, and says
+/// nothing about the gate, the clean-tree requirement or the branch-conflict
+/// refusal. It also does not throw the unintegrated work away -- those workers
+/// are left unretired, with their branches and conversations intact -- so
+/// overriding is recoverable rather than destructive.
+pub(in crate::mcp) const FORCE_DESCRIPTION: &str =
+    "Skip only the round check; unintegrated workers stay unretired.";
+
 impl McpServer {
     /// `merge` action: land one finished worker's branch on its base branch.
     ///
@@ -7,6 +19,11 @@ impl McpServer {
     /// trial merge, dirty check, gate, real merge, cleanup -- is one blocking
     /// unit in [`crate::pool::merge`], so it runs off the runtime thread and
     /// answers with a single payload the CLI renders as one line.
+    ///
+    /// A consolidator is held to the round it was dispatched for, not just to
+    /// the branches it happened to merge: every member that is not missing and
+    /// not already integrated -- by history or by content -- refuses the merge
+    /// by name, `force` aside. See [`crate::cli::help`] `merge`.
     pub(super) async fn handle_merge(
         &self,
         args: &Value,
@@ -30,6 +47,11 @@ impl McpServer {
             .get("keep_branch")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        // `force`: land a round that does not match its record -- a member
+        // left out, or one merged and then revised on. The refusal names each
+        // one with its unintegrated commit count; the forced merge lands them
+        // unretired, so nothing is lost by overriding.
+        let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
         let root = self.pool.scratch_root().clone();
         let admission = self.pool.admission();
         // The retirement the merge performs appends the worker's final REPORT
@@ -44,6 +66,7 @@ impl McpServer {
                     worker_id: &worker_id,
                     verified,
                     keep_branch,
+                    force,
                     admission: Some(admission),
                     archive_dir,
                 },

@@ -13,5 +13,8 @@ pub(super) fn build(cli_args: &[String], tool_args: &mut Map<String, Value>) -> 
         target::worker_id(cli_args, tool_args);
     }
     target::keep_branch(cli_args, tool_args);
+    if flag_index(cli_args, &["--force"]).is_some() {
+        tool_args.insert("force".into(), Value::Bool(true));
+    }
     Ok(())
 }

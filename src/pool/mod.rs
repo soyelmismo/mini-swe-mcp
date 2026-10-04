@@ -60,7 +60,8 @@ pub use self::buffer::{
 pub use self::clock::unix_timestamp;
 pub use self::merge::{
     MergeApprovedReport, MergeApprovedRequest, MergeReport, MergeRequest, MergedWorker,
-    SkippedWorker, merge_approved, merge_approved_in, merge_worker, merge_worker_in,
+    SkippedWorker, UnintegratedWorker, merge_approved, merge_approved_in, merge_worker,
+    merge_worker_in, unintegrated_workers_in,
 };
 pub(crate) use self::registry::recover_orphaned_workers_in;
 pub use self::registry::{
@@ -1025,6 +1026,29 @@ impl WorkerPool {
                 self.scratch.join(format!("swe-wt-{worker_id}.round-base")),
                 base.stdout,
             )?;
+            // The membership of the round this consolidator is being dispatched
+            // for, captured now and read at merge time. Reconstructing it later
+            // from the registry cannot work: rows are retired as rounds land,
+            // so by merge time the same owner and group name an unrelated set
+            // (a worker of the next round, or one absorbed by an earlier
+            // consolidator), and the check would hold the round back for a
+            // member it never had -- or wave through one it did. Ready and
+            // not-ready alike: a member the consolidator leaves out is exactly
+            // the one this record has to name.
+            if let Some(group) = meta.group.clone() {
+                let manifest = self.round_manifest(&meta.owner, &group, &repo_path).await;
+                let members: Vec<String> = manifest
+                    .ready
+                    .iter()
+                    .chain(manifest.not_ready.iter())
+                    .map(|worker| worker.id.clone())
+                    .collect();
+                std::fs::write(
+                    self.scratch
+                        .join(format!("swe-wt-{worker_id}.round-members")),
+                    members.join("\n"),
+                )?;
+            }
         }
         self.save_status(
             &meta,

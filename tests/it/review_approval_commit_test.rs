@@ -168,3 +168,53 @@ async fn a_tree_changed_after_the_snapshot_keeps_the_pre_commit_head() {
         .await
     );
 }
+
+/// The harness's own commit is only the reviewed tree while the tree is still
+/// uncommitted: the reviewer's edit sits in the worktree, the security review
+/// completes, and nothing touches it afterwards. The approval must then name
+/// that commit, so the audited code is never re-audited on the next revision.
+#[tokio::test]
+async fn a_reviewed_uncommitted_tree_approves_the_harness_commit() {
+    let repo = common::TestRepo::new("approval-dirty-unchanged");
+    common::git(repo.path(), &["checkout", "-q", "-b", "worker-dirty"]);
+    std::fs::write(repo.path().join("before.rs"), "// before\n").unwrap();
+    common::git(repo.path(), &["add", "-A"]);
+    common::git(repo.path(), &["commit", "-q", "-m", "before"]);
+    let pre_commit_head = common::git(repo.path(), &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
+
+    // What a security reviewer leaves behind: an edit in the working tree, with
+    // no commit of its own -- exactly what the implementer's uncommitted work
+    // looks like too.
+    std::fs::write(repo.path().join("reviewed.rs"), "// reviewed\n").unwrap();
+    let snapshot = __test_snapshot_worktree_tree(repo.path())
+        .await
+        .expect("the reviewer's tree is snapshot-able");
+    let status = common::git(repo.path(), &["status", "--porcelain"]);
+    assert!(
+        status.contains("reviewed.rs"),
+        "the reviewed edit must still be uncommitted for this test to mean anything"
+    );
+
+    // The harness commits the tree it reviewed; nothing moved it in between.
+    common::git(repo.path(), &["add", "-A"]);
+    common::git(repo.path(), &["commit", "-q", "-m", "harness commit"]);
+    let harness_commit = common::git(repo.path(), &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
+
+    assert!(
+        __test_commit_matches_snapshot(
+            repo.path(),
+            &Some(snapshot),
+            &Some(harness_commit.clone()),
+        )
+        .await,
+        "the harness's commit is the reviewed tree when nothing moved it"
+    );
+    assert_ne!(
+        harness_commit, pre_commit_head,
+        "the harness's commit is not the HEAD the reviewer started from"
+    );
+}

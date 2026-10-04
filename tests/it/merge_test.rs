@@ -120,6 +120,7 @@ impl Fixture {
                 worker_id: id,
                 verified,
                 keep_branch,
+                force: false,
                 admission: None,
                 archive_dir: None,
             },

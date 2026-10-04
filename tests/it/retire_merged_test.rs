@@ -212,6 +212,7 @@ impl Fixture {
                 worker_id: id,
                 verified: Some(true),
                 keep_branch: true,
+                force: false,
                 admission: None,
                 archive_dir: None,
             },
@@ -231,6 +232,23 @@ impl Fixture {
                 // its own gate runs exactly like any other merge's.
                 verified: Some(true),
                 keep_branch: false,
+                force: false,
+                admission: None,
+                archive_dir: None,
+            },
+        )
+        .map(|_| ())
+    }
+
+    /// `merge <id> --force`: the same merge with the round check overridden.
+    fn force_merge(&self, id: &str) -> anyhow::Result<()> {
+        merge_worker_in(
+            &self.root(),
+            &MergeRequest {
+                worker_id: id,
+                verified: Some(true),
+                keep_branch: false,
+                force: true,
                 admission: None,
                 archive_dir: None,
             },
@@ -247,6 +265,7 @@ impl Fixture {
                 worker_id: id,
                 verified: Some(true),
                 keep_branch: false,
+                force: false,
                 admission: None,
                 archive_dir: None,
             },
@@ -736,11 +755,15 @@ fn the_sweep_retires_merged_workers_and_orphan_histories_only() {
     );
 }
 
-/// A worker revised *after* the consolidator integrated its earlier tip keeps
-/// its branch: its history file records the old tip as integrated, but the
-/// branch now carries commits the base does not have, and deleting it would
-/// destroy that work. The other member of the same round is still provably
-/// integrated and is retired.
+/// A worker revised *after* the consolidator integrated its earlier tip holds
+/// the round back: the merge refuses, naming it and its unintegrated commit
+/// count, because the branch now carries commits the base does not have and
+/// landing the round would ship master without them.
+///
+/// Forced, the round lands and the re-revised member keeps its branch and row
+/// anyway -- its history file records the old tip as integrated, but deleting
+/// the branch would destroy work that is nowhere else -- while the other member
+/// of the same round is still provably integrated and is retired.
 #[test]
 fn a_worker_revised_after_its_tip_was_integrated_is_not_retired() {
     let f = Fixture::new("retire-revised");
@@ -785,8 +808,30 @@ fn a_worker_revised_after_its_tip_was_integrated_is_not_retired() {
     git(f.repo(), &["commit", "-m", "revision after integration"]);
     git(f.repo(), &["checkout", "-q", "main"]);
 
-    f.merge("rcons")
-        .expect("the consolidator merge must succeed");
+    // The refusal comes first, and it is the whole point of the check: a round
+    // that does not match what the consolidator integrated must not land by
+    // accident, naming the member that moved on.
+    let refusal = f
+        .merge("rcons")
+        .expect_err("a round with an unintegrated member must be refused");
+    let refusal = format!("{refusal:#}");
+    assert!(
+        refusal.contains("r-new") && refusal.contains("1 unintegrated commit"),
+        "the refusal must name the re-revised member and count its commits: {refusal}"
+    );
+    // The refused merge wrote nothing: the consolidator is still where the
+    // fixture left it, and neither round member has moved.
+    assert!(
+        !f.repo().join("rcons.txt").exists(),
+        "a refused merge must not land the consolidator's branch"
+    );
+    assert!(
+        f.row_exists("r-ok") && f.row_exists("r-new"),
+        "a refused merge must retire nobody"
+    );
+
+    f.force_merge("rcons")
+        .expect("the forced consolidator merge must succeed");
 
     assert!(
         !f.row_exists("r-ok"),

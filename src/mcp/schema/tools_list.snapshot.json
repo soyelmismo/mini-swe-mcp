@@ -65,6 +65,10 @@
             },
             "type": "array"
           },
+          "force": {
+            "description": "Skip only the round check; unintegrated workers stay unretired.",
+            "type": "boolean"
+          },
           "full": {
             "description": "The whole diff for 'collect'.",
             "type": "boolean"
@@ -83,6 +87,10 @@
           "keep_branch": {
             "description": "Keep the branch.",
             "type": "boolean"
+          },
+          "last": {
+            "description": "Only the N most recent.",
+            "type": "integer"
           },
           "max_turns": {
             "description": "Max bash turns; on 'steer', a stopped worker's budget.",
@@ -211,10 +219,6 @@
               "type": "string"
             },
             "type": "array"
-          },
-          "last": {
-            "description": "Only the N most recent.",
-            "type": "integer"
           }
         },
         "required": [
