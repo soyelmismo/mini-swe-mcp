@@ -2003,63 +2003,56 @@ mod tests {
     }
 
     /// Every row of a frame starts its op at the same column, at 40, 60, 80 and
-    /// 120: the visible columns and their widths are decided once for the whole
-    /// frame, so a table of ragged rows (one worker keeping a column its
-    /// neighbour dropped) cannot happen.
+    /// 120: the visible columns and their widths are chosen once for the whole
+    /// frame, so a table where one row keeps a column its neighbour dropped
+    /// (a ragged table) cannot happen.
     #[test]
     fn test_every_row_of_a_frame_aligns_its_op_column() {
-        // Deliberately mixed rows: wide and narrow `step/max`, a long and a
-        // short id, so a per-row decision would disagree with its neighbour.
+        // Deliberately mixed rows: a wide and a narrow `step/max` value and
+        // different op lengths, so a per-row column decision disagrees with
+        // its neighbour and the table comes out ragged.
         let entries = vec![
             Row::new("a1b2c3d4")
                 .status(RegistryStatus::Running)
                 .turns(15, 250)
                 .command("Consolidate the round in group round57")
-                .task("Consolidate the round in group round57")
                 .group("round57")
                 .build(),
             Row::new("bb1a5885")
                 .status(RegistryStatus::Completed)
                 .turns(71, 150)
                 .command("Polish the monitor columns")
-                .task("Polish the monitor columns")
                 .group("round57")
                 .build(),
             Row::new("c0ffee00")
                 .status(RegistryStatus::Failed)
                 .turns(9, 9)
                 .command("cargo test --lib monitor")
-                .task("Test the monitor")
                 .group("round57")
                 .build(),
         ];
+        // The first 10 characters of every op survive truncation at 40 columns
+        // (the op keeps at least MIN_OP_WIDTH = 24), so they locate the op.
+        let ops: Vec<&str> = entries
+            .iter()
+            .map(|e| {
+                let op = e.last_command.as_str();
+                &op[..10]
+            })
+            .collect();
         for width in [40usize, 60, 80, 120] {
             let text = render_dashboard_with_width(&entries, 1060, false, width);
-            let mut op_columns = Vec::new();
-            for line in text.lines() {
-                let Some(rest) = line.split_once(status_glyph(RegistryStatus::Failed)) else {
-                    continue;
-                };
-                if !line.contains("a1b2c3d4") && !line.contains("bb1a5885") && !line.contains("c0ffee00")
-                {
-                    continue;
-                }
-                let _ = rest;
-                // The op is everything after the id, padded to its column width.
-                for id in ["a1b2c3d4", "bb1a5885", "c0ffee00"] {
-                    if let Some(pos) = line.find(id) {
-                        op_columns.push(pos + ID_WIDTH);
-                    }
-                }
-            }
-            assert_eq!(
-                op_columns.len(),
-                entries.len(),
-                "a worker row went missing at {width}:\n{text}"
-            );
+            let columns: Vec<usize> = ops
+                .iter()
+                .map(|op| {
+                    text.lines()
+                        .find_map(|line| line.find(op))
+                        .unwrap_or_else(|| panic!("no row showing {op:?} at {width}:\n{text}"))
+                })
+                .collect();
             assert!(
-                op_columns.windows(2).all(|w| w[0] == w[1]),
-                "rows disagree on the op column at {width}: {op_columns:?}\n{text}"
+                columns.windows(2).all(|w| w[0] == w[1]),
+                "rows disagree on the op column at {width}: {columns:?}\n{text}"
             );
         }
     }
