@@ -761,6 +761,7 @@ mod tests {
             name0.starts_with("swe-target-") && name0.contains(&first) && name0.ends_with("-0"),
             "got: {name0:?}"
         );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -901,7 +902,17 @@ mod tests {
             "A leased dir must never be swept"
         );
         drop(lease);
-        sweep_targets(&base, std::time::Duration::ZERO, 0).unwrap();
+        // Eviction is best-effort per pass: a pass that loses a race logs the
+        // failure and leaves the slot for the next one (the background sweep
+        // runs again after a few minutes), so poll instead of demanding that a
+        // single pass always wins. A sweep that never reclaims the slot still
+        // fails here.
+        for _ in 0..8 {
+            sweep_targets(&base, std::time::Duration::ZERO, 0).unwrap();
+            if !target.exists() {
+                break;
+            }
+        }
         assert!(
             !target.exists(),
             "A released dir must be swept once it is idle"

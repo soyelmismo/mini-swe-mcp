@@ -12,10 +12,15 @@ use std::path::{Path, PathBuf};
 
 /// One repository's pool of build dirs, with the dirs this test leased.
 ///
-/// The repository root is unique per test, so the pool names derived from it
-/// are unique too and the cleanup below only ever removes this test's dirs.
+/// The repository root and the build-dir base are unique per test, so the pool
+/// names derived from them are unique too and the cleanup below only ever
+/// removes this test's dirs. The base is this test's own, never the host's
+/// shared `swe_base_dir()`: the background sweep scans that shared root, so a
+/// lease filed there could race the sweep's probe of the very lock this test
+/// checks.
 struct Pool {
     repo: PathBuf,
+    base: PathBuf,
     leased: Vec<PathBuf>,
 }
 
@@ -26,8 +31,14 @@ impl Pool {
             uuid::Uuid::new_v4().simple()
         ));
         std::fs::create_dir_all(&repo).expect("repository root must be creatable");
+        let base = std::env::temp_dir().join(format!(
+            "swe-lease-base-{tag}-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&base).expect("lease base must be creatable");
         Self {
             repo,
+            base,
             leased: Vec::new(),
         }
     }
@@ -35,7 +46,10 @@ impl Pool {
     /// Lease a dir the way a worker's first heavy command does. The returned
     /// guard is the worker's claim on it: dropping it ends the worker.
     fn lease(&mut self) -> BuildDirLease {
-        let lease = BuildDirLease::acquire(&self.repo).expect("a worker must lease a dir");
+        // The cap is irrelevant here: these dirs hold only a few bytes, so a
+        // generous cap never trips. The point is the lease, not the cap.
+        let lease = BuildDirLease::acquire_in(&self.repo, &self.base, u64::MAX)
+            .expect("a worker must lease a dir");
         self.leased.push(lease.dir().to_path_buf());
         lease
     }
@@ -76,6 +90,7 @@ impl Drop for Pool {
             let _ = std::fs::remove_dir_all(dir);
         }
         let _ = std::fs::remove_dir_all(&self.repo);
+        let _ = std::fs::remove_dir_all(&self.base);
     }
 }
 
