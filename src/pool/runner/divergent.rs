@@ -633,7 +633,7 @@ mod tests {
 
     #[test]
     fn the_divergent_environment_shifts_home_tmpdir_and_tz() {
-        let guard = crate::test_support::TestScratch::own(scratch("env"));
+        let guard = crate::test_support::TestScratch::new("divergent-env");
         let worktree = guard.path().to_path_buf();
         let env = divergent_environment(
             &worktree,
@@ -664,12 +664,14 @@ mod tests {
             Path::new(&home).starts_with(crate::worktree::scratch_dir(&worktree)),
             "the divergent HOME must stay inside the worker's private scratch, got {home:?}"
         );
-        let _ = std::fs::remove_dir_all(&worktree);
+        // `guard` reclaims the worktree and the `swe-tmp-<leaf>` scratch that
+        // `divergent_environment` derived from it, on the success path and on
+        // the failure path alike.
     }
 
     #[test]
     fn a_dispatcher_variable_cannot_override_the_deliberate_divergence() {
-        let guard = crate::test_support::TestScratch::own(scratch("override"));
+        let guard = crate::test_support::TestScratch::new("divergent-override");
         let worktree = guard.path().to_path_buf();
         let env = divergent_environment(
             &worktree,
@@ -687,7 +689,7 @@ mod tests {
             home, "/dispatchers/home",
             "the deliberate divergence must win over the dispatcher's own value"
         );
-        let _ = std::fs::remove_dir_all(&worktree);
+        // `guard` reclaims the worktree and its derived `swe-tmp-<leaf>` scratch.
     }
 
     #[test]
@@ -714,6 +716,77 @@ mod tests {
             enabled(),
             direct,
             "enabled() must read {DISABLE_ENV} from the process environment"
+        );
+    }
+    /// Variant B's `HOME`/`TMPDIR` are filed as `swe-tmp-<leaf>` under the scratch
+    /// base, keyed on the worktree's *leaf* name -- not inside the worktree. So
+    /// removing the worktree alone leaves the private scratch behind, and a test
+    /// that panics after building the environment leaves it in the operator's
+    /// scratch base once per run, for as long as nobody prunes it. Only a guard that
+    /// owns both removes on every path, which is what this pins: the failure this
+    /// test exists to catch is precisely the path a sequential cleanup skips.
+    #[test]
+    fn a_panicking_environment_test_leaves_no_private_scratch_behind() {
+        let guard = crate::test_support::TestScratch::new("hygiene-divergent-panic");
+        let worktree = guard.path().to_path_buf();
+        let base = crate::worktree::swe_base_dir();
+        let leaf = worktree
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("the scratch has a leaf name")
+            .to_string();
+
+        let unwound = crate::test_support::panics(|| {
+            // The production code under test, not a stand-in: the leak is in which
+            // directory *it* files the scratch, so only calling it proves the guard
+            // reclaims that directory.
+            let env = divergent_environment(&worktree, &[]);
+            let home = env
+                .iter()
+                .find(|(name, _)| name == "HOME")
+                .map(|(_, value)| PathBuf::from(value))
+                .expect("HOME is always set");
+            assert!(home.is_dir(), "precondition: the scratch was created");
+            panic!("the failing assertion this fixture exists to provoke");
+        });
+        assert!(unwound, "the fixture must unwind, or nothing was proven");
+
+        drop(guard);
+        assert_eq!(
+            crate::test_support::swe_entry_for(&base, &leaf),
+            None,
+            "{} outlived the test that derived it",
+            base.display()
+        );
+    }
+
+    /// The same reclamation on the ordinary end of a test body, which is the path
+    /// that runs most often and the one a regression would most easily keep.
+    #[test]
+    fn the_divergent_scratch_is_reclaimed_on_the_normal_path_too() {
+        let guard = crate::test_support::TestScratch::new("hygiene-divergent-ok");
+        let worktree = guard.path().to_path_buf();
+        let base = crate::worktree::swe_base_dir();
+        let leaf = worktree
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("the scratch has a leaf name")
+            .to_string();
+
+        let env = divergent_environment(&worktree, &[]);
+        let home = env
+            .iter()
+            .find(|(name, _)| name == "HOME")
+            .map(|(_, value)| PathBuf::from(value))
+            .expect("HOME is always set");
+        assert!(home.is_dir(), "precondition: the scratch was created");
+
+        drop(guard);
+        assert_eq!(
+            crate::test_support::swe_entry_for(&base, &leaf),
+            None,
+            "{} outlived the test that derived it",
+            base.display()
         );
     }
 }
