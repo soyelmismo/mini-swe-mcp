@@ -167,20 +167,55 @@ pub fn format_dispatch_quiet(val: &serde_json::Value) -> QuietDispatch {
 
 /// The watch command a `--quiet` dispatch reminder names.
 ///
-/// Same precedence as the human-facing [`format_dispatch`]: the hub's
-/// token-bound `watch_command` when it minted one, the round command for a
-/// consolidated dispatch, and the plain `mini-swe-mcp watch` otherwise -- which
-/// follows every worker the caller owns, so it is right even with no token and
-/// no group.
+/// A consolidated round is waited on as a round: its consolidator is dispatched
+/// separately, long after these workers stopped, so the plain per-caller watch
+/// would return on the first worker and leave the rest of the round unwatched.
+/// The round command therefore wins whenever the answer names a group and asks
+/// for consolidation, and the hub's token prefix rides along when the reply
+/// carried one -- a watch started as a different caller would follow someone
+/// else's workers and never see this round. A non-consolidated dispatch keeps
+/// today's command: the token-bound one when the hub minted it, the plain
+/// `mini-swe-mcp watch` otherwise, which follows every worker the caller owns.
 fn quiet_watch_command(val: &serde_json::Value) -> String {
-    if let Some(command) = val.get("watch_command").and_then(|v| v.as_str()) {
-        return command.to_string();
+    let group = val.get("group").and_then(|v| v.as_str());
+    if let Some(group) = group
+        && val
+            .get("consolidate")
+            .is_some_and(|value| !matches!(value, Value::Null))
+    {
+        let round = format!("mini-swe-mcp watch --group {} --all", shell_word(group));
+        return match watch_token(val) {
+            Some(token) => format!("{token} {round}"),
+            None => round,
+        };
     }
-    match val.get("group").and_then(|v| v.as_str()) {
-        Some(group) => {
-            format!("mini-swe-mcp watch --group {} --all", shell_word(group))
-        }
-        None => "mini-swe-mcp watch".to_string(),
+    match val.get("watch_command").and_then(|v| v.as_str()) {
+        Some(command) => command.to_string(),
+        None => match group {
+            Some(group) => {
+                format!("mini-swe-mcp watch --group {} --all", shell_word(group))
+            }
+            None => "mini-swe-mcp watch".to_string(),
+        },
+    }
+}
+
+/// The `NAME=value` prefix of the hub's token-bound `watch_command`, when the
+/// answer carried one.
+///
+/// Only the assignment is reused, never the command behind it: the token is
+/// what binds the watch to this caller, and the round arguments are the part
+/// that has to change.
+fn watch_token(val: &serde_json::Value) -> Option<&str> {
+    let command = val.get("watch_command").and_then(|v| v.as_str())?;
+    let (prefix, rest) = command.split_once(' ')?;
+    if !rest.trim().is_empty() {
+        return None;
+    }
+    let (name, token) = prefix.split_once('=')?;
+    match (name, token) {
+        ("MINI_SWE_WATCH_TOKEN", token) if !token.is_empty() => Some(prefix),
+        _ => None,
     }
 }
 
