@@ -442,8 +442,11 @@ impl SecurityScope {
                 merged,
                 branch,
                 commits,
+                base_tip,
                 ..
-            } if !merged.is_empty() && !commits.is_empty() => own_files(repo, branch, merged).await,
+            } if !merged.is_empty() && !commits.is_empty() => {
+                own_files(repo, branch, merged, base_tip.as_deref()).await
+            }
             Self::Since { base, branch, .. } => files_since(repo, base, branch).await,
         }
     }
@@ -625,6 +628,11 @@ fn is_object_id(value: &str) -> bool {
 /// * `merged` names the commits a consolidator's merged workers were each
 ///   security-approved at; a consolidator's scope excludes what those commits
 ///   already cover, and nothing else.
+/// * `base_branch` is the branch the work will be merged into, when the caller
+///   knows one: a consolidator that merged that branch's current state must not
+///   re-audit what the base already carried, so its tip is subtracted too. A
+///   worker needs no such exclusion -- its range `base..branch` never contains
+///   the base branch's own commits.
 /// * `role` decides the exclusion; a plain worker is never treated as a
 ///   consolidator even if it names branches.
 pub async fn scope_for(
@@ -634,16 +642,27 @@ pub async fn scope_for(
     base_commit: &str,
     approved: Option<String>,
     merged: &[String],
+    base_branch: Option<&str>,
 ) -> SecurityScope {
     match role {
-        WorkerRole::Consolidate => SecurityScope::Since {
-            base: base_commit.to_string(),
-            branch: branch.to_string(),
-            approved: Vec::new(),
-            commits: own_commits(repo, branch, merged).await,
-            merged: merged.to_vec(),
-            uncommitted: has_uncommitted_changes(repo).await,
-        },
+        WorkerRole::Consolidate => {
+            // The base branch is excluded exactly like a merged worker branch:
+            // as a set difference over whole histories. A conflict resolution
+            // the consolidator wrote is a commit on its branch that the base
+            // does not contain, so it stays in scope; the base's own commits
+            // leave it. An unresolvable tip subtracts nothing, which is the
+            // same scope a consolidator without a base branch gets.
+            let base_tip = base_branch.and_then(|base| branch_tip(repo, base));
+            SecurityScope::Since {
+                base: base_commit.to_string(),
+                branch: branch.to_string(),
+                approved: Vec::new(),
+                commits: own_commits(repo, branch, merged, base_tip.as_deref()).await,
+                merged: merged.to_vec(),
+                base_tip,
+                uncommitted: has_uncommitted_changes(repo).await,
+            }
+        }
         WorkerRole::Worker => match approved.filter(|sha| is_object_id(sha)) {
             // An approval the repository cannot resolve -- a pruned branch, a
             // rewritten history, a value that is not a plain object id at all
@@ -659,6 +678,10 @@ pub async fn scope_for(
                         approved: already,
                         commits,
                         merged: Vec::new(),
+                        // A worker's range `base..branch` cannot contain the
+                        // base branch's own commits, so there is nothing for a
+                        // base-tip exclusion to remove.
+                        base_tip: None,
                         uncommitted: has_uncommitted_changes(repo).await,
                     }
                 }
@@ -709,6 +732,9 @@ pub(super) async fn security_scope(
         &worktree.base_commit,
         approved_commit,
         merged_branches,
+        // The guard records the branch this work will be merged into, which is
+        // the history a consolidator may have merged in and must not re-audit.
+        worktree.base_branch.as_deref(),
     )
     .await
 }
@@ -950,7 +976,12 @@ pub(super) async fn commits_since(path: &Path, base: &str, branch: &str) -> Opti
 /// worker branches it merged, but yielding the paths those own commits touched
 /// instead of the commits themselves. This is the consolidator's sensitive-path
 /// probe -- the merged worker branches are not its to re-audit.
-pub(super) async fn own_files(path: &Path, branch: &str, merged: &[String]) -> Vec<String> {
+pub(super) async fn own_files(
+    path: &Path,
+    branch: &str,
+    merged: &[String],
+    base_tip: Option<&str>,
+) -> Vec<String> {
     let path = path.to_path_buf();
     let branch = branch.to_string();
     let merged = merged.to_vec();
@@ -962,6 +993,7 @@ pub(super) async fn own_files(path: &Path, branch: &str, merged: &[String]) -> V
             .filter(|merged| *merged != &branch)
             .flat_map(|merged| rev_list(&path, merged))
             .collect();
+        exclude_base_tip(&mut exclusions, base_tip);
         exclusions.sort();
         exclusions.dedup();
         // `--remerge-diff` reports a merge commit's *resolution* -- what the
@@ -1065,8 +1097,13 @@ pub(super) async fn files_since(path: &Path, base: &str, branch: &str) -> Vec<St
 /// The exclusion is a set difference over whole histories rather than over merge
 /// commit parents, so a worker branch that is itself an ancestor of another
 /// merged one cannot smuggle that ancestor's commits back into the review.
-pub(super) async fn own_commits(path: &Path, branch: &str, merged: &[String]) -> Vec<String> {
-    own_history(path, branch, merged).await.0
+pub(super) async fn own_commits(
+    path: &Path,
+    branch: &str,
+    merged: &[String],
+    base_tip: Option<&str>,
+) -> Vec<String> {
+    own_history(path, branch, merged, base_tip).await.0
 }
 
 /// A consolidator's own commits and the files they touched, one query.
@@ -1078,16 +1115,22 @@ pub(super) async fn own_commits(path: &Path, branch: &str, merged: &[String]) ->
 /// exactly what `--remerge-diff` reports: the difference between the merge
 /// result and the merge git would have made on its own, and nothing at all for
 /// a clean merge.
-async fn own_history(path: &Path, branch: &str, merged: &[String]) -> (Vec<String>, Vec<String>) {
+async fn own_history(
+    path: &Path,
+    branch: &str,
+    merged: &[String],
+    base_tip: Option<&str>,
+) -> (Vec<String>, Vec<String>) {
     let path = path.to_path_buf();
     let branch = branch.to_string();
     let merged = merged.to_vec();
     tokio::task::spawn_blocking(move || {
-        let exclusions: Vec<String> = merged
+        let mut exclusions: Vec<String> = merged
             .iter()
             .filter(|merged_branch| *merged_branch != &branch)
             .flat_map(|merged_branch| rev_list(&path, merged_branch))
             .collect();
+        exclude_base_tip(&mut exclusions, base_tip);
         // The history query: one marker line per commit the consolidator wrote
         // or resolved, followed by the files of that commit's own change.
         let mut args: Vec<String> = vec![
@@ -1178,6 +1221,44 @@ fn run_own_history(path: &Path, args: &[String]) -> Option<(Vec<String>, Vec<Str
     files.sort();
     files.dedup();
     Some((commits, files))
+}
+
+/// The current tip of the base branch a consolidator's work will be merged
+/// into, as a plain object id.
+///
+/// A consolidator resolves conflicts against the base branch's *current* state,
+/// so the base's own history -- reviewed where it came from, on the branch that
+/// landed it -- reaches the consolidator's audit through the merge and must be
+/// subtracted exactly like a merged worker branch's history.
+///
+/// `None` when there is no base branch or git cannot resolve it to a commit: a
+/// tip the repository cannot name is no evidence that anything was already
+/// reviewed, so the caller excludes nothing rather than guess. The
+/// `refs/heads/` prefix also keeps a name that is not a revision from being
+/// parsed as a git option, and the object-id guard keeps a value that is not a
+/// plain commit id from reaching a `--not` argument at all.
+fn branch_tip(path: &Path, base_branch: &str) -> Option<String> {
+    crate::worktree::git(
+        path,
+        "rev-parse",
+        &["rev-parse", "--verify", &format!("refs/heads/{base_branch}^{{commit}}")],
+    )
+    .ok()
+    .filter(|out| out.status.success())
+    .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    .filter(|tip| is_object_id(tip))
+}
+
+/// Add the base branch's tip to the `--not` set that carves a consolidator's
+/// own history out of its branch.
+///
+/// An absent tip adds nothing: the set difference then leaves the whole
+/// branch history in, which is the conservative direction -- a wider audit,
+/// never a narrower one.
+fn exclude_base_tip(exclusions: &mut Vec<String>, base_tip: Option<&str>) {
+    if let Some(tip) = base_tip {
+        exclusions.push(tip.to_string());
+    }
 }
 
 /// Commits reachable from `r#ref`, or empty when git cannot resolve it.
@@ -1348,6 +1429,12 @@ pub enum SecurityScope {
         /// Branches already reviewed at their own approved commits, which a
         /// consolidator's own commits must be measured without.
         merged: Vec<String>,
+        /// The tip of the base branch this work will be merged into, when git
+        /// resolves it: a consolidator that merged that branch must not
+        /// re-audit what the base already carried. `None` -- no base branch, or
+        /// one git cannot resolve -- excludes nothing, so the scope stays as
+        /// wide as it would have been without a base branch at all.
+        base_tip: Option<String>,
         /// Whether the working tree carries a change the covered commits do
         /// not: an agent edits before it commits, so an empty commit list is
         /// not by itself evidence that nothing is left unaudited.

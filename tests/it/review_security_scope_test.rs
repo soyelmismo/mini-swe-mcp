@@ -16,6 +16,11 @@
 //! * **A consolidator reviews its own commits.** The worker branches it merged,
 //!   each already reviewed at its own approved commit, are excluded from its
 //!   security scope; only its interaction fixes and conflict resolutions remain.
+//! * **A consolidator does not re-audit the base branch it merged in.** The base
+//!   branch's current tip is subtracted the same way, so work that landed on it
+//!   after the dispatch -- already reviewed where it came from -- stays out; a
+//!   resolution the consolidator wrote itself is a commit the base does not
+//!   contain and stays in, and a base tip git cannot resolve subtracts nothing.
 //!
 //! Every repository is a temporary directory this test creates and removes; no
 //! registry, hub or real repository is written.
@@ -74,7 +79,7 @@ async fn worker_scope(
     base: &str,
     approved: Option<String>,
 ) -> mini_swe_mcp::pool::SecurityScope {
-    scope_for(repo, branch, WorkerRole::Worker, base, approved, &[]).await
+    scope_for(repo, branch, WorkerRole::Worker, base, approved, &[], None).await
 }
 
 #[tokio::test]
@@ -187,6 +192,7 @@ async fn a_consolidator_reviews_only_its_own_commits() {
         &base,
         None,
         &merged,
+        Some("master"),
     )
     .await;
 
@@ -545,6 +551,7 @@ async fn a_merged_branch_beyond_its_approval_stays_in_the_consolidators_scope() 
         &base,
         None,
         &approved_merged_branches(&["w1".to_string()], |_| Some(approved.clone())),
+        Some("master"),
     )
     .await;
 
@@ -679,6 +686,7 @@ async fn a_conflict_resolved_in_a_merge_commit_stays_in_the_consolidators_scope(
         &base,
         None,
         &merged,
+        Some("master"),
     )
     .await;
 
@@ -758,6 +766,7 @@ async fn a_planted_non_object_id_approval_never_reaches_git_in_the_consolidator_
         &base,
         None,
         &approved_merged_branches(&["w1".to_string()], |_| Some(planted.clone())),
+        Some("master"),
     )
     .await;
 
