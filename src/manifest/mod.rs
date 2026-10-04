@@ -162,10 +162,22 @@ impl ModelManifest {
     ///
     /// The built-in modes `quality` and `security` are always available even
     /// when the manifest does not declare them; a manifest-declared entry of
-    /// the same name overrides the built-in prompt. Any other name resolves
-    /// only when the manifest declares it.
+    /// the same name overrides the built-in prompt. A built-in override is
+    /// found case-insensitively (exact match first, then a scan for
+    /// `quality`/`security`), so a `Security:` entry still overrides the
+    /// built-in; any other name resolves only on an exact match.
     pub fn review_mode(&self, name: &str) -> Option<&ReviewModeDefinition> {
-        self.review_modes.get(name)
+        if let Some(def) = self.review_modes.get(name) {
+            return Some(def);
+        }
+        if name.eq_ignore_ascii_case("quality") || name.eq_ignore_ascii_case("security") {
+            return self
+                .review_modes
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(_, def)| def);
+        }
+        None
     }
 
     /// Review-mode entries in sorted name order.
