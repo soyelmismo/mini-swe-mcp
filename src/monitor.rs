@@ -963,8 +963,904 @@ fn columns_env() -> Option<usize> {
     env_parse::<usize>("COLUMNS").filter(|c| *c > 0)
 }
 
+// ----------
+// Interactive mini-TUI
+// ----------
+
+/// Maximum number of turns kept in memory per worker detail view.
+///
+/// The history log is append-only and can grow without bound over a long
+/// worker, so the detail view keeps only the newest turns in memory and trims
+/// the rest as it reads. Bounded by construction; the reader never grows past
+/// this even when the file on disk is much longer.
+pub const MAX_TURNS_IN_MEMORY: usize = 500;
+
+/// A single parsed turn of a worker's history log, as the detail view shows it.
+///
+/// One assistant turn plus its tool result (or the user-role output that
+/// answers a code-block turn) collapses into one row: the step number, the
+/// command it ran, the exit code the harness recorded, and the last few lines
+/// of output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnView {
+    /// 1-based step number this turn belongs to.
+    pub step: usize,
+    /// The bash command the assistant ran (empty for a no-command turn).
+    pub command: String,
+    /// The exit code recorded by the harness, when the output named one.
+    pub exit_code: Option<i32>,
+    /// The last few lines of the tool output, newest last.
+    pub output_lines: Vec<String>,
+}
+
+/// Incremental reader over a worker's append-only history log.
+///
+/// Remembers the byte offset it has consumed and parses only the lines that
+/// were appended since the last read, so a refresh never re-reads the whole
+/// file. Keeps at most [`MAX_TURNS_IN_MEMORY`] turns; older ones are dropped.
+/// A torn final line (a crash mid-append) is skipped and the offset advances
+/// past it, so the next read picks up after it.
+#[derive(Debug, Clone, Default)]
+pub struct HistoryReader {
+    /// Byte offset the reader has consumed so far.
+    pub offset: u64,
+    /// Parsed turns, newest last, capped at [`MAX_TURNS_IN_MEMORY`].
+    pub turns: Vec<TurnView>,
+}
+
+/// Number of output lines kept per turn.
+const TURN_TAIL_LINES: usize = 5;
+
+/// Turns one PgUp/PgDn moves the detail view: a page, not a line, so a long
+/// history stays navigable without repeating the key.
+const PAGE_TURNS: usize = 10;
+
+impl HistoryReader {
+    /// Read every line appended to `path` since the last read and fold the new
+    /// turns into `self.turns`.
+    ///
+    /// The file is opened read-only and only the bytes after `self.offset` are
+    /// read, so a refresh is proportional to what changed, never to the whole
+    /// log. A missing file (a worker with no history yet) is not an error.
+    pub fn read_incremental(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = match std::fs::File::open(path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let len = file.metadata()?.len();
+        if len < self.offset {
+            // The file shrank (a rewrite replaced the log): start over.
+            self.offset = 0;
+            self.turns.clear();
+        }
+        if len <= self.offset {
+            return Ok(());
+        }
+        file.seek(SeekFrom::Start(self.offset))?;
+        let mut buf = String::new();
+        file.read_to_string(&mut buf)?;
+        self.offset = len;
+        self.consume_lines(&buf);
+        Ok(())
+    }
+
+    /// Fold freshly-read lines into `self.turns`, capping the memory.
+    fn consume_lines(&mut self, buf: &str) {
+        let mut pending: Option<TurnView> = None;
+        let mut step = self.turns.last().map(|t| t.step).unwrap_or(0);
+        for line in buf.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Some(turn) = parse_turn_line(line, step) {
+                step = turn.step;
+                if let Some(done) = pending.take() {
+                    self.turns.push(done);
+                }
+                pending = Some(turn);
+            } else if let Some(output) = parse_tool_output(line)
+                && let Some(turn) = pending.as_mut()
+            {
+                turn.exit_code = output.0;
+                turn.output_lines = output.1;
+            }
+            // A torn line (a crash mid-append) parses as neither; the offset
+            // already advanced past it, so the next read continues after it.
+        }
+        if let Some(done) = pending.take() {
+            self.turns.push(done);
+        }
+        if self.turns.len() > MAX_TURNS_IN_MEMORY {
+            let excess = self.turns.len() - MAX_TURNS_IN_MEMORY;
+            self.turns.drain(..excess);
+        }
+    }
+}
+
+/// Parse one JSONL line of a history log into a [`TurnView`], if it is a turn.
+///
+/// The metadata line (line one) and any non-turn message parse to `None`. A
+/// turn is an assistant message that ran a command: its tool result carries
+/// the `COMMAND OUTPUT (exit code: N)` prefix and the output tail. `step` is
+/// the running step counter the caller maintains; it advances only when a turn
+/// is found.
+fn parse_turn_line(line: &str, step: usize) -> Option<TurnView> {
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    if value.get("role")?.as_str()? != "assistant" {
+        return None;
+    }
+    // The command is the first bash tool call's `command` argument, or the
+    // assistant's prose when no tool call named one.
+    let command = value
+        .get("tool_calls")
+        .and_then(|calls| calls.as_array())
+        .and_then(|calls| {
+            calls.iter().find_map(|call| {
+                if call.get("function")?.get("name")?.as_str()? != "bash" {
+                    return None;
+                }
+                let args = call.get("function")?.get("arguments")?.as_str()?;
+                serde_json::from_str::<serde_json::Value>(args)
+                    .ok()
+                    .and_then(|a| {
+                        a.get("command")
+                            .and_then(|c| c.as_str())
+                            .map(str::to_string)
+                    })
+            })
+        })
+        .unwrap_or_else(|| {
+            value
+                .get("content")
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string()
+        });
+    Some(TurnView {
+        step: step + 1,
+        command,
+        exit_code: None,
+        output_lines: Vec::new(),
+    })
+}
+
+/// Parse a tool-result line into its exit code and output tail.
+///
+/// The harness records every executed command as `COMMAND OUTPUT (exit code:
+/// N)` followed by the output; the detail view shows only the last few lines
+/// so one noisy turn cannot push the rest off screen.
+fn parse_tool_output(line: &str) -> Option<(Option<i32>, Vec<String>)> {
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    let role = value.get("role")?.as_str()?;
+    let content = value.get("content")?.as_str()?;
+    let prefix = "COMMAND OUTPUT (exit code: ";
+    let Some(rest) = content.strip_prefix(prefix) else {
+        // A tool result without the harness prefix (an error, a block note):
+        // still worth showing under the turn, without an exit code. User-role
+        // lines are instructions, not output, so only tool lines qualify.
+        if role != "tool" {
+            return None;
+        }
+        return Some((None, tail_lines(content)));
+    };
+    let (code_text, output) = rest.split_once(')')?;
+    let exit_code = code_text.trim().parse::<i32>().ok();
+    // A code-block (prose) turn is answered by a user message carrying the
+    // same harness prefix, so both roles attach output to the pending turn.
+    if role != "tool" && role != "user" {
+        return None;
+    }
+    Some((exit_code, tail_lines(output)))
+}
+
+/// Keep the last [`TURN_TAIL_LINES`] non-blank lines of a tool output.
+fn tail_lines(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .map(str::trim_end)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .take(TURN_TAIL_LINES)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
+}
+
+/// A key the interactive loop can receive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Key {
+    Up,
+    Down,
+    PageUp,
+    PageDown,
+    Enter,
+    Esc,
+    /// A printable character (e.g. `q`, `g`, `f`, `j`, `k`).
+    Char(char),
+}
+
+/// What a keypress does to the UI state machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    /// Move the selection up one worker (list).
+    MoveUp,
+    /// Move the selection down one worker (list).
+    MoveDown,
+    /// Open the selected worker's detail view (list).
+    OpenDetail,
+    /// Go back to the list (detail).
+    Back,
+    /// Quit the monitor entirely (list).
+    Quit,
+    /// Toggle group collapse/expand (list).
+    ToggleGroups,
+    /// Toggle follow mode (detail).
+    ToggleFollow,
+    /// Scroll the detail view up one page.
+    ScrollUp,
+    /// Scroll the detail view down one page.
+    ScrollDown,
+    /// No state change (e.g. `g`/`f` in the wrong view).
+    None,
+}
+
+/// The two views of the mini-TUI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum View {
+    List,
+    Detail,
+}
+
+/// The interactive UI state.
+#[derive(Debug, Clone)]
+pub struct UiState {
+    /// Which view is active.
+    pub view: View,
+    /// Index of the selected worker within the flat list of visible workers.
+    pub selection: usize,
+    /// Whether workers are shown under their group headings.
+    pub groups_expanded: bool,
+    /// Whether the detail view sticks to the newest turn.
+    pub follow: bool,
+    /// Scroll offset (in turns) of the detail view.
+    pub scroll: usize,
+}
+
+impl Default for UiState {
+    fn default() -> Self {
+        Self {
+            view: View::List,
+            selection: 0,
+            groups_expanded: true,
+            follow: true,
+            scroll: 0,
+        }
+    }
+}
+
+impl UiState {
+    /// Apply a key to the state and return what it did.
+    ///
+    /// Pure and deterministic: the interactive loop feeds raw keys in and the
+    /// resulting action drives the redraw. `worker_count` is the number of
+    /// visible workers in the list, used to clamp the selection.
+    pub fn apply_key(&mut self, key: Key, worker_count: usize) -> Action {
+        match self.view {
+            View::List => match key {
+                Key::Up => {
+                    if self.selection > 0 {
+                        self.selection -= 1;
+                        Action::MoveUp
+                    } else {
+                        Action::None
+                    }
+                }
+                Key::Down => {
+                    if worker_count > 0 && self.selection + 1 < worker_count {
+                        self.selection += 1;
+                        Action::MoveDown
+                    } else {
+                        Action::None
+                    }
+                }
+                Key::Enter => {
+                    if worker_count > 0 {
+                        self.view = View::Detail;
+                        self.follow = true;
+                        self.scroll = 0;
+                        Action::OpenDetail
+                    } else {
+                        Action::None
+                    }
+                }
+                Key::Esc | Key::Char('q') => Action::Quit,
+                Key::Char('g') => {
+                    self.groups_expanded = !self.groups_expanded;
+                    Action::ToggleGroups
+                }
+                _ => Action::None,
+            },
+            View::Detail => match key {
+                // Ctrl+C arrives as `q` from `read_key`: it steps back here
+                // and quits from the list, so two presses always exit.
+                Key::Esc | Key::Char('q') => {
+                    self.view = View::List;
+                    Action::Back
+                }
+                Key::PageUp => {
+                    self.scroll = self.scroll.saturating_sub(PAGE_TURNS);
+                    Action::ScrollUp
+                }
+                Key::PageDown => {
+                    self.scroll = self.scroll.saturating_add(PAGE_TURNS);
+                    Action::ScrollDown
+                }
+                Key::Char('f') => {
+                    self.follow = !self.follow;
+                    Action::ToggleFollow
+                }
+                _ => Action::None,
+            },
+        }
+    }
+}
+
+/// Parse a raw byte sequence from the terminal into a [`Key`].
+///
+/// Handles the arrow keys and PgUp/PgDn escape sequences plus `j`/`k` as
+/// Up/Down aliases; everything else maps to its character or `None` for
+/// control bytes the UI ignores.
+pub fn parse_key(bytes: &[u8]) -> Option<Key> {
+    match bytes {
+        [0x1b, b'[', b'A'] => Some(Key::Up),
+        [0x1b, b'[', b'B'] => Some(Key::Down),
+        [0x1b, b'[', b'5', b'~'] => Some(Key::PageUp),
+        [0x1b, b'[', b'6', b'~'] => Some(Key::PageDown),
+        [b'\r'] | [b'\n'] => Some(Key::Enter),
+        [0x1b] => Some(Key::Esc),
+        [b'j'] => Some(Key::Down),
+        [b'k'] => Some(Key::Up),
+        [b] if b.is_ascii_graphic() || *b == b' ' => Some(Key::Char(*b as char)),
+        _ => None,
+    }
+}
+
+/// Fit one worker to a single compact line of at most `width` visible columns.
+///
+/// Layout: `glyph id model step/max elapsed op` with the group demoted to a
+/// `[group]` prefix inside the op column. The op text is truncated to whatever
+/// the fixed columns leave behind, so no line ever overflows `width`.
+/// Completed and retired-soon workers are dimmed.
+pub fn fit_compact_row(w: &WorkerRegistryEntry, now: u64, width: usize) -> String {
+    let glyph = status_glyph(w.status).to_string();
+    let id = pad_visible(&truncate_visible(&w.id, 8), 8);
+    let model = pad_visible(&truncate_visible(&w.model, 8), 8);
+    let duration_secs = if w.status.is_terminal() {
+        w.updated_at.saturating_sub(w.started_at)
+    } else {
+        now.saturating_sub(w.started_at)
+    };
+    let elapsed = format_duration(duration_secs);
+    let turns = format!("{}/{}", w.step, w.max_turns);
+
+    let group = w
+        .group
+        .as_deref()
+        .filter(|g| !g.trim().is_empty())
+        .map(|g| format!("[{}] ", g.trim()));
+    let op_text = if let Some(ref q) = w.question {
+        format!("ASK: {q}")
+    } else if !w.last_command.is_empty()
+        && w.last_command != "completed"
+        && w.last_command != "initializing"
+    {
+        w.last_command.clone()
+    } else {
+        w.task.lines().next().unwrap_or("").trim().to_string()
+    };
+    let op_text = format!("{}{op_text}", group.unwrap_or_default());
+
+    let fixed = visible_width(&glyph)
+        + 1
+        + 8
+        + 1
+        + 8
+        + 1
+        + visible_width(&turns)
+        + 1
+        + visible_width(&elapsed)
+        + 1;
+    let op_width = width.saturating_sub(fixed).max(1);
+    let op = truncate_visible(&op_text, op_width);
+
+    let line = format!("{glyph} {id} {model} {turns} {elapsed} {op}");
+    if dim_worker(w, now) {
+        format!("\x1b[2m{line}\x1b[0m")
+    } else {
+        line
+    }
+}
+
+/// Whether a worker row is dimmed: terminal workers, plus live workers that
+/// stopped reporting (no update within the terminal TTL, so the sweeper will
+/// soon retire them).
+fn dim_worker(w: &WorkerRegistryEntry, now: u64) -> bool {
+    if w.status.is_terminal() {
+        return true;
+    }
+    now.saturating_sub(w.updated_at) > crate::pool::DEFAULT_TERMINAL_TTL_SECS
+}
+
+/// The one-character status glyph for a worker.
+pub fn status_glyph(status: RegistryStatus) -> char {
+    match status {
+        RegistryStatus::Running => '\u{25cf}',
+        RegistryStatus::Paused => '\u{25cb}',
+        RegistryStatus::Reviewing => '\u{25c6}',
+        RegistryStatus::Completed => '\u{2713}',
+        RegistryStatus::Failed => '\u{2717}',
+        RegistryStatus::Exhausted => '\u{26a0}',
+        RegistryStatus::Stopped => '\u{25a0}',
+        RegistryStatus::Interrupted => '\u{25b2}',
+    }
+}
+
+/// One line of the key hint shown at the bottom of the interactive views.
+pub fn key_hint(view: View) -> &'static str {
+    match view {
+        View::List => "Up/Down or j/k move - Enter detail - g groups - q quit",
+        View::Detail => "PgUp/PgDn scroll - f follow - Esc/q back",
+    }
+}
+
+// ----------
+// Interactive terminal loop (raw mode, alternate screen, key input)
+// ----------
+
+/// Raw-mode terminal guard: enters raw mode plus the alternate screen on
+/// creation and restores cooked mode, the cursor and the main screen on drop,
+/// so every exit path (normal, error, panic unwind) leaves a usable terminal.
+struct TerminalGuard {
+    orig: libc::termios,
+}
+
+impl TerminalGuard {
+    /// Enter raw mode on stdin and switch to the alternate screen.
+    ///
+    /// Fails when stdin is not a TTY or termios cannot be read, in which case
+    /// the caller falls back to the non-interactive rendering.
+    fn enter() -> std::io::Result<Self> {
+        let mut orig: libc::termios = unsafe { std::mem::zeroed() };
+        if unsafe { libc::tcgetattr(0, &mut orig) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut raw = orig;
+        raw.c_iflag &= !(libc::BRKINT | libc::ICRNL | libc::INPCK | libc::ISTRIP | libc::IXON);
+        raw.c_oflag &= !libc::OPOST;
+        raw.c_cflag |= libc::CS8;
+        raw.c_lflag &= !(libc::ECHO | libc::ICANON | libc::IEXTEN | libc::ISIG);
+        raw.c_cc[libc::VMIN] = 1;
+        raw.c_cc[libc::VTIME] = 0;
+        if unsafe { libc::tcsetattr(0, libc::TCSANOW, &raw) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        {
+            let mut stdout = std::io::stdout().lock();
+            let _ = write!(stdout, "\x1b[?1049h\x1b[?25l");
+            let _ = stdout.flush();
+        }
+        Ok(Self { orig })
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::tcsetattr(0, libc::TCSANOW, &self.orig);
+        }
+        {
+            let mut stdout = std::io::stdout().lock();
+            let _ = write!(stdout, "\x1b[?25h\x1b[?1049l");
+            let _ = stdout.flush();
+        }
+    }
+}
+
+/// Install a panic hook that restores the terminal before unwinding further.
+///
+/// [`TerminalGuard`] already restores on unwind, but a panic on another thread
+/// would otherwise leave raw mode behind; the hook makes the restore
+/// unconditional and then runs the previous hook.
+fn install_panic_hook(orig: libc::termios) {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        unsafe {
+            libc::tcsetattr(0, libc::TCSANOW, &orig);
+        }
+        {
+            let mut stdout = std::io::stdout().lock();
+            let _ = write!(stdout, "\x1b[?25h\x1b[?1049l");
+            let _ = stdout.flush();
+        }
+        previous(info);
+    }));
+}
+
+/// One selectable line of the compact list: a group heading or a worker row.
+enum ListLine<'a> {
+    Header(String),
+    Worker(&'a WorkerRegistryEntry),
+}
+
+/// Build the compact list lines for `entries`, grouped by repository.
+///
+/// Each group gets a one-line header with its counts
+/// (`running/done/failed`, every non-zero state) followed by one compact row
+/// per worker. When `expanded` is false only the headers are returned. Returns
+/// the lines plus the worker ids in display order, so the selection index maps
+/// to a worker.
+fn build_list_lines<'a>(
+    entries: &'a [WorkerRegistryEntry],
+    now: u64,
+    width: usize,
+    expanded: bool,
+) -> (Vec<ListLine<'a>>, Vec<&'a WorkerRegistryEntry>) {
+    let mut repos: BTreeMap<&str, RepoGroup<'a>> = BTreeMap::new();
+    for entry in entries {
+        let repo = entry.repo_path.as_deref().unwrap_or(DEFAULT_REPO_KEY);
+        repos.entry(repo).or_insert_with(RepoGroup::new).push(entry);
+    }
+    let mut lines = Vec::new();
+    let mut order = Vec::new();
+    for (repo_path, group) in &repos {
+        let summary = summary_line(&group.summary_items(), true);
+        let heading = truncate_visible(&format!("[{repo_path}]  {summary}"), width);
+        lines.push(ListLine::Header(format!("\x1b[1;36m{heading}\x1b[0m")));
+        if expanded {
+            for w in &group.workers {
+                order.push(*w);
+                lines.push(ListLine::Worker(w));
+            }
+        }
+    }
+    let _ = now;
+    (lines, order)
+}
+
+/// Render the compact list view into `height` rows at `width` columns.
+///
+/// The selected worker's row is highlighted; the view scrolls so the selection
+/// stays visible. Ends with the key hint line.
+fn render_list(
+    entries: &[WorkerRegistryEntry],
+    state: &UiState,
+    now: u64,
+    width: usize,
+    height: usize,
+) -> String {
+    let (lines, order) = build_list_lines(entries, now, width, state.groups_expanded);
+    let selected_id = order.get(state.selection).map(|w| w.id.as_str());
+    // Line index of the selected worker, for scroll-into-view.
+    let mut selected_line = 0usize;
+    for (i, line) in lines.iter().enumerate() {
+        if let ListLine::Worker(w) = line
+            && Some(w.id.as_str()) == selected_id
+        {
+            selected_line = i;
+        }
+    }
+    let body_height = height.saturating_sub(2).max(1);
+    let start = if lines.len() <= body_height {
+        0
+    } else {
+        selected_line
+            .saturating_sub(body_height.saturating_sub(1))
+            .min(lines.len() - body_height)
+    };
+    let mut out = String::new();
+    for line in lines.iter().skip(start).take(body_height) {
+        match line {
+            ListLine::Header(h) => {
+                out.push_str(&truncate_visible(h, width));
+                out.push('\n');
+            }
+            ListLine::Worker(w) => {
+                let row = fit_compact_row(w, now, width);
+                if Some(w.id.as_str()) == selected_id {
+                    out.push_str(&format!("\x1b[7m{row}\x1b[0m\n"));
+                } else {
+                    out.push_str(&row);
+                    out.push('\n');
+                }
+            }
+        }
+    }
+    out.push_str(&truncate_visible(key_hint(View::List), width));
+    out.push('\n');
+    out
+}
+
+/// Render the detail view for one worker: its REPORT/question/status header on
+/// top, then its turns newest-last. Follow mode sticks to the newest turn;
+/// otherwise `state.scroll` turns are skipped from the end.
+fn render_detail(
+    entry: &WorkerRegistryEntry,
+    reader: &HistoryReader,
+    state: &UiState,
+    now: u64,
+    width: usize,
+    height: usize,
+) -> String {
+    let mut out = String::new();
+    let status_name = entry.status.display_name();
+    out.push_str(&truncate_visible(
+        &format!(
+            "{} {} {} {}/{}",
+            status_glyph(entry.status),
+            entry.id,
+            status_name,
+            entry.step,
+            entry.max_turns
+        ),
+        width,
+    ));
+    out.push('\n');
+    out.push_str(&truncate_visible(
+        &format!("task: {}", entry.task.lines().next().unwrap_or("")),
+        width,
+    ));
+    out.push('\n');
+    if let Some(ref q) = entry.question {
+        out.push_str(&truncate_visible(&format!("question: {q}"), width));
+        out.push('\n');
+    }
+    if let Some(ref report) = entry.report
+        && !report.is_empty()
+    {
+        out.push_str(&truncate_visible(
+            &format!(
+                "report: {} | files: {} | tests: {} | risks: {}",
+                report.done, report.files, report.tests, report.risks
+            ),
+            width,
+        ));
+        out.push('\n');
+    }
+    let header_lines = out.lines().count();
+    let body_height = height.saturating_sub(header_lines + 1).max(1);
+    // Window over turns first (scroll is in turns), then fit the flattened
+    // lines to the body: follow mode sticks to the newest turn.
+    let skip = if state.follow {
+        0
+    } else {
+        state.scroll.min(reader.turns.len().saturating_sub(1))
+    };
+    let end = reader.turns.len().saturating_sub(skip);
+    let mut turn_lines: Vec<String> = Vec::new();
+    for turn in &reader.turns[..end] {
+        let code = turn
+            .exit_code
+            .map(|c| format!(" (exit {c})"))
+            .unwrap_or_default();
+        turn_lines.push(truncate_visible(
+            &format!("#{} {}{}", turn.step, turn.command, code),
+            width,
+        ));
+        for line in &turn.output_lines {
+            turn_lines.push(truncate_visible(&format!("  {line}"), width));
+        }
+    }
+    if turn_lines.is_empty() {
+        turn_lines.push("(no turns recorded yet)".to_string());
+    }
+    let start = turn_lines.len().saturating_sub(body_height);
+    for line in turn_lines.iter().skip(start) {
+        out.push_str(line);
+        out.push('\n');
+    }
+    let _ = now;
+    out.push_str(&truncate_visible(key_hint(View::Detail), width));
+    out.push('\n');
+    out
+}
+/// Read one keypress from stdin, gathering a full escape sequence.
+///
+/// Arrow keys and PgUp/PgDn arrive as multi-byte sequences; after a lone ESC
+/// byte a short `poll` decides whether more bytes follow (sequence) or the
+/// user pressed Esc alone. Returns `None` on EOF or an unreadable stdin.
+fn read_key() -> Option<Key> {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    let stdin = std::io::stdin();
+    let fd = stdin.as_raw_fd();
+    let mut buf = [0u8; 32];
+    let n = stdin.lock().read(&mut buf).ok()?;
+    if n == 0 {
+        return None;
+    }
+    let mut bytes = buf[..n].to_vec();
+    // A lone ESC may be the start of a sequence: wait briefly for the rest.
+    if bytes == [0x1b] {
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        if unsafe { libc::poll(&mut pfd, 1, 50) } > 0 && pfd.revents & libc::POLLIN != 0 {
+            let extra = stdin.lock().read(&mut buf).ok().unwrap_or(0);
+            bytes.extend_from_slice(&buf[..extra]);
+        }
+    }
+    if bytes == [0x03] {
+        // Ctrl+C in raw mode arrives as a byte, not a signal: it steps back
+        // in the detail view and quits from the list, like `q`.
+        return Some(Key::Char('q'));
+    }
+    // `j`/`k` move in the list; elsewhere they are plain characters.
+    parse_key(&bytes)
+}
+
+/// Terminal height in rows, defaulting when it cannot be read.
+fn terminal_height() -> usize {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        if let Ok(file) = std::fs::OpenOptions::new().read(true).open("/dev/tty") {
+            let mut size = libc::winsize {
+                ws_row: 0,
+                ws_col: 0,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
+            if unsafe { libc::ioctl(file.as_raw_fd(), libc::TIOCGWINSZ, &mut size) } == 0
+                && size.ws_row > 0
+            {
+                return size.ws_row as usize;
+            }
+        }
+    }
+    24
+}
+
+/// Run the interactive mini-TUI: compact list plus worker detail.
+///
+/// Enters raw mode and the alternate screen, then redraws at most once per
+/// second plus on every keypress, so idle CPU stays near zero. The monitor is
+/// strictly read-only: it never writes registry rows, histories or the hub.
+async fn run_interactive() -> Result<()> {
+    let guard = TerminalGuard::enter()?;
+    install_panic_hook(guard.orig);
+    let _guard = guard;
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Key>();
+    std::thread::spawn(move || {
+        while let Some(key) = read_key() {
+            if tx.send(key).is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut sigterm = {
+        #[cfg(unix)]
+        {
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok()
+        }
+        #[cfg(not(unix))]
+        {
+            None::<tokio::signal::unix::Signal>
+        }
+    };
+
+    let mut state = UiState::default();
+    let mut readers: std::collections::HashMap<String, HistoryReader> =
+        std::collections::HashMap::new();
+    // Scratch root is resolved once: history files live beside the registry.
+    let scratch = crate::worktree::ScratchRoot::from_env();
+
+    loop {
+        let entries = load_all_registry_entries();
+        let now = unix_timestamp();
+        let width = terminal_width().unwrap_or(DEFAULT_TERMINAL_WIDTH);
+        let height = terminal_height();
+
+        // Clamp the selection to the visible workers.
+        let (_, order) = build_list_lines(&entries, now, width, state.groups_expanded);
+        if !order.is_empty() {
+            state.selection = state.selection.min(order.len() - 1);
+        }
+        // Drop readers for workers that left the registry, so a long session
+        // never accumulates histories for workers that are gone.
+        readers.retain(|id, _| entries.iter().any(|e| e.id == *id));
+
+        let output = match state.view {
+            View::List => render_list(&entries, &state, now, width, height),
+            View::Detail => {
+                let selected = order.get(state.selection);
+                match selected {
+                    Some(entry) => {
+                        let path = crate::pool::history_log_path_in(&scratch, &entry.id);
+                        let reader = readers.entry(entry.id.clone()).or_default();
+                        let _ = reader.read_incremental(&path);
+                        if state.follow {
+                            state.scroll = 0;
+                        } else {
+                            state.scroll = state.scroll.min(reader.turns.len().saturating_sub(1));
+                        }
+                        render_detail(entry, reader, &state, now, width, height)
+                    }
+                    None => render_list(&entries, &state, now, width, height),
+                }
+            }
+        };
+        {
+            let mut stdout = std::io::stdout().lock();
+            let _ = write!(stdout, "\x1b[H\x1b[J{output}");
+            let _ = stdout.flush();
+        }
+
+        enum Wake {
+            Key(Key),
+            Tick,
+            Done,
+        }
+        let wake = async {
+            {
+                if let Some(sig) = sigterm.as_mut() {
+                    tokio::select! {
+                        biased;
+                        _ = sig.recv() => Wake::Done,
+                        _ = tokio::signal::ctrl_c() => Wake::Done,
+                        key = rx.recv() => match key {
+                            Some(k) => Wake::Key(k),
+                            None => Wake::Done,
+                        },
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => Wake::Tick,
+                    }
+                } else {
+                    tokio::select! {
+                        biased;
+                        _ = tokio::signal::ctrl_c() => Wake::Done,
+                        key = rx.recv() => match key {
+                            Some(k) => Wake::Key(k),
+                            None => Wake::Done,
+                        },
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => Wake::Tick,
+                    }
+                }
+            }
+        };
+        match wake.await {
+            Wake::Done => break,
+            Wake::Tick => {}
+            Wake::Key(key) => {
+                let (_, order) = build_list_lines(&entries, now, width, state.groups_expanded);
+                if state.apply_key(key, order.len()) == Action::Quit {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub async fn run_monitor(once: bool) -> Result<()> {
     let is_tty = std::io::stdout().is_terminal();
+    let stdin_tty = std::io::stdin().is_terminal();
+    if !once && is_tty && stdin_tty {
+        // Interactive mini-TUI; any terminal setup failure falls back to the
+        // plain rendering below, so a broken `$TERM` never breaks the monitor.
+        if run_interactive().await.is_ok() {
+            return Ok(());
+        }
+    }
     if once || !is_tty {
         let entries = load_all_registry_entries();
         let now = unix_timestamp();
@@ -1675,6 +2571,236 @@ mod tests {
         assert!(
             text.contains("cargo test --all"),
             "command must survive:\n{text}"
+        );
+    }
+
+    /// The list/detail/back/quit/scroll/follow state machine answers every key
+    /// with the action its view owns and ignores the keys of the other view.
+    #[test]
+    fn test_key_state_machine_covers_list_detail_back_quit_scroll_follow() {
+        let mut state = UiState::default();
+        assert_eq!(state.view, View::List);
+
+        // List: move within bounds, clamp at both ends.
+        assert_eq!(state.apply_key(Key::Down, 3), Action::MoveDown);
+        assert_eq!(state.selection, 1);
+        assert_eq!(state.apply_key(Key::Up, 3), Action::MoveUp);
+        assert_eq!(state.selection, 0);
+        assert_eq!(state.apply_key(Key::Up, 3), Action::None);
+        state.selection = 2;
+        assert_eq!(state.apply_key(Key::Down, 3), Action::None);
+
+        // List: groups toggle, follow/scroll keys are ignored.
+        assert_eq!(state.apply_key(Key::Char('g'), 3), Action::ToggleGroups);
+        assert!(!state.groups_expanded);
+        assert_eq!(state.apply_key(Key::Char('g'), 3), Action::ToggleGroups);
+        assert!(state.groups_expanded);
+        assert_eq!(state.apply_key(Key::Char('f'), 3), Action::None);
+        assert_eq!(state.apply_key(Key::PageDown, 3), Action::None);
+
+        // List: Enter opens the detail, Esc/q quit; Enter with no workers does
+        // nothing.
+        assert_eq!(state.apply_key(Key::Enter, 0), Action::None);
+        assert_eq!(state.apply_key(Key::Enter, 3), Action::OpenDetail);
+        assert_eq!(state.view, View::Detail);
+        assert!(state.follow);
+        assert_eq!(state.scroll, 0);
+
+        // Detail: scroll pages, follow toggles, movement keys are ignored.
+        assert_eq!(state.apply_key(Key::PageDown, 3), Action::ScrollDown);
+        assert_eq!(state.scroll, PAGE_TURNS);
+        assert_eq!(state.apply_key(Key::PageDown, 3), Action::ScrollDown);
+        assert_eq!(state.scroll, 2 * PAGE_TURNS);
+        assert_eq!(state.apply_key(Key::PageUp, 3), Action::ScrollUp);
+        assert_eq!(state.scroll, PAGE_TURNS);
+        // Scrolling past the newest turn clamps instead of wrapping.
+        assert_eq!(state.apply_key(Key::PageUp, 3), Action::ScrollUp);
+        assert_eq!(state.apply_key(Key::PageUp, 3), Action::ScrollUp);
+        assert_eq!(state.scroll, 0);
+        assert_eq!(state.apply_key(Key::Char('f'), 3), Action::ToggleFollow);
+        assert!(!state.follow);
+        assert_eq!(state.apply_key(Key::Up, 3), Action::None);
+        assert_eq!(state.apply_key(Key::Char('g'), 3), Action::None);
+
+        // Detail: Esc/q go back; list: Esc/q quit.
+        assert_eq!(state.apply_key(Key::Esc, 3), Action::Back);
+        assert_eq!(state.view, View::List);
+        assert_eq!(state.apply_key(Key::Char('q'), 3), Action::Quit);
+        let mut detail = UiState {
+            view: View::Detail,
+            ..UiState::default()
+        };
+        assert_eq!(detail.apply_key(Key::Char('q'), 3), Action::Back);
+    }
+
+    /// Raw terminal bytes map to keys: arrows, PgUp/PgDn, Enter, Esc, j/k as
+    /// Up/Down aliases, and control bytes map to nothing.
+    #[test]
+    fn test_parse_key_maps_sequences_and_aliases() {
+        assert_eq!(parse_key(&[0x1b, b'[', b'A']), Some(Key::Up));
+        assert_eq!(parse_key(&[0x1b, b'[', b'B']), Some(Key::Down));
+        assert_eq!(parse_key(&[0x1b, b'[', b'5', b'~']), Some(Key::PageUp));
+        assert_eq!(parse_key(&[0x1b, b'[', b'6', b'~']), Some(Key::PageDown));
+        assert_eq!(parse_key(b"\r"), Some(Key::Enter));
+        assert_eq!(parse_key(&[0x1b]), Some(Key::Esc));
+        assert_eq!(parse_key(b"j"), Some(Key::Down));
+        assert_eq!(parse_key(b"k"), Some(Key::Up));
+        assert_eq!(parse_key(b"q"), Some(Key::Char('q')));
+        assert_eq!(parse_key(&[0x03]), None);
+        assert_eq!(parse_key(&[0x1b, b'[', b'Z']), None);
+    }
+
+    /// History lines fold into turns: an assistant tool call opens a turn and
+    /// the tool result attaches its exit code plus the output tail.
+    #[test]
+    fn test_history_reader_parses_turns_incrementally() {
+        let dir = std::env::temp_dir().join(format!(
+            "monitor-test-{}-{}",
+            std::process::id(),
+            unix_timestamp()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("swe-wt-w1.history.jsonl");
+
+        let meta = serde_json::json!({"task": "t", "model": "m", "repo_path": "r",
+            "base_commit": "c", "branch": "b", "network_offline": false,
+            "max_turns": 10, "revision": 0, "messages": []});
+        let assistant = |command: &str| {
+            serde_json::json!({"role": "assistant", "content": "working",
+                "tool_calls": [{"id": "call_1", "type": "function",
+                    "function": {"name": "bash", "arguments":
+                        serde_json::to_string(&serde_json::json!({"command": command}))
+                            .expect("args")}}]})
+            .to_string()
+        };
+        let tool = |code: i32, output: &str| {
+            serde_json::json!({"role": "tool", "tool_call_id": "call_1",
+                "content": format!("COMMAND OUTPUT (exit code: {code})\n{output}")})
+            .to_string()
+        };
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n{}\n{}\n",
+                meta,
+                assistant("cargo test"),
+                tool(0, "ok\nline2\nline3\nline4\nline5\nline6\nline7")
+            ),
+        )
+        .expect("write history");
+
+        let mut reader = HistoryReader::default();
+        reader.read_incremental(&path).expect("read");
+        assert_eq!(reader.turns.len(), 1);
+        assert_eq!(reader.turns[0].step, 1);
+        assert_eq!(reader.turns[0].command, "cargo test");
+        assert_eq!(reader.turns[0].exit_code, Some(0));
+        // Only the last few output lines survive per turn.
+        assert_eq!(reader.turns[0].output_lines.len(), 5);
+        assert_eq!(reader.turns[0].output_lines.last().unwrap(), "line7");
+        let offset = reader.offset;
+        assert!(offset > 0);
+
+        // A second read with nothing appended parses nothing new.
+        reader.read_incremental(&path).expect("re-read");
+        assert_eq!(reader.turns.len(), 1);
+        assert_eq!(reader.offset, offset);
+
+        // Appended lines parse from the remembered offset; a torn final line
+        // is skipped without failing the read.
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("append");
+            writeln!(file, "{}", assistant("cargo build")).expect("turn");
+            writeln!(file, "{}", tool(1, "boom")).expect("result");
+            writeln!(file, "{{\"role\": \"assistant\", \"broken\"").expect("torn");
+        }
+        reader.read_incremental(&path).expect("incremental");
+        assert_eq!(reader.turns.len(), 2);
+        assert_eq!(reader.turns[1].step, 2);
+        assert_eq!(reader.turns[1].command, "cargo build");
+        assert_eq!(reader.turns[1].exit_code, Some(1));
+        assert_eq!(reader.turns[1].output_lines, vec!["boom".to_string()]);
+        assert!(reader.offset > offset);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The reader caps its memory: far more turns than fit stay on disk.
+    #[test]
+    fn test_history_reader_keeps_at_most_the_last_500_turns() {
+        let mut reader = HistoryReader::default();
+        let mut buf = String::new();
+        for i in 0..(MAX_TURNS_IN_MEMORY + 50) {
+            buf.push_str(
+                &serde_json::json!({"role": "assistant", "content": format!("turn {i}")})
+                    .to_string(),
+            );
+            buf.push('\n');
+        }
+        reader.consume_lines(&buf);
+        assert_eq!(reader.turns.len(), MAX_TURNS_IN_MEMORY);
+        assert_eq!(
+            reader.turns.last().unwrap().command,
+            format!("turn {}", MAX_TURNS_IN_MEMORY + 49)
+        );
+        assert_eq!(reader.turns.first().unwrap().step, 51);
+    }
+
+    /// One worker fits one line at any width: the op column absorbs the slack
+    /// and the line never overflows, dimmed for terminal workers.
+    #[test]
+    fn test_compact_row_fits_any_width() {
+        let live = Row::new("a1b2c3d4")
+            .task("Refactor the authentication middleware into smaller pieces")
+            .command("cargo test --all --verbose -- --nocapture")
+            .turns(37, 250)
+            .group("audits")
+            .build();
+        let done = Row::new("d4e5f6a7b8")
+            .status(RegistryStatus::Completed)
+            .task("Finished work")
+            .command("completed")
+            .turns(9, 100)
+            .build();
+
+        for width in [40usize, 60, 80, 120, 200] {
+            let row = fit_compact_row(&live, 1060, width);
+            assert!(
+                visible_width(&row) <= width,
+                "live row overflows {width}: {row:?}"
+            );
+            assert!(row.contains("a1b2c3d4"), "id lost:\n{row}");
+            assert!(row.contains("37/250"), "step/max lost:\n{row}");
+            if width >= 80 {
+                assert!(row.contains("[audits]"), "group lost:\n{row}");
+            }
+
+            let finished = fit_compact_row(&done, 1060, width);
+            assert!(
+                visible_width(&finished) <= width,
+                "done row overflows {width}: {finished:?}"
+            );
+            assert!(
+                finished.starts_with("\x1b[2m"),
+                "completed workers must dim:\n{finished:?}"
+            );
+        }
+        // The live row carries no dimming, but a live worker that stopped
+        // reporting (retired-soon) dims like a terminal one.
+        assert!(!fit_compact_row(&live, 1060, 120).starts_with("\x1b[2m"));
+        let stale = Row::new("stale001")
+            .task("Gone quiet")
+            .command("cargo test")
+            .turns(3, 100)
+            .updated_at(100)
+            .build();
+        assert!(
+            fit_compact_row(&stale, 10_000, 120).starts_with("\x1b[2m"),
+            "a worker quiet past the TTL must dim"
         );
     }
 }
