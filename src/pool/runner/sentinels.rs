@@ -207,10 +207,13 @@ fn peel_question(rest: &str) -> &str {
     rest.trim().trim_matches('"').trim_matches('\'').trim()
 }
 
-/// Whether `c` ends an unquoted shell command: a separator, a line break, or
-/// the ampersand of a `&&` pair.
+/// Whether `c` ends an unquoted shell command: a separator or a line break.
+///
+/// Spaces are part of the question, not a break in it — `echo
+/// ASK_ORCHESTRATOR: is this ok?` is one four-word question — so only the
+/// characters that would really end the command count.
 fn is_shell_separator(c: char) -> bool {
-    c.is_whitespace() || matches!(c, ';' | '|' | '&')
+    c == '\n' || c == '\r' || matches!(c, ';' | '|' | '&')
 }
 
 /// The angle-bracket templates of the system prompt, echoed back verbatim.
@@ -934,6 +937,11 @@ mod tests {
 
     #[test]
     fn an_ask_orchestrator_stops_at_the_first_unquoted_separator() {
+        // The gaps inside an unquoted question are its own, not separators.
+        assert_eq!(
+            parse_ask_orchestrator("echo ASK_ORCHESTRATOR: is this ok?"),
+            Some("is this ok?".to_string())
+        );
         assert_eq!(
             parse_ask_orchestrator("echo \"ASK_ORCHESTRATOR: q\"; ls"),
             Some("q".to_string())
