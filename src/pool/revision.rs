@@ -753,11 +753,14 @@ struct RetireCandidate {
 /// Two independent jobs, both cheap and bounded:
 ///
 /// * an **integrated** worker -- its row is `Completed`, and its `worker-<id>`
-///   branch is an ancestor of the base branch its row records *and* carries at
-///   least one commit beyond the commit it was dispatched from -- is retired
-///   outright: its commits are in the base branch, so branch, row, history,
-///   mailbox and scratch all go now. This is what keeps `list` showing only
-///   live and awaiting-integration workers, with no hiding logic anywhere.
+///   branch's work is already carried by the base branch its row records -- by
+///   ancestry, or by content, since a consolidator that takes a worker's change
+///   as a squash or a re-merge leaves the worker's tip unreachable -- *and* the
+///   branch carries at least one commit beyond the commit it was dispatched
+///   from -- is retired outright: its work is in the base branch, so branch,
+///   row, history, mailbox and scratch all go now. This is what keeps `list`
+///   showing only live and awaiting-integration workers, with no hiding logic
+///   anywhere.
 ///
 ///   Both halves of that proof are load-bearing. A worker that is running,
 ///   paused, interrupted, exhausted or failed is never retired here, whatever
@@ -842,10 +845,16 @@ pub fn sweep_retired_workers_in(root: &ScratchRoot, ack_dir: Option<&Path>) -> R
             });
     }
     for ((repo, base), candidates) in &groups {
-        // The probe failed: retire nothing, and never guess a repository.
-        let Some(merged) = merged_branch_tips(repo, base) else {
-            continue;
-        };
+        // A batched pre-pass: one `for-each-ref` proves for the whole group
+        // which branches the base carries by history, so the per-worker git
+        // process is only spent on the ones that needs the content proof.
+        // `None` means the probe itself failed, which is not the same as an
+        // empty set -- an empty set proves no branch is contained, while `None`
+        // proves nothing. A contained tip is still a fact the probe gave us
+        // (an ancestry proof is a proof whatever else git could not answer), so
+        // the group falls back to the shared predicate for the rest rather than
+        // retiring nothing.
+        let merged = merged_branch_tips(repo, base).unwrap_or_default();
         let ctx = RetireContext {
             repo: Some(repo.as_path()),
             ack_dir,
@@ -859,16 +868,31 @@ pub fn sweep_retired_workers_in(root: &ScratchRoot, ack_dir: Option<&Path>) -> R
         };
         for candidate in candidates {
             let branch = format!("worker-{}", candidate.id);
-            // Two proofs, not one: the branch is contained in the base *and* it
-            // carries at least one commit of its own. A branch still sitting on
-            // the commit it was dispatched from is contained in the base
-            // trivially -- the base contains that commit -- which is how a
+            // Two proofs, not one: the base carries the branch's work *and*
+            // the branch carries at least one commit of its own. A branch still
+            // sitting on the commit it was dispatched from is contained in the
+            // base trivially -- the base contains that commit -- which is how a
             // worker interrupted one second after dispatch used to be retired
             // as "integrated".
-            let Some(tip) = merged.get(&branch) else {
-                continue;
+            //
+            // "Carries the work" is the one shared definition
+            // (`super::merge::work_already_in`), the predicate a merge refuses a
+            // round without: the branch is an ancestor of the base, or merging
+            // it would change nothing. A branch the group probe already carried
+            // is answered from the tip it gave, which is the ancestry half of
+            // that predicate for free; every other branch is asked the whole
+            // question, which is what retires a worker the round integrated as a
+            // squash or a re-merge instead of stranding it on the books.
+            let carried = match merged.get(&branch) {
+                Some(tip) => tip_beyond_base(Some(tip), Some(&candidate.base_commit)),
+                None => {
+                    tip_beyond_base(
+                        branch_tip(repo, &branch).as_deref(),
+                        Some(&candidate.base_commit),
+                    ) && super::merge::work_already_in(repo, base, &branch)
+                }
             };
-            if !tip_beyond_base(Some(tip), Some(&candidate.base_commit)) {
+            if !carried {
                 continue;
             }
             retire_worker_with(root, &candidate.id, &ctx);
