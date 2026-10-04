@@ -1118,7 +1118,8 @@ impl WorktreeGuard {
         }
     }
 
-    /// Stage and commit the worktree at `path`, reporting what was left out.
+    /// Stage and commit the worktree at `path`, naming `branch` when this pass
+    /// created a commit on it and reporting what was left out.
     ///
     /// Split out of [`WorktreeGuard::commit_changes`] so the pool's `kill`
     /// path can commit the uncommitted work of a worker whose guard it does
@@ -1129,12 +1130,17 @@ impl WorktreeGuard {
     /// Every harness commit goes through here, so the staging rules of
     /// [`stage_commitable_changes_at`] hold for auto-checkpoints, the final
     /// commit and the checkpoint before a merge alike.
+    ///
+    /// Every harness commit goes through here, so the staging rules of
+    /// [`stage_commitable_changes_at`] hold for auto-checkpoints, the final
+    /// commit and the checkpoint before a merge alike.
     pub(crate) fn commit_all(
         path: &Path,
         base_commit: &str,
+        branch: &str,
         message: &str,
     ) -> Result<CommitReport> {
-        Self::commit_all_capped(path, base_commit, commit_file_cap_bytes(), message)
+        Self::commit_all_capped(path, base_commit, branch, commit_file_cap_bytes(), message)
     }
 
     /// [`WorktreeGuard::commit_all`] with the per-file cap in bytes supplied
@@ -1143,6 +1149,7 @@ impl WorktreeGuard {
     fn commit_all_capped(
         path: &Path,
         base_commit: &str,
+        branch: &str,
         cap_bytes: u64,
         message: &str,
     ) -> Result<CommitReport> {
@@ -1163,7 +1170,7 @@ impl WorktreeGuard {
 
         Self::commit_staged_at(path, message)?;
         Ok(CommitReport {
-            branch: None,
+            branch: Some(branch.to_string()),
             skipped,
         })
     }
@@ -1247,8 +1254,8 @@ impl WorktreeGuard {
         cap_bytes: u64,
         message: &str,
     ) -> Result<CommitReport> {
-        let mut report = Self::commit_all_capped(path, base_commit, cap_bytes, message)?;
-        if report.committed() || Self::branch_has_commits_at(repo_root, base_commit, branch) {
+        let mut report = Self::commit_all_capped(path, base_commit, branch, cap_bytes, message)?;
+        if !report.committed() && Self::branch_has_commits_at(repo_root, base_commit, branch) {
             report.branch = Some(branch.to_string());
         }
         Ok(report)
@@ -1322,6 +1329,10 @@ impl WorktreeGuard {
         }
         log_skipped(path, &skipped);
         if !keep.is_empty() {
+            // `-A` scoped to these pathspecs, so a path the worker staged and
+            // then deleted records the deletion: a plain `add` cannot name it
+            // any more, and the blob its earlier `add` left in the index would
+            // otherwise reach the commit anyway.
             run_pathspecs(path, "add", &["add"], &keep);
         }
         Ok(Staging {
@@ -1672,28 +1683,48 @@ const PATHSPEC_CHUNK: usize = 256;
 /// pathspec magic so a filename that starts with `:` or holds a glob character
 /// is never read as a pattern.
 ///
-/// A chunk git refuses is logged and skipped rather than propagated: the
-/// `git add -A` this replaces was ignored on failure too, and one unreadable
+/// A chunk git refuses is retried path by path, because git aborts the whole
+/// invocation when a single pathspec matches nothing -- a file that vanished
+/// between the status read and this pass, or a name that is not valid UTF-8 --
+/// and one such path must not cost the other 255 their place in the commit. A
+/// path that still fails alone is logged and skipped rather than propagated:
+/// the `git add -A` this replaces was ignored on failure too, and one unreadable
 /// path must not cost a worker its whole checkpoint.
 fn run_pathspecs(path: &Path, operation: &str, args: &[&str], paths: &[String]) {
     for chunk in paths.chunks(PATHSPEC_CHUNK) {
-        let specs: Vec<String> = chunk.iter().map(|p| format!(":(literal){p}")).collect();
-        let mut argv: Vec<&str> = args.to_vec();
-        argv.push("--");
-        argv.extend(specs.iter().map(String::as_str));
-        match git(path, operation, &argv) {
-            Ok(output) if output.status.success() => {}
-            Ok(output) => warn!(
+        if run_pathspec_chunk(path, operation, args, chunk) {
+            continue;
+        }
+        for single in chunk {
+            run_pathspec_chunk(path, operation, args, std::slice::from_ref(single));
+        }
+    }
+}
+
+/// Run one `git args… -- <pathspecs>` invocation, answering whether git took it.
+fn run_pathspec_chunk(path: &Path, operation: &str, args: &[&str], chunk: &[String]) -> bool {
+    let specs: Vec<String> = chunk.iter().map(|p| format!(":(literal){p}")).collect();
+    let mut argv: Vec<&str> = args.to_vec();
+    argv.push("--");
+    argv.extend(specs.iter().map(String::as_str));
+    match git(path, operation, &argv) {
+        Ok(output) if output.status.success() => true,
+        Ok(output) => {
+            warn!(
                 worktree = %path.display(),
                 paths = chunk.len(),
                 error = %String::from_utf8_lossy(&output.stderr).trim(),
                 "git {} could not stage every path it was given", operation
-            ),
-            Err(error) => warn!(
+            );
+            false
+        }
+        Err(error) => {
+            warn!(
                 worktree = %path.display(),
                 error = %error,
                 "git {} could not run", operation
-            ),
+            );
+            false
         }
     }
 }
@@ -2137,6 +2168,69 @@ mod tests {
             .join(format!("swe-lease-{tag}-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&path).expect("repository root must be creatable");
         path
+    }
+
+    /// A throwaway repository with one baseline commit, plus the scratch root
+    /// its checkouts are filed under. Both live under the process temp dir, so
+    /// the test never touches the real scratch base.
+    fn repo_with_worktree(tag: &str) -> (PathBuf, WorktreeGuard) {
+        let scratch = std::env::temp_dir()
+            .join(format!("swe-guard-{tag}-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&scratch).expect("create scratch root");
+        let repo = scratch.join("repo");
+        std::fs::create_dir_all(&repo).expect("create repo");
+        git(&repo, "init", &["init", "-b", "master"]);
+        git(&repo, "config", &["config", "user.name", "mini-swe-test"]);
+        git(&repo, "config", &["config", "user.email", "test@localhost"]);
+        std::fs::write(repo.join("README.md"), "# scratch\n").expect("seed file");
+        git(&repo, "add", &["add", "README.md"]);
+        git(&repo, "commit", &["commit", "-m", "baseline"]);
+        let root = scratch.join("worktrees");
+        std::fs::create_dir_all(&root).expect("create worktree root");
+        let guard = WorktreeGuard::new_in(&ScratchRoot::new(&root), &repo, tag)
+            .expect("worktree must be created");
+        (scratch, guard)
+    }
+
+    /// `commit_all` is what the pool's kill path and the phase checkpoints
+    /// consult, so its report is the only signal those callers have that a
+    /// commit was created: a dirty worktree must name the branch, a clean one
+    /// must not.
+    #[test]
+    fn commit_all_reports_the_commit_it_made() {
+        let (scratch, mut guard) = repo_with_worktree("commit-all-report");
+
+        let clean = WorktreeGuard::commit_all(
+            &guard.path,
+            &guard.base_commit,
+            &guard.branch,
+            "worker: nothing to do",
+        )
+        .expect("a clean tree is not an error");
+        assert!(
+            !clean.committed(),
+            "a clean worktree must not report a commit: {clean:?}"
+        );
+
+        std::fs::write(guard.path.join("edit.rs"), "fn main() {}\n").expect("write edit");
+        let report = WorktreeGuard::commit_all(
+            &guard.path,
+            &guard.base_commit,
+            &guard.branch,
+            "worker: checkpoint",
+        )
+        .expect("commit must succeed");
+        assert!(
+            report.committed(),
+            "the commit was created and must be reported: {report:?}"
+        );
+        assert_eq!(
+            report.branch.as_deref(),
+            Some(guard.branch.as_str()),
+            "the report must name the branch the commit landed on"
+        );
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 
     /// The worker's dir is leased once and held for its whole lifetime, so a

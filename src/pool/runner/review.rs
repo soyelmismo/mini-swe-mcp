@@ -1598,12 +1598,13 @@ impl WorkerPool {
         {
             let path = worktree.path.clone();
             let base_commit = worktree.base_commit.clone();
+            let branch = worktree.branch.clone();
             let message = format!(
                 "worker({}): implementation phase completed (checkpoint)",
                 worker_id
             );
             let committed = tokio::task::spawn_blocking(move || {
-                crate::worktree::WorktreeGuard::commit_all(&path, &base_commit, &message)
+                crate::worktree::WorktreeGuard::commit_all(&path, &base_commit, &branch, &message)
             })
             .await
             .unwrap_or(Ok(CommitReport::default()));

@@ -2422,12 +2422,10 @@ impl WorkerPool {
             return;
         }
         let worker_id = id.to_string();
+        let branch = format!("worker-{worker_id}");
+        let message = format!("worker({worker_id}): checkpoint before kill");
         let committed = tokio::task::spawn_blocking(move || {
-            WorktreeGuard::commit_all(
-                &path,
-                "",
-                &format!("worker({worker_id}): checkpoint before kill"),
-            )
+            WorktreeGuard::commit_all(&path, "", &branch, &message)
         })
         .await;
         match committed {

@@ -2144,12 +2144,13 @@ impl<'a> TurnEngine<'a> {
                     {
                         let path = self.worktree.path.clone();
                         let base_commit = self.worktree.base_commit.clone();
+                        let branch = self.worktree.branch.clone();
                         let message = format!(
                             "worker({}): checkpoint step {} before pause (error: {})",
                             self.worker_id, *self.step, e
                         );
                         let committed = tokio::task::spawn_blocking(move || {
-                            WorktreeGuard::commit_all(&path, &base_commit, &message)
+                            WorktreeGuard::commit_all(&path, &base_commit, &branch, &message)
                         })
                         .await
                         .unwrap_or(Ok(CommitReport::default()));
