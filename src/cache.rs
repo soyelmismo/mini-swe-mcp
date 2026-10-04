@@ -324,7 +324,17 @@ pub(crate) fn repo_key(repo: &Path) -> anyhow::Result<String> {
 /// lease order, not by admission slot: a live worker holds one exclusively for
 /// its whole lifetime, so two workers of one repository can never share a dir.
 pub(crate) fn build_dir(repo: &Path, index: usize) -> anyhow::Result<PathBuf> {
-    Ok(crate::worktree::swe_base_dir().join(format!("swe-target-{}-{index}", repo_key(repo)?)))
+    build_dir_in(repo, &crate::worktree::swe_base_dir(), index)
+}
+
+/// [`build_dir`] under an explicit scratch `base`, so tests can lease slots
+/// without mutating the process-global `SWE_TEMP_DIR`.
+pub(crate) fn build_dir_in(
+    repo: &Path,
+    base: &Path,
+    index: usize,
+) -> anyhow::Result<PathBuf> {
+    Ok(base.join(format!("swe-target-{}-{index}", repo_key(repo)?)))
 }
 
 /// Remove every build directory leased for `repo`.
@@ -509,7 +519,14 @@ impl BuildDirLease {
     /// Lease the lowest-indexed free directory of `repo`, creating a new one
     /// when every directory the repository already has is live.
     pub fn acquire(repo: &Path) -> std::io::Result<Self> {
-        Self::acquire_with_cap(repo, slot_max_bytes())
+        Self::acquire_in(repo, &crate::worktree::swe_base_dir(), slot_max_bytes())
+    }
+
+    /// [`acquire`] against an explicit scratch `base`, so tests never have to
+    /// mutate the process-global `SWE_TEMP_DIR`. [`acquire`] delegates here
+    /// unchanged.
+    pub fn acquire_in(repo: &Path, base: &Path, max_bytes: u64) -> std::io::Result<Self> {
+        Self::acquire_with_cap_in(repo, base, max_bytes)
     }
 
     /// Lease `repo`'s lowest free slot, emptying it first when it holds more
@@ -520,15 +537,18 @@ impl BuildDirLease {
     /// other test in the binary shares; [`acquire`] passes the value parsed from
     /// [`SLOT_MAX_GIB_ENV`].
     fn acquire_with_cap(repo: &Path, max_bytes: u64) -> std::io::Result<Self> {
-        let base = crate::worktree::swe_base_dir();
-        std::fs::create_dir_all(&base)?;
+        Self::acquire_with_cap_in(repo, &crate::worktree::swe_base_dir(), max_bytes)
+    }
+
+    fn acquire_with_cap_in(repo: &Path, base: &Path, max_bytes: u64) -> std::io::Result<Self> {
+        std::fs::create_dir_all(base)?;
         // The sweep lock keeps eviction from removing a directory between the
         // probe below and the lock that proves it free.
         let global = lock_file(&base.join(".swe-target-sweep.lock"))?;
         flock(&global, true, false)?;
         let mut index = 0usize;
         let lease = loop {
-            let dir = build_dir(repo, index).map_err(std::io::Error::other)?;
+            let dir = build_dir_in(repo, base, index).map_err(std::io::Error::other)?;
             std::fs::create_dir_all(&dir)?;
             let lock = lock_file(&build_dir_lock_path(&dir))?;
             if flock(&lock, true, true).is_ok() {
@@ -873,36 +893,29 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn sweep_preserves_leased_targets_and_removes_idle_targets() {
-        crate::agent::env::with_env_lock(|| {
-            let base = crate::worktree::swe_base_dir()
-                .join(format!("swe-sweep-test-{}", uuid::Uuid::new_v4()));
-            std::fs::create_dir_all(&base).unwrap();
-            let previous = std::env::var("SWE_TEMP_DIR").ok();
-            // SAFETY: the environment lock is held for the whole closure.
-            unsafe { std::env::set_var("SWE_TEMP_DIR", &base) };
-            let lease = BuildDirLease::acquire(&base).unwrap();
-            let target = lease.dir().to_path_buf();
-            std::fs::write(target.join("artifact"), b"build").unwrap();
-            sweep_targets(&base, std::time::Duration::ZERO, 0).unwrap();
-            assert!(
-                target.join("artifact").exists(),
-                "A leased dir must never be swept"
-            );
-            drop(lease);
-            sweep_targets(&base, std::time::Duration::ZERO, 0).unwrap();
-            assert!(
-                !target.exists(),
-                "A released dir must be swept once it is idle"
-            );
-            // SAFETY: the environment lock is still held.
-            unsafe {
-                match previous {
-                    Some(value) => std::env::set_var("SWE_TEMP_DIR", value),
-                    None => std::env::remove_var("SWE_TEMP_DIR"),
-                }
-            }
-            let _ = std::fs::remove_dir_all(base);
-        });
+        let base = std::env::temp_dir().join(format!("swe-sweep-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let lease = BuildDirLease::acquire_in(&repo, &base, u64::MAX).unwrap();
+        let target = lease.dir().to_path_buf();
+        assert!(
+            target.starts_with(&base),
+            "the leased slot must live under the explicit base, got {target:?}"
+        );
+        std::fs::write(target.join("artifact"), b"build").unwrap();
+        sweep_targets(&base, std::time::Duration::ZERO, 0).unwrap();
+        assert!(
+            target.join("artifact").exists(),
+            "A leased dir must never be swept"
+        );
+        drop(lease);
+        sweep_targets(&base, std::time::Duration::ZERO, 0).unwrap();
+        assert!(
+            !target.exists(),
+            "A released dir must be swept once it is idle"
+        );
+        let _ = std::fs::remove_dir_all(base);
     }
 
     /// A repository of this test's own, so the pool of build dirs keyed to it
