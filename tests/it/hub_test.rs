@@ -1111,7 +1111,11 @@ async fn a_checkpointed_worker_survives_hub_sigkill_and_revision() {
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let api_base = format!("http://{}/v1", listener.local_addr().unwrap());
-    let llm = tokio::spawn(serve_checkpoint_revision_script(listener));
+    let turn20_in_hand = std::sync::Arc::new(tokio::sync::Notify::new());
+    let llm = tokio::spawn(serve_checkpoint_revision_script(
+        listener,
+        turn20_in_hand.clone(),
+    ));
     let command = || {
         let mut cmd = tokio::process::Command::new(common::binary_path());
         cmd.env("SWE_HUB_DIR", &hub)
@@ -1211,6 +1215,14 @@ async fn a_checkpointed_worker_survives_hub_sigkill_and_revision() {
         Some(common::host_of_this_process().as_str())
     );
     assert_eq!(checkpoint.verify, None);
+    // The worker is now blocked on turn 20's unanswered call: kill the daemon
+    // exactly there, so the worker is interrupted mid-call rather than having
+    // already retried and finished. The notify is the only signal that turn
+    // 20's request is actually in hand, so the kill cannot race the worker's
+    // next turn.
+    tokio::time::timeout(std::time::Duration::from_secs(15), turn20_in_hand.notified())
+        .await
+        .expect("turn 20's call must reach the script before the kill");
     first.kill().await.unwrap();
     first.wait().await.unwrap();
 
@@ -1303,7 +1315,15 @@ async fn a_checkpointed_worker_survives_hub_sigkill_and_revision() {
 /// Script the fake LLM for `a_checkpointed_worker_survives_hub_sigkill_and_revision`:
 /// turn 19 writes the checkpoint marker, turn 20 is deliberately left unanswered
 /// so the hub can be SIGKILLed mid-call, and turn 21 finishes the worker.
-async fn serve_checkpoint_revision_script(listener: TcpListener) {
+///
+/// `turn20_in_hand` fires the moment turn 20's request has been read, so the
+/// test can SIGKILL the daemon exactly while the worker is blocked on that
+/// call instead of racing it through the retry that would otherwise consume
+/// turn 21 and finish before the kill lands.
+async fn serve_checkpoint_revision_script(
+    listener: TcpListener,
+    turn20_in_hand: std::sync::Arc<tokio::sync::Notify>,
+) {
     for turn in 1..=21 {
         let (mut socket, _) = listener.accept().await.unwrap();
         // A SIGKILL can drop the connection mid-request: skip that turn and keep
@@ -1312,14 +1332,19 @@ async fn serve_checkpoint_revision_script(listener: TcpListener) {
             continue;
         }
         if turn == 20 {
-            // Hold the post-checkpoint LLM call open without answering, so the
-            // worker stays blocked mid-call until the daemon (and the in-process
-            // worker) is SIGKILLed. Dropping the socket here would let the
-            // worker's retry consume turn 21 and finish before the kill lands,
-            // and this test must observe an *interrupted* worker.
+            // The worker is now blocked reading this call's stream. Signal the
+            // test to kill the daemon, then hold the connection open without
+            // answering until the daemon (and the in-process worker) dies.
+            turn20_in_hand.notify_waiters();
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
             continue;
         }
+        // A real model takes on the order of a second per turn; the fake
+        // answers instantly, which would finish all twenty turns and flush a
+        // step to the registry before the test's step poll sees one. Pacing
+        // the turns past the registry's step-coalescing window keeps the
+        // persisted step counter (the contract the resume relies on) real.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         let command = match turn {
             19 => "echo checkpoint > kept.txt".to_string(),
             21 => "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT".to_string(),
@@ -1370,7 +1395,10 @@ async fn the_revision_script_answers_after_a_connection_closed_mid_request() {
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(serve_checkpoint_revision_script(listener));
+    let server = tokio::spawn(serve_checkpoint_revision_script(
+        listener,
+        std::sync::Arc::new(tokio::sync::Notify::new()),
+    ));
 
     for turn in 1..=18 {
         assert!(ask(addr).await.contains(&format!("echo turn {turn}")));
