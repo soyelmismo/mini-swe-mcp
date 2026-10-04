@@ -659,13 +659,19 @@ fn list_content_lines(
                 .first()
                 .and_then(|w| w.repo_path.as_deref())
                 .unwrap_or(DEFAULT_REPO_KEY);
-            lines.push(truncate_visible(&format!("repo: {repo}"), inner));
+            // The same sanitizing the interactive list applies: a heading is
+            // drawn verbatim into a terminal, so nothing the registry row
+            // carries may carry a terminal command of its own.
+            lines.push(truncate_visible(
+                &format!("repo: {}", sanitize_text(repo)),
+                inner,
+            ));
         }
         let counts = group_counts(workers, use_color);
         let header = if counts.is_empty() {
-            name.clone()
+            sanitize_text(name)
         } else {
-            format!("{name}  {counts}")
+            format!("{}  {counts}", sanitize_text(name))
         };
         lines.push(truncate_visible(&header, inner));
         for w in workers {
@@ -2502,18 +2508,44 @@ mod tests {
             "the output must still show: {detail}"
         );
 
-        // The list heading shows the group and repo the worker chose, too.
+        // The headings show the group and repo the row carries, too -- in the
+        // interactive list and in the plain dashboard alike, and both draw
+        // into a terminal. A second repository makes the `repo:` line render,
+        // so the repo path is exercised beside the group name.
         let mut grouped = entry;
-        grouped.group = Some("round52".to_string());
-        let grouped_slice = [grouped];
-        let (lines, _) = build_list_lines(&grouped_slice, 1060, 200, true);
-        let heading = match &lines[0] {
-            ListLine::Header(h) => h.clone(),
-            ListLine::Worker(_) => String::new(),
-        };
+        grouped.group = Some(format!("round52{hostile}"));
+        grouped.repo_path = Some(format!("local{hostile}"));
+        let mut second = Row::new("hostile2")
+            .task("second")
+            .command("true")
+            .repo("other")
+            .build();
+        second.group = grouped.group.clone();
+        let grouped_slice = [grouped, second];
+        let headings: Vec<String> = build_list_lines(&grouped_slice, 1060, 200, true)
+            .0
+            .iter()
+            .filter_map(|line| match line {
+                ListLine::Header(h) => Some(h.clone()),
+                ListLine::Worker(_) => None,
+            })
+            .chain(
+                render_dashboard_with_width(&grouped_slice, 1060, false, 1060)
+                    .lines()
+                    .map(str::to_string),
+            )
+            .collect();
         assert!(
-            !heading.contains('\x1b'),
-            "no escape may survive into a list heading: {heading:?}"
+            headings.iter().all(|h| !h.contains('\x1b')),
+            "no escape may survive into a heading: {headings:?}"
+        );
+        assert!(
+            headings.iter().any(|h| h.contains("round52")),
+            "the group heading must still show: {headings:?}"
+        );
+        assert!(
+            headings.iter().any(|h| h.contains("repo:")),
+            "the repo heading must still show: {headings:?}"
         );
     }
 
