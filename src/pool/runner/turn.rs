@@ -467,14 +467,14 @@ pub(super) const LOG_OUTPUT_BYTES: usize = 400;
 /// Blank lines carry nothing, and the bound is applied after the line pick so a
 /// single very long line cannot smuggle a whole transcript into one field.
 pub(super) fn log_output_tail(output: &str) -> String {
-    let mut kept: Vec<&str> = Vec::with_capacity(LOG_OUTPUT_LINES);
+    let mut kept: VecDeque<&str> = VecDeque::with_capacity(LOG_OUTPUT_LINES + 1);
     for line in output.lines().filter(|line| !line.trim().is_empty()) {
-        kept.push(line);
         if kept.len() == LOG_OUTPUT_LINES {
-            break;
+            kept.pop_front();
         }
+        kept.push_back(line);
     }
-    bounded_tail(&kept.join("\n"), LOG_OUTPUT_BYTES)
+    bounded_tail(&kept.into_iter().collect::<Vec<_>>().join("\n"), LOG_OUTPUT_BYTES)
 }
 
 /// The nudge a first loop detection injects: name the loop, name what the
@@ -3688,13 +3688,48 @@ mod tests {
     use super::{
         EDIT_PLAN_FILES, EDIT_PLAN_PATH_BYTES, LlmResponse, LoopDetector, LoopVerdict,
         MAX_TURNS_LIMIT, ProgressSummary, ProgressWatch, READ_ONLY_NUDGE_TURNS, REPEAT_BLOCK_LIMIT,
-        REPORT_SCAN_BYTES, ReadOnlyNudge, ReadOnlyStreak, ReadOnlyThresholds,
-        STAGNATION_SAMPLE_TURNS, TASK_QUESTION_BYTES, append_report_text, edit_plan,
-        edit_plan_text, extension_budget, grant_extension, isolation_block, loop_nudge_text,
-        loop_pause_question, named_file_defaults, normalize_command_base, output_digest,
-        parse_shortstat, parse_threshold, read_only_nudge_text, read_only_pause_question,
-        read_only_plan_text, read_only_thresholds, summarized_task, task_names_files,
+        LOG_OUTPUT_BYTES, LOG_OUTPUT_LINES, REPORT_SCAN_BYTES, ReadOnlyNudge, ReadOnlyStreak,
+        ReadOnlyThresholds, STAGNATION_SAMPLE_TURNS, TASK_QUESTION_BYTES, append_report_text,
+        edit_plan, edit_plan_text, extension_budget, grant_extension, isolation_block,
+        log_output_tail, loop_nudge_text, loop_pause_question, named_file_defaults,
+        normalize_command_base, output_digest, parse_shortstat, parse_threshold,
+        read_only_nudge_text, read_only_pause_question, read_only_plan_text,
+        read_only_thresholds, summarized_task, task_names_files,
     };
+
+    /// A verify that ran thousands of test lines must not put them in the log:
+    /// the tracing line carries the tail only, and the worker still gets the
+    /// whole (separately truncated) output through its observation.
+    #[test]
+    fn the_log_tail_keeps_the_end_of_a_long_output_and_nothing_more() {
+        let mut output = String::new();
+        for i in 0..5000 {
+            output.push_str(&format!("test suite::case_{i} ... ok\n"));
+        }
+        let tail = log_output_tail(&output);
+
+        assert!(
+            tail.len() <= LOG_OUTPUT_BYTES,
+            "a log tail must stay under {LOG_OUTPUT_BYTES} bytes, got {}",
+            tail.len()
+        );
+        assert!(
+            !tail.contains("case_0 "),
+            "the head of a long output must not reach the log"
+        );
+        assert!(
+            tail.contains("case_4999"),
+            "the log must name the last line the run ended with"
+        );
+
+        // Blank lines carry nothing, so they never consume one of the five.
+        let padded = format!("a\n\n   \nb\n\nc\n\nd\n\ne\n\nf\n");
+        assert_eq!(
+            log_output_tail(&padded),
+            "b\nc\nd\ne\nf",
+            "the tail must be the last {LOG_OUTPUT_LINES} non-empty lines"
+        );
+    }
 
     /// A response with no tool call and no reasoning, for scan-buffer tests.
     fn scanned(content: &str, command: Option<&str>) -> LlmResponse {

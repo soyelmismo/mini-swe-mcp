@@ -1096,7 +1096,7 @@ pub(crate) fn rotate_log(path: &Path) -> std::io::Result<bool> {
     }
 }
 
-/// Where [`rotate_log`] moves the log it replaces: the same directory, the same
+/// Where a rotation moves the log it replaces: the same directory, the same
 /// stem, one `.1` generation.
 pub fn rotated_log_path(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_os_string();
@@ -1456,6 +1456,74 @@ fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A log at or below the cap is left exactly as it is; the cap is what
+    /// rotates, and a log under it must survive untouched.
+    #[test]
+    fn a_log_below_the_cap_is_not_rotated() {
+        let scratch = crate::test_support::TestScratch::new("hub-log-under-cap");
+        let log = scratch.path().join("hub.log");
+        std::fs::write(&log, "under the cap").expect("seed the log");
+
+        assert!(!rotate_log(&log).expect("rotate"));
+        assert!(log.is_file(), "the log must survive below the cap");
+        assert!(
+            !rotated_log_path(&log).exists(),
+            "no generation may be created below the cap"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&log).expect("read the log"),
+            "under the cap",
+            "a log below the cap must keep its content"
+        );
+    }
+
+    /// Past the cap the log is retired to `hub.log.1` and the caller opens a
+    /// fresh one; a second oversized generation replaces the first instead of
+    /// piling up, so the directory never holds more than two.
+    #[test]
+    fn an_oversized_log_rotates_and_keeps_one_previous_generation() {
+        let scratch = crate::test_support::TestScratch::new("hub-log-rotate");
+        let log = scratch.path().join("hub.log");
+        let previous = rotated_log_path(&log);
+        let oversize = vec![b'x'; (LOG_ROTATE_BYTES + 1) as usize];
+        std::fs::write(&log, &oversize).expect("seed the oversized log");
+
+        assert!(rotate_log(&log).expect("rotate the oversized log"));
+        assert_eq!(
+            std::fs::read(&previous).expect("read the rotated generation"),
+            oversize,
+            "the whole oversized log must be kept as hub.log.1"
+        );
+        // The caller reopens the path: it is now a new, empty file.
+        std::fs::write(&log, b"fresh\n").expect("start the new generation");
+        assert!(previous.is_file(), "the previous generation must survive");
+
+        // A second oversized log replaces that generation rather than adding
+        // a second one.
+        std::fs::write(&log, vec![b'y'; (LOG_ROTATE_BYTES + 1) as usize]).expect("seed again");
+        assert!(rotate_log(&log).expect("rotate the second time"));
+        assert_eq!(
+            std::fs::metadata(&previous).expect("stat the generation").len(),
+            LOG_ROTATE_BYTES + 1,
+            "hub.log.1 must hold the newest oversized log"
+        );
+        // Rotation leaves the name free for the caller's fresh file; nothing
+        // else is created, so a second generation can never accumulate.
+        assert!(
+            !log.exists(),
+            "rotation leaves the log name free for the caller's fresh file"
+        );
+        let kept: Vec<_> = std::fs::read_dir(scratch.path())
+            .expect("list the hub dir")
+            .map(|entry| entry.expect("dir entry").file_name())
+            .collect();
+        assert_eq!(
+            kept,
+            vec![std::ffi::OsString::from("hub.log.1")],
+            "only the retired generation may remain, found {kept:?}"
+        );
+    }
 
     /// The abstract-namespace fallback (used when no short writable directory
     /// exists, e.g. inside a sandbox) binds and accepts like a path socket.
