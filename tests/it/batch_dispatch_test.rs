@@ -154,3 +154,36 @@ async fn shared_top_level_values_apply_as_defaults() {
 
     reap(&owned, &worker_ids(&payload)).await;
 }
+/// The batch answer names the round it dispatched into when every entry agrees
+/// on one group, because that is what a `--quiet` caller needs to wait with
+/// `watch --group <g> --all`; a batch split across two groups names none, so no
+/// group is silently left unwatched.
+#[tokio::test]
+async fn a_batch_answer_names_its_round_only_when_the_entries_agree() {
+    let dir = TempDir::new_in_tmp("batch-mcp-round");
+    let repo = scratch_repo(dir.path());
+    let owned = IsolatedPool::new(8, "batch-mcp-round-pool");
+    let server = McpServer::new(owned.pool.clone(), "ninja".to_string());
+
+    let repo_path = repo.to_string_lossy().into_owned();
+    let one_round = dispatch_batch(
+        &server,
+        json!([{ "task": "a" }, { "task": "b" }]),
+        json!({ "repo_path": repo_path.clone(), "group": "round-1" }),
+    )
+    .await;
+    assert_eq!(one_round["group"], json!("round-1"), "{one_round}");
+    reap(&owned, &worker_ids(&one_round)).await;
+
+    let two_rounds = dispatch_batch(
+        &server,
+        json!([{ "task": "c" }, { "task": "d", "group": "round-2" }]),
+        json!({ "repo_path": repo_path, "group": "round-1" }),
+    )
+    .await;
+    assert!(
+        two_rounds.get("group").is_none(),
+        "two groups have no single round to wait on: {two_rounds}"
+    );
+    reap(&owned, &worker_ids(&two_rounds)).await;
+}

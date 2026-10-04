@@ -20,7 +20,7 @@ mod target;
 pub use dispatch::parse_batch_tasks;
 
 /// Dispatch usage line, shared by `--help` and the missing-task error.
-pub const DISPATCH_USAGE: &str = "dispatch <task> | dispatch -f <tasks.yaml> [--model <model>] [--review-after <model>] [--repo <repo>] [--max-turns <n>] [--group <group>] [--role <role>] [--consolidate[=<model>]] [--consolidate-verify <cmd>] [--offline] [--verify <cmd>] [--quiet] (task: ONE focused concern, scoped files, acceptance gate; -f runs a YAML/JSON list, '-' reads stdin; --quiet prints only the worker id(s))";
+pub const DISPATCH_USAGE: &str = "dispatch <task> | dispatch -f <tasks.yaml> [--model <model>] [--review-after <model>] [--repo <repo>] [--max-turns <n>] [--group <group>] [--role <role>] [--consolidate[=<model>]] [--consolidate-verify <cmd>] [--offline] [--verify <cmd>] [--quiet] (task: ONE focused concern, scoped files, acceptance gate; -f runs a YAML/JSON list, '-' reads stdin; --quiet prints only the worker id(s) on stdout, with a watch reminder on stderr)";
 
 /// Consolidate usage line, shared by `--help` and the missing-group error.
 pub const CONSOLIDATE_USAGE: &str = "consolidate --group <group> [--model <model>] [--verify <cmd>] [--max-turns <n>] | consolidate --group <group> --set [--model <model>] [--verify <cmd>] (--set amends the pending round's auto-consolidation settings)";

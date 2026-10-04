@@ -668,7 +668,10 @@ pub fn has_unshare() -> bool {
 /// wrapping layer must not re-interpret it: single quotes suppress all
 /// expansion, and an embedded `'` is closed, escaped and reopened (the standard
 /// `'"'"'` dance).
-fn shell_quote(value: &str) -> String {
+///
+/// Public because a printed command line is built from caller-supplied text in
+/// more than one place, and every one of them must quote the same way.
+pub fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
 
