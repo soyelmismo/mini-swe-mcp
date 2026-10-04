@@ -83,13 +83,12 @@ pub(crate) fn select_security_reviewer(
     manifest: &ModelManifest,
     default_model: &str,
 ) -> ReviewerChoice {
-    // A `default_model` the catalog does not define is a typo, and it must not
-    // silently disarm the audit: `resolve_model` passes an unknown name through
-    // verbatim, so the review would be sent to a model id no provider serves,
-    // fail quietly, and record no findings while the worker completes. An
-    // unresolvable name is therefore ignored and the dispatch default audits
-    // instead; `ModelManifest::validate` names the typo to the operator.
-    match mode_default_reviewer("security", manifest).filter(|alias| manifest.knows_model(alias)) {
+    // `mode_default_reviewer` already ignores a `default_model` the catalog
+    // cannot resolve: `resolve_model` passes an unknown name through verbatim,
+    // so the review would be sent to a model id no provider serves, fail
+    // quietly, and record no findings while the worker completes -- the audit
+    // silently gone. The dispatch default audits instead.
+    match mode_default_reviewer("security", manifest) {
         Some(alias) => ReviewerChoice {
             model: manifest.resolve_model(&alias).0,
             reason: "security mode's default_model",
@@ -304,7 +303,12 @@ pub fn mode_default_reviewer(
         .review_mode(name)
         .and_then(|def| def.default_model.clone())
         .map(|m| m.trim().to_string())
-        .filter(|m| !m.is_empty())
+        // A name the catalog cannot resolve is not a reviewer: `resolve_model`
+        // would pass it through verbatim, so the review would be sent to a
+        // model id no provider serves, fail quietly, and record no findings
+        // while the worker completes. Every caller falls back to its own
+        // default instead, and `ModelManifest::validate` names the typo.
+        .filter(|m| !m.is_empty() && manifest.knows_model(m))
 }
 
 /// Whether `requested` names a model the manifest knows: an alias, or a full

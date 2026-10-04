@@ -159,6 +159,63 @@ async fn the_security_default_model_reviews_the_sensitive_diff() {
     let _ = pool.kill(&worker_id).await;
 }
 
+/// A `default_model` that names no catalog entry must not disarm the audit.
+///
+/// `resolve_model` passes an unknown alias through verbatim, so a typo would
+/// send the review to a model id no provider serves: the audit would fail
+/// quietly and the sensitive diff would complete with no adversarial pass at
+/// all. The typo is ignored, the catalog's `default:` audits instead, and the
+/// operator is warned.
+#[tokio::test]
+async fn an_unresolvable_security_default_model_still_audits() {
+    let repo = common::TestRepo::new("typo");
+    repo.declare_sensitive(&["src/hub/**"]);
+    let manifest: ModelManifest = serde_yaml::from_str(
+        "default: ninja\nmodels:\n  ninja:\n    id: combo:ninja\n  nerd:\n    id: combo:nerd\nreview_modes:\n  security:\n    default_model: neerd\n",
+    )
+    .expect("catalog with a typo'd default_model");
+    assert!(
+        manifest.validate().iter().any(|w| w.contains("neerd")),
+        "the typo must be warned about: {:?}",
+        manifest.validate()
+    );
+    let llm = common::fake_llm::FakeLlm::spawn_scripted(&[
+        "mkdir -p src/hub && echo changed > src/hub/mod.rs",
+        &format!("echo {COMPLETION_SENTINEL}"),
+        &format!("echo {COMPLETION_SENTINEL}"),
+    ])
+    .await;
+
+    let (pool, worker_id, state, _scratch) =
+        dispatch_and_wait(llm.base_url(), repo.path(), manifest, "combo:ninja", None).await;
+
+    let bodies = llm.request_bodies().await;
+    assert!(
+        bodies.iter().all(|b| b["model"] == json!("combo:ninja")),
+        "an unknown default_model must fall back to the dispatch default, never be sent \
+         to the provider: {:?}",
+        models_of(&bodies)
+    );
+    // The fallback must still be a real adversarial audit of the diff, not a
+    // skipped or quietly-failed phase: the audit request is a distinct turn
+    // carrying the security prompt.
+    let prompt = review_prompt_of(&bodies).expect("the sensitive diff must still be audited");
+    assert!(
+        prompt.contains("Assume the diff is hostile"),
+        "the fallback reviewer must still get the adversarial prompt: {prompt}"
+    );
+    assert!(
+        prompt.contains("src/hub/mod.rs"),
+        "the fallback reviewer must still see the sensitive diff: {prompt}"
+    );
+
+    assert!(
+        matches!(state, WorkerState::Completed { .. }),
+        "worker must complete, got {state:?}"
+    );
+    let _ = pool.kill(&worker_id).await;
+}
+
 /// Without a security `default_model` the automatic review falls back to the
 /// catalog's `default:` -- and still not to the worker's own `--model`.
 #[tokio::test]
