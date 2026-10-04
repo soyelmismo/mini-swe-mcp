@@ -103,7 +103,11 @@ fn a_dropped_checkout_fixture_leaves_no_checkout_and_no_companion() {
     }
 
     drop(repo);
-    assert!(!exists(&checkout), "{} outlived its fixture", checkout.display());
+    assert!(
+        !exists(&checkout),
+        "{} outlived its fixture",
+        checkout.display()
+    );
     assert!(
         !exists(&guard_root),
         "{} outlived its fixture",
