@@ -3162,6 +3162,12 @@ impl<'a> TurnEngine<'a> {
     /// how many files went in and names the base commit it can diff against to
     /// see the whole change set.
     ///
+    /// The commit also refuses what must never reach history -- a file over the
+    /// commit cap, a compile cache under a tool home the worker pointed inside
+    /// its worktree -- and names each refused path in the same notice, so the
+    /// model learns where its files went instead of re-running the command that
+    /// produced them.
+    ///
     /// `commit_changes` shells out to git, so it runs off the runtime thread.
     async fn checkpoint(&mut self) {
         let message = format!(
