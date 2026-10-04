@@ -26,18 +26,29 @@ fn run(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).to_string()
 }
 
+/// A throwaway repository plus the scratch root its worktrees live under.
+///
+/// Every checkout this fixture drives is built with
+/// [`WorktreeGuard::new_in`] over a root the fixture owns and removes, so the
+/// suite never files a `swe-wt-*` checkout or its `swe-tmp-*` companion in the
+/// real scratch base that [`mini_swe_mcp::worktree::swe_base_dir`] resolves.
 struct TestRepo {
     dir: PathBuf,
+    root: PathBuf,
 }
 
 impl TestRepo {
     fn new(prefix: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!(
+        let unique = format!(
             "swe-test-repo-{prefix}-{}-{}",
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::SeqCst)
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
+        );
+        // One parent per fixture holds both the repository and the worktree
+        // scratch root, so `Drop` takes the pair with a single removal.
+        let base = std::env::temp_dir().join(unique);
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join("repo");
         std::fs::create_dir_all(&dir).unwrap();
         run(&dir, &["init", "-b", "master"]);
         run(&dir, &["config", "user.name", "mini-swe-test"]);
@@ -48,20 +59,40 @@ impl TestRepo {
         std::fs::write(&readme, "# Test Repository\nInitial baseline content\n").unwrap();
         run(&dir, &["add", "README.md"]);
         run(&dir, &["commit", "-m", "Initial baseline commit"]);
-        Self { dir }
+        Self { dir, root: base }
     }
 
     fn path(&self) -> &Path {
         &self.dir
     }
+
+    /// The scratch root every checkout of this repository is created under.
+    fn scratch(&self) -> mini_swe_mcp::worktree::ScratchRoot {
+        mini_swe_mcp::worktree::ScratchRoot::new(&self.root)
+    }
+
+    /// A worker checkout of this repository, isolated from the real scratch base.
+    fn guard(&self, worker_id: &str) -> WorktreeGuard {
+        WorktreeGuard::new_in(&self.scratch(), &self.dir, worker_id)
+            .expect("worktree creation failed")
+    }
+
+    /// Re-attach to the branch [`Self::guard`] preserved, under the same
+    /// isolated root.
+    fn reopen(&self, worker_id: &str, base_commit: &str) -> anyhow::Result<WorktreeGuard> {
+        WorktreeGuard::reopen_in(&self.scratch(), &self.dir, worker_id, base_commit)
+    }
 }
 
 impl Drop for TestRepo {
     fn drop(&mut self) {
-        // A worker leases build directories keyed by this repo's hash; they are
-        // filed next to the scratch base, so removing the repo has to take them.
+        // A worker leases build directories keyed by this repo's hash, and a
+        // checkout it ran derives a private `swe-tmp-<leaf>`; both are filed
+        // next to the scratch base, so removing the fixture has to take them.
         mini_swe_mcp::cache::remove_build_dir_leases(&self.dir);
-        let _ = std::fs::remove_dir_all(&self.dir);
+        mini_swe_mcp::worktree::remove_target_dirs(&self.dir);
+        mini_swe_mcp::worktree::remove_scratch_root_worktrees(&self.root);
+        let _ = std::fs::remove_dir_all(&self.root);
     }
 }
 
@@ -101,8 +132,8 @@ fn concurrent_guards_use_distinct_branches_and_paths() {
     let id_b = unique_worker_id("b");
 
     let (branch_a, path_a, branch_b, path_b) = {
-        let guard_a = WorktreeGuard::new(repo, &id_a).expect("first worktree failed");
-        let guard_b = WorktreeGuard::new(repo, &id_b).expect("second worktree failed");
+        let guard_a = test_repo.guard(&id_a);
+        let guard_b = test_repo.guard(&id_b);
 
         // Distinct branches and distinct on-disk locations.
         assert_ne!(guard_a.branch, guard_b.branch, "branches must differ");
@@ -156,9 +187,8 @@ fn concurrent_guards_use_distinct_branches_and_paths() {
 #[test]
 fn get_diff_spans_checkpoint_commits_and_uncommitted_work() {
     let test_repo = TestRepo::new("diff-checkpoint");
-    let repo = test_repo.path();
     let id = unique_worker_id("diff-checkpoint");
-    let mut guard = WorktreeGuard::new(repo, &id).expect("worktree creation failed");
+    let mut guard = test_repo.guard(&id);
 
     std::fs::write(guard.path.join("before_checkpoint.txt"), "first\n").unwrap();
     guard
@@ -180,9 +210,8 @@ fn get_diff_spans_checkpoint_commits_and_uncommitted_work() {
 #[test]
 fn get_diff_reports_untracked_and_modified_files() {
     let test_repo = TestRepo::new("diff");
-    let repo = test_repo.path();
     let id = unique_worker_id("diff");
-    let guard = WorktreeGuard::new(repo, &id).expect("worktree creation failed");
+    let guard = test_repo.guard(&id);
 
     // Pristine worktree => empty diff.
     assert_eq!(guard.get_diff().expect("get_diff failed on clean tree"), "");
@@ -251,7 +280,7 @@ fn test_worktree_cleanup_on_drop_with_uncommitted_files() {
     let repo = test_repo.path();
     let id = unique_worker_id("dirty");
     let (branch, path) = {
-        let guard = WorktreeGuard::new(repo, &id).expect("worktree creation failed");
+        let guard = test_repo.guard(&id);
         let path = guard.path.clone();
         let branch = guard.branch.clone();
 
@@ -317,7 +346,7 @@ fn test_sync_artifacts_preserves_reports_to_repo_root() {
     let test_repo = TestRepo::new("artifacts");
     let repo = test_repo.path();
     let id = unique_worker_id("artifacts");
-    let guard = WorktreeGuard::new(repo, &id).expect("worktree creation failed");
+    let guard = test_repo.guard(&id);
 
     let audit_dir = guard.path.join("audits");
     std::fs::create_dir_all(&audit_dir).expect("failed to create audits dir in worktree");
@@ -352,8 +381,13 @@ fn test_commit_changes_preserves_branch_on_drop() {
     let id = unique_worker_id("commit");
     let branch = format!("worker-{id}");
 
-    {
-        let mut guard = WorktreeGuard::new(repo, &id).expect("worktree creation failed");
+    let path = {
+        let mut guard = test_repo.guard(&id);
+        // The checkout this guard really made, so the cleanup assertion below
+        // names a path that exists until the guard drops. Deriving it from the
+        // real scratch base instead would pass vacuously, because the checkout
+        // is filed under the fixture's own root.
+        let path = guard.path.clone();
         let new_file = guard.path.join("preserved_feature.txt");
         std::fs::write(&new_file, "Preserved code from subagent\n").expect("write file");
 
@@ -362,11 +396,12 @@ fn test_commit_changes_preserves_branch_on_drop() {
             .expect("commit failed");
         assert_eq!(committed_branch, Some(branch.clone()));
         assert!(guard.preserve_branch);
+        assert!(path.exists(), "precondition: the checkout exists");
         // Guard drops here
-    }
+        path
+    };
 
     // Worktree directory and registration are gone
-    let path = mini_swe_mcp::worktree::swe_base_dir().join(format!("swe-wt-{id}"));
     assert!(!path.exists(), "worktree dir should be cleaned up");
     assert!(!worktree_is_registered(repo, &path));
 
@@ -388,7 +423,7 @@ fn test_sync_artifacts_skips_unchanged_files_but_copies_changed_ones() {
     let test_repo = TestRepo::new("unchanged");
     let repo = test_repo.path();
     let id = unique_worker_id("unchanged");
-    let guard = WorktreeGuard::new(repo, &id).expect("worktree creation failed");
+    let guard = test_repo.guard(&id);
 
     let audit_dir = guard.path.join("audits");
     std::fs::create_dir_all(&audit_dir).expect("failed to create audits dir in worktree");
@@ -454,7 +489,7 @@ fn test_sync_never_reverts_a_newer_repo_file_the_worker_never_touched() {
     std::fs::write(&repo_file, "seeded v1\n").expect("failed to write seeded artifact");
 
     let id = unique_worker_id("no-revert");
-    let guard = WorktreeGuard::new(repo, &id).expect("worktree creation failed");
+    let guard = test_repo.guard(&id);
     assert!(
         guard.path.join("audits/memory.md").exists(),
         "the artifact was not seeded into the worktree"
@@ -497,7 +532,7 @@ fn test_sync_publishes_a_seeded_file_the_worker_modified() {
     std::fs::write(&repo_file, "seeded v1\n").expect("failed to write seeded report");
 
     let id = unique_worker_id("edited-seed");
-    let guard = WorktreeGuard::new(repo, &id).expect("worktree creation failed");
+    let guard = test_repo.guard(&id);
     std::fs::write(guard.path.join("reports/status.md"), "worker revision\n")
         .expect("failed to edit the seeded report in the worktree");
 
@@ -522,7 +557,7 @@ fn test_sync_publishes_a_new_file_the_worker_created() {
     let test_repo = TestRepo::new("new-artifact");
     let repo = test_repo.path();
     let id = unique_worker_id("new-artifact");
-    let guard = WorktreeGuard::new(repo, &id).expect("worktree creation failed");
+    let guard = test_repo.guard(&id);
 
     let audit_dir = guard.path.join("audits");
     std::fs::create_dir_all(&audit_dir).expect("failed to create audits dir in worktree");
@@ -549,7 +584,7 @@ fn test_sync_artifacts_never_mirrors_git_build_or_node_modules() {
     let test_repo = TestRepo::new("guards");
     let repo = test_repo.path();
     let id = unique_worker_id("guards");
-    let guard = WorktreeGuard::new(repo, &id).expect("worktree creation failed");
+    let guard = test_repo.guard(&id);
 
     // A worker that ran a build or an install inside an artifact directory
     // leaves dependency caches and build output behind. None of it may cross
@@ -603,7 +638,7 @@ fn test_sync_artifacts_publishes_files_atomically_without_staging_debris() {
     let test_repo = TestRepo::new("atomic");
     let repo = test_repo.path();
     let id = unique_worker_id("atomic");
-    let guard = WorktreeGuard::new(repo, &id).expect("worktree creation failed");
+    let guard = test_repo.guard(&id);
 
     let report_dir = guard.path.join("reports");
     std::fs::create_dir_all(&report_dir).expect("failed to create reports dir in worktree");
@@ -657,7 +692,7 @@ fn hostile_worker_id_cannot_escape_the_scratch_base_or_become_a_git_flag() {
     let flag = format!("--upload-pack=/bin/sh-{traversal}");
 
     for (id, label) in [(&traversal, "traversal"), (&flag, "option-injection")] {
-        let guard = WorktreeGuard::new(repo, id).expect("worktree creation failed");
+        let guard = test_repo.guard(id);
 
         let name = guard
             .path
@@ -698,9 +733,8 @@ fn worktree_directory_is_private_to_its_owner() {
     use std::os::unix::fs::PermissionsExt;
 
     let test_repo = TestRepo::new("private");
-    let repo = test_repo.path();
     let id = unique_worker_id("private");
-    let guard = WorktreeGuard::new(repo, &id).expect("worktree creation failed");
+    let guard = test_repo.guard(&id);
 
     let mode = std::fs::metadata(&guard.path)
         .expect("failed to stat the worktree directory")
@@ -727,7 +761,7 @@ fn reopen_reattaches_to_the_preserved_branch() {
     let base = run(repo, &["rev-parse", "HEAD"]).trim().to_string();
     let branch = format!("worker-{id}");
     let first_path = {
-        let mut guard = WorktreeGuard::new(repo, &id).expect("worktree creation failed");
+        let mut guard = test_repo.guard(&id);
         std::fs::write(guard.path.join("fix.txt"), "fix\n").expect("worker change");
         guard
             .commit_changes("worker: fix")
@@ -743,7 +777,7 @@ fn reopen_reattaches_to_the_preserved_branch() {
         "the finished run must remove its checkout"
     );
 
-    let guard = WorktreeGuard::reopen(repo, &id, &base).expect("reopen must re-attach");
+    let guard = test_repo.reopen(&id, &base).expect("reopen must re-attach");
     assert_eq!(guard.branch, branch, "the revision keeps the same branch");
     assert_eq!(
         guard.base_commit, base,
@@ -763,10 +797,9 @@ fn reopen_reattaches_to_the_preserved_branch() {
 #[test]
 fn reopen_on_a_missing_branch_is_a_clear_error() {
     let test_repo = TestRepo::new("reopen-missing");
-    let repo = test_repo.path();
     let id = unique_worker_id("reopen-missing");
 
-    let err = match WorktreeGuard::reopen(repo, &id, "abc123") {
+    let err = match test_repo.reopen(&id, "abc123") {
         Ok(_) => panic!("no such branch exists"),
         Err(e) => e,
     };
@@ -791,7 +824,7 @@ fn sync_base(guard: &WorktreeGuard) -> mini_swe_mcp::worktree::BaseSync {
 fn moving_base_is_merged_and_excluded_from_worker_diff() {
     use mini_swe_mcp::worktree::BaseSync;
     let repo = TestRepo::new("sync-clean");
-    let guard = WorktreeGuard::new(repo.path(), &unique_worker_id("sync-clean")).unwrap();
+    let guard = repo.guard(&unique_worker_id("sync-clean"));
     assert_eq!(guard.base_branch.as_deref(), Some("master"));
     assert_eq!(sync_base(&guard), BaseSync::Unchanged);
     std::fs::write(guard.path.join("worker.txt"), "worker change\n").unwrap();
@@ -837,7 +870,7 @@ fn moving_base_is_merged_and_excluded_from_worker_diff() {
 fn conflicting_base_refuses_completion_until_markers_are_resolved() {
     use mini_swe_mcp::worktree::BaseSync;
     let repo = TestRepo::new("sync-conflict");
-    let mut guard = WorktreeGuard::new(repo.path(), &unique_worker_id("sync-conflict")).unwrap();
+    let mut guard = repo.guard(&unique_worker_id("sync-conflict"));
     std::fs::write(guard.path.join("README.md"), "worker intent\n").unwrap();
     std::fs::write(repo.path().join("README.md"), "base intent\n").unwrap();
     run(repo.path(), &["add", "."]);
@@ -896,7 +929,7 @@ fn conflicting_base_refuses_completion_until_markers_are_resolved() {
 fn detached_dispatch_has_no_base_to_sync() {
     let repo = TestRepo::new("sync-detached");
     run(repo.path(), &["switch", "--detach"]);
-    let guard = WorktreeGuard::new(repo.path(), &unique_worker_id("sync-detached")).unwrap();
+    let guard = repo.guard(&unique_worker_id("sync-detached"));
     assert_eq!(guard.base_branch, None);
     std::fs::write(guard.path.join("worker.txt"), "pending\n").unwrap();
     assert_eq!(
@@ -934,7 +967,7 @@ fn sync_base_env_zero_leaves_worker_untouched() {
         return;
     }
     let repo = TestRepo::new("sync-disabled");
-    let guard = WorktreeGuard::new(repo.path(), &unique_worker_id("sync-disabled")).unwrap();
+    let guard = repo.guard(&unique_worker_id("sync-disabled"));
     std::fs::write(guard.path.join("worker.txt"), "pending\n").unwrap();
     std::fs::write(repo.path().join("base.txt"), "base\n").unwrap();
     run(repo.path(), &["add", "."]);

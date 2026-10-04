@@ -43,18 +43,25 @@ mod tests {
     use super::*;
     use crate::pool::WorkerPool;
 
-    fn server() -> McpServer {
-        McpServer::new(
-            WorkerPool::new(1, "http://localhost:1".to_string(), "test-key".to_string()),
-            "ninja".to_string(),
-        )
+    /// The pool files every row and mailbox under a temporary scratch root,
+    /// held for as long as the server, so no test touches the real base.
+    fn server() -> (crate::test_support::TestScratch, McpServer) {
+        let root = crate::test_support::TestScratch::new("mcp-help");
+        let pool = WorkerPool::with_scratch(
+            1,
+            "http://localhost:1".to_string(),
+            "test-key".to_string(),
+            crate::worktree::ScratchRoot::new(root.path()),
+        );
+        (root, McpServer::new(pool, "ninja".to_string()))
     }
 
     /// The index an MCP-only agent gets instead of the CLI: every topic the
     /// `help <topic>` topics accept, so nothing is unreachable without a shell.
     #[test]
     fn no_topic_returns_the_index() {
-        let reply = server().handle_help(&json!({})).expect("the index");
+        let (_root, server) = server();
+        let reply = server.handle_help(&json!({})).expect("the index");
         let topics: Vec<&str> = reply["topics"]
             .as_array()
             .expect("an array of topics")
@@ -68,7 +75,8 @@ mod tests {
     /// paths can never drift.
     #[test]
     fn a_topic_returns_the_same_text_as_the_cli() {
-        let reply = server()
+        let (_root, server) = server();
+        let reply = server
             .handle_help(&json!({ "topic": "workflow" }))
             .expect("the workflow topic");
         assert_eq!(reply["topic"], json!("workflow"));
@@ -82,8 +90,9 @@ mod tests {
     /// action would refuse.
     #[test]
     fn every_indexed_topic_resolves() {
+        let (_root, server) = server();
         for topic in crate::cli::help::TOPICS {
-            let reply = server()
+            let reply = server
                 .handle_help(&json!({ "topic": topic }))
                 .unwrap_or_else(|error| panic!("topic '{topic}' must resolve: {error}"));
             assert!(
@@ -96,7 +105,8 @@ mod tests {
     /// A typo names the alternatives rather than answering with nothing.
     #[test]
     fn an_unknown_topic_is_refused_with_the_available_topics() {
-        let error = server()
+        let (_root, server) = server();
+        let error = server
             .handle_help(&json!({ "topic": "nope" }))
             .expect_err("an unknown topic must be refused");
         let message = error.to_string();

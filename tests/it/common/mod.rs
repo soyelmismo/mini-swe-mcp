@@ -519,11 +519,37 @@ impl TestRepo {
     pub fn path(&self) -> &Path {
         &self.dir
     }
+
+    /// A worker checkout of this repository under an isolated scratch root.
+    ///
+    /// [`WorktreeGuard::new`] files the checkout, and the private
+    /// `swe-tmp-<leaf>` scratch the sandbox derives from it, in the real
+    /// scratch base a test suite must not touch; this seam keeps both inside a
+    /// directory [`Drop`] removes.
+    pub fn guard(&self, worker_id: &str) -> mini_swe_mcp::worktree::WorktreeGuard {
+        let root = self.dir.with_extension("worktrees");
+        std::fs::create_dir_all(&root).expect("create worktree scratch root");
+        mini_swe_mcp::worktree::WorktreeGuard::new_in(
+            &mini_swe_mcp::worktree::ScratchRoot::new(root),
+            &self.dir,
+            worker_id,
+        )
+        .expect("worktree must be created")
+    }
 }
 
 impl Drop for TestRepo {
     fn drop(&mut self) {
+        // A worker running against this repository derives its private
+        // `swe-tmp-<leaf>` scratch next to the *scratch base*, so removing the
+        // repository alone leaves that companion behind in the real base.
+        mini_swe_mcp::worktree::remove_target_dirs(&self.dir);
         mini_swe_mcp::cache::remove_build_dir_leases(&self.dir);
+        // The checkouts [`Self::guard`] created, and their companions, live in
+        // a sibling root this repository owns.
+        let worktrees = self.dir.with_extension("worktrees");
+        mini_swe_mcp::worktree::remove_scratch_root_worktrees(&worktrees);
+        let _ = std::fs::remove_dir_all(&worktrees);
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }

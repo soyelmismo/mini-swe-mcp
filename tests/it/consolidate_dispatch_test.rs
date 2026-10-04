@@ -660,10 +660,16 @@ fn the_consolidate_help_topic_describes_the_round_workflow() {
         );
     }
 
-    let server = mini_swe_mcp::mcp::McpServer::new(
-        mini_swe_mcp::pool::WorkerPool::new(1, "http://localhost:1".to_string(), "k".to_string()),
-        "ninja".to_string(),
+    // The pool files its rows under a temporary scratch root, so this test
+    // never writes into the real one.
+    let root = TempDir::new_in_tmp("consolidate-help");
+    let pool = mini_swe_mcp::pool::WorkerPool::with_scratch(
+        1,
+        "http://localhost:1".to_string(),
+        "k".to_string(),
+        ScratchRoot::new(root.path()),
     );
+    let server = mini_swe_mcp::mcp::McpServer::new(pool, "ninja".to_string());
     let tools = server.tools_list();
     let description = tools["tools"][0]["description"]
         .as_str()
