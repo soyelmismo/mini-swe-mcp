@@ -1196,14 +1196,8 @@ pub async fn run(args: &[String], json_output: bool, admin: bool) -> Result<i32>
         if !events.is_empty() && !opts.follow {
             return Ok(0);
         }
-        let request_initial = initial;
         initial = false;
         if watching.is_empty() && (explicit || watched_any) {
-            if std::env::var("MINI_SWE_WATCH_DEBUG").is_ok() {
-                eprintln!(
-                    "watch-debug: ending watching={watching:?} events={events:?} printed_event={printed_event} watched_any={watched_any} request_initial={request_initial} reply={response}"
-                );
-            }
             return Ok(end_watch(printed_event, watched_any));
         }
         let wait = match opts.timeout {

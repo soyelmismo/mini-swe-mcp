@@ -1809,22 +1809,6 @@ async fn watch_snapshot(pool: &WorkerPool) -> crate::cli::watch::Snapshot {
         crate::pool::load_all_registry_entries_in(pool.scratch_root())
             .iter()
             .map(|entry| {
-                if let Ok(debug_path) = std::env::var("MINI_SWE_WATCH_DEBUG_FILE") {
-                    use std::io::Write;
-                    if let Ok(mut f) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(&debug_path)
-                    {
-                        let _ = writeln!(
-                            f,
-                            "snapshot first-load: {} status={} worktree={}",
-                            entry.id,
-                            entry.status.display_name(),
-                            pool.scratch_root().join(format!("swe-wt-{}", entry.id)).is_dir()
-                        );
-                    }
-                }
                 let mut view = registry_snapshot(entry, now);
                 if branch_replay_suppressed(entry) {
                     view[BRANCH_GONE_OR_MERGED] = json!(true);
@@ -1837,46 +1821,30 @@ async fn watch_snapshot(pool: &WorkerPool) -> crate::cli::watch::Snapshot {
             continue;
         };
         let view = views.entry(id.to_string()).or_insert_with(|| {
-            if let Ok(debug_path) = std::env::var("MINI_SWE_WATCH_DEBUG_FILE") {
-                use std::io::Write;
-                let dir = pool.scratch_root().join("swe-registry");
-                let listing = std::fs::read_dir(&dir)
-                    .map(|rd| {
-                        rd.flatten()
-                            .filter_map(|f| {
-                                let len = f.metadata().map(|m| m.len()).unwrap_or(0);
-                                Some(format!("{}:{}", f.file_name().to_string_lossy(), len))
-                            })
-                            .collect::<Vec<_>>()
-                            .join(",")
-                    })
-                    .unwrap_or_else(|e| format!("read_dir failed: {e}"));
-                let row_path = dir.join(format!("{id}.json"));
-                let content = std::fs::read(&row_path)
-                    .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
-                    .unwrap_or_else(|e| format!("read failed: {e}"));
-                let parsed = serde_json::from_slice::<serde_json::Value>(
-                    std::fs::read(&row_path).as_deref().unwrap_or_default(),
-                )
-                .map(|v| v["status"].to_string())
-                .unwrap_or_else(|e| format!("parse failed: {e}"));
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&debug_path)
-                {
-                    let _ = writeln!(
-                        f,
-                        "skeleton for {id}: dir=[{listing}] content={content} parsed={parsed}"
-                    );
-                }
+            // The registry load that built `views` ran a moment before
+            // `list_workers` re-read the registry, so a row written in that
+            // window (a terminal status the orchestrator just recorded) is
+            // present here but was absent there. Seed the skeleton from the
+            // row's own summary so the worker is not left status-less: a
+            // status-less view produces no event, and a watch that only ever
+            // sees it would end believing there was nothing to watch.
+            let mut view = json!({
+                "worker_id":id,"model":row["model"],"owner":row["owner"],"group":"default",
+                "task":clamp_string(row["task"].as_str().unwrap_or("").lines().next().unwrap_or(""),500),
+                "branch":null,"revision":0,"max_turns":0,"metrics":WorkerMetrics::default(),
+                "elapsed":0,"last_step_at":now,"last_ops":[],"question":null
+            });
+            if let Some(status) = row["state"]["status"].as_str() {
+                view["status"] = json!(status.to_ascii_lowercase());
             }
-            json!({
-            "worker_id":id,"model":row["model"],"owner":row["owner"],"group":"default",
-            "task":clamp_string(row["task"].as_str().unwrap_or("").lines().next().unwrap_or(""),500),
-            "branch":null,"revision":0,"max_turns":0,"metrics":WorkerMetrics::default(),
-            "elapsed":0,"last_step_at":now,"last_ops":[],"question":null
-            })
+            if let Some(step) = row["state"]["step"].as_u64() {
+                view["step"] = json!(step);
+                view["turns"] = json!(step);
+            }
+            if let Some(last) = row["state"]["last_command"].as_str() {
+                view["last_ops"] = json!([clamp_string(last, 256)]);
+            }
+            view
         });
         view["owner"] = row["owner"].clone();
         if let Some(progress) = pool.worker_progress(id).await {
@@ -2302,23 +2270,6 @@ impl EventRouter {
                 {
                     events.push(v.clone());
                 }
-            }
-        }
-        if watching.is_empty()
-            && let Ok(path) = std::env::var("MINI_SWE_WATCH_DEBUG_FILE")
-        {
-            use std::io::Write;
-            let line = format!(
-                "watch_reply initial={initial} events={} watch_current={}\n",
-                events.len(),
-                serde_json::to_string(&self.watch_current).unwrap_or_default()
-            );
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-            {
-                let _ = f.write_all(line.as_bytes());
             }
         }
         let mut reply = json!({"watching":watching,"events":events});
