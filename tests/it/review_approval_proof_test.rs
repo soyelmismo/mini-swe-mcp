@@ -7,7 +7,7 @@
 //!    because recording it would let the next revision skip the review of
 //!    code nobody audited.
 //! 2. An empty reviewer (`--review-after :<mode>` with no mode default) must
-//!    run on the implementer's model, not send an empty model string to the
+//!    run on the dispatch default, not send an empty model string to the
 //!    provider and quietly end inconclusive.
 //! 3. A requested manifest-declared mode whose phase the sensitive-path
 //!    upgrade displaced must still run as its own successive phase, not be
@@ -179,7 +179,7 @@ async fn an_empty_reviewer_runs_on_the_dispatch_default() {
     );
     assert_eq!(
         bodies[2]["model"],
-        json!("test-model"),
+        json!("combo:ninja"),
         "the empty reviewer falls back to the dispatch default"
     );
     let _ = pool.kill(&worker_id).await;
@@ -196,7 +196,7 @@ async fn a_requested_mode_survives_the_sensitive_upgrade() {
     let repo = common::TestRepo::new("approval-displaced");
     repo.declare_sensitive(&["src/hub/**"]);
     let manifest: ModelManifest = serde_yaml::from_str(
-        "models:\n  test-model:\n    id: test-model\nreview_modes:\n  perf:\n    checklist: Check for N+1 queries.\n    model: test-model\n",
+        "models:\n  test-model:\n    id: test-model\nreview_modes:\n  perf:\n    checklist: Check for N+1 queries.\n    default_model: test-model\n",
     )
     .expect("manifest with a perf mode");
     let llm = FakeLlm::spawn_sse(vec![

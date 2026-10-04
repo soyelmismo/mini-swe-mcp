@@ -32,7 +32,7 @@ fn a_manifest_without_review_modes_parses_to_empty() {
 #[test]
 fn a_declared_mode_parses_its_checklist_and_model() {
     let manifest = modes_manifest(
-        "models:\n  nerd:\n    id: combo:nerd\nreview_modes:\n  perf:\n    checklist: Check for N+1 queries.\n    model: nerd\n",
+        "models:\n  nerd:\n    id: combo:nerd\nreview_modes:\n  perf:\n    checklist: Check for N+1 queries.\n    default_model: nerd\n",
     );
     let def = manifest.review_mode("perf").expect("perf mode");
     assert_eq!(def.checklist.as_deref(), Some("Check for N+1 queries."));
@@ -84,7 +84,7 @@ fn an_empty_checklist_warns_and_is_dropped_by_normalize() {
 #[test]
 fn parse_with_manifest_resolves_a_custom_mode() {
     let manifest = modes_manifest(
-        "models:\n  nerd:\n    id: combo:nerd\nreview_modes:\n  perf:\n    checklist: Check for N+1 queries.\n    model: nerd\n",
+        "models:\n  nerd:\n    id: combo:nerd\nreview_modes:\n  perf:\n    checklist: Check for N+1 queries.\n    default_model: nerd\n",
     );
     let (model, mode) =
         ReviewMode::parse_with_manifest("some-reviewer:perf", &manifest).expect("perf mode");
@@ -96,7 +96,7 @@ fn parse_with_manifest_resolves_a_custom_mode() {
 #[test]
 fn parse_with_manifest_uses_the_mode_default_for_an_empty_model() {
     let manifest = modes_manifest(
-        "models:\n  nerd:\n    id: combo:nerd\nreview_modes:\n  perf:\n    checklist: Check for N+1 queries.\n    model: nerd\n",
+        "models:\n  nerd:\n    id: combo:nerd\nreview_modes:\n  perf:\n    checklist: Check for N+1 queries.\n    default_model: nerd\n",
     );
     let (model, mode) = ReviewMode::parse_with_manifest(":perf", &manifest).expect("perf mode");
     assert_eq!(model, "nerd");

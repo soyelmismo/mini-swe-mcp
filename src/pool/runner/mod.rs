@@ -732,8 +732,10 @@ impl WorkerPool {
         // successive phase, so `--review-after <model>:<mode>` keeps meaning
         // that mode runs. The built-in `quality` keeps the historical rule: the
         // upgrade replaces it, as it did before declared modes existed.
+        // Only a manifest-declared mode is re-added: the built-in `quality`
+        // keeps the historical rule where the upgrade replaces it.
         if let Some((reviewer, wanted)) = requested_review
-            && wanted.checklist.is_some()
+            && self.manifest().review_mode(&wanted.name).is_some()
             && !review_plan
                 .iter()
                 .any(|(_, mode, _)| mode.name == wanted.name)
