@@ -101,3 +101,4 @@ defect, not a style one; the section is parsed as one glob per line.
 - src/agent/env.rs
 - src/pool/steer.rs
 - src/mcp/handlers/**
+- src/pool/runner/whole_file.rs

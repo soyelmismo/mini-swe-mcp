@@ -75,6 +75,7 @@ use super::sentinels::{
     parse_consolidate_wait, parse_consolidator_verdicts, parse_kill_job, parse_report,
     parse_request_turns, parse_wait_job, summarize_command,
 };
+use super::whole_file::{WholeFileGuard, WholeFileReply, already_shown_note, whole_file_reply};
 
 /// Prefix used by both tool results and code-block command output messages.
 pub(super) const COMMAND_OUTPUT_PREFIX: &str = "COMMAND OUTPUT (exit code: ";
@@ -1450,6 +1451,9 @@ pub(super) struct ProgressWatch {
     /// reasoning until the model produces a sound one, so the next request
     /// has to know whether the drop is still in force.
     degenerate_guard_step: Option<usize>,
+    /// Files the whole-file expansion has already shown, so a slice of an
+    /// unchanged one is not answered with the same payload again.
+    whole_files: WholeFileGuard,
 }
 
 impl ProgressWatch {
@@ -1614,6 +1618,32 @@ impl ProgressWatch {
         // identical value is the echo the observed run looped on.
         self.degenerate_turns += 1;
         (self.degenerate_turns >= DEGENERATE_REPEAT_TURNS).then_some(self.degenerate_turns)
+    }
+
+    /// Replace a small range read's observation with the whole file, or leave
+    /// the output alone.
+    ///
+    /// Cross-turn state lives here rather than in the engine because this is
+    /// the same per-worker detector as the guards above: which files have
+    /// already been shown whole is a fact about the run, not about one turn.
+    fn whole_file_output(
+        &mut self,
+        command: &str,
+        worktree: &Path,
+        step: usize,
+        succeeded: bool,
+    ) -> Option<String> {
+        // A failed command keeps its error: the harness read runs only after
+        // the sandboxed command itself succeeded, so a model sees what went
+        // wrong rather than a file the harness substituted for it.
+        if !succeeded {
+            return None;
+        }
+        match whole_file_reply(command, worktree, &mut self.whole_files, step) {
+            WholeFileReply::Keep => None,
+            WholeFileReply::Whole { text } => Some(text),
+            WholeFileReply::AlreadyShown { step: shown_at } => Some(already_shown_note(shown_at)),
+        }
     }
 
     /// The recent-history summary the budget-extension decision is pure over.
@@ -2099,6 +2129,21 @@ impl<'a> TurnEngine<'a> {
         let (output, code) = self
             .run_gated(&cmd_str, AdmissionClass::Exploratory)
             .await?;
+
+        // --- Whole-file expansion ---
+        // A small file asked for by line range is answered with all of it,
+        // numbered like `cat -n`: one answer where the slice plus its
+        // remainder cost two turns. A repeat slice of an unchanged file keeps
+        // its range with a note pointing at the step that already showed it.
+        let output = match self.watch.whole_file_output(
+            &cmd_str,
+            &self.worktree.path,
+            *self.step,
+            code == Some(0),
+        ) {
+            Some(whole) => format!("{output}\n{whole}"),
+            None => output,
+        };
 
         // --- Consolidator verbs (harness side, never bash) ---
         // The sandbox holds no git credentials, so these run here, on the
@@ -4632,6 +4677,471 @@ mod tests {
                 None,
                 "a command that has since failed must re-run"
             );
+        }
+
+        /// A small range read is answered with the whole file; a file too big, a
+        /// pipeline, and anything outside the worktree keep their own output.
+        mod whole_file_expansion {
+            use crate::pool::runner::whole_file::{
+                WHOLE_FILE_REPEAT_TURNS, WholeFileGuard, WholeFileReply, descriptor_is_inside,
+                whole_file_reply,
+            };
+            use std::os::unix::fs::OpenOptionsExt;
+            use std::path::{Path, PathBuf};
+
+            /// A unique scratch directory outside any worktree, for the file a
+            /// test must never reach.
+            fn scratch_dir(tag: &str) -> PathBuf {
+                let dir = std::env::temp_dir().join(format!(
+                    "turn-whole-file-{tag}-{}-{}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ));
+                let _ = std::fs::remove_dir_all(&dir);
+                std::fs::create_dir_all(&dir).expect("create scratch dir");
+                dir
+            }
+
+            /// A scratch worktree unique to this test, cleaned up on drop.
+            struct Tree(PathBuf);
+
+            impl Tree {
+                fn new(tag: &str) -> Self {
+                    let dir = std::env::temp_dir().join(format!(
+                        "turn-whole-file-{tag}-{}-{}",
+                        std::process::id(),
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_nanos()
+                    ));
+                    let _ = std::fs::remove_dir_all(&dir);
+                    std::fs::create_dir_all(&dir).expect("create scratch worktree");
+                    Self(dir)
+                }
+
+                fn path(&self) -> &Path {
+                    &self.0
+                }
+
+                /// Write a file of `lines` numbered lines, relative to the root.
+                fn file(&self, rel: &str, lines: usize) -> PathBuf {
+                    let path = self.0.join(rel);
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent).expect("create parent dir");
+                    }
+                    let body: String = (1..=lines)
+                        .map(|n| format!("line {n}\n"))
+                        .collect::<Vec<_>>()
+                        .join("");
+                    std::fs::write(&path, body).expect("write file");
+                    path
+                }
+            }
+
+            impl Drop for Tree {
+                fn drop(&mut self) {
+                    let _ = std::fs::remove_dir_all(&self.0);
+                }
+            }
+
+            /// The whole-file answer for `command`, as text.
+            fn reply(
+                tree: &Tree,
+                guard: &mut WholeFileGuard,
+                step: usize,
+                command: &str,
+            ) -> String {
+                match whole_file_reply(command, tree.path(), guard, step) {
+                    WholeFileReply::Whole { text } => text,
+                    WholeFileReply::Keep => panic!("expected the whole file for {command:?}"),
+                    WholeFileReply::AlreadyShown { step } => {
+                        panic!("unexpected already-shown note at step {step}")
+                    }
+                }
+            }
+
+            /// A slice of a small file is answered with every line of it, numbered
+            /// like `cat -n` and introduced by the harness line that says so.
+            #[test]
+            fn a_small_range_read_becomes_the_whole_file() {
+                let tree = Tree::new("small");
+                tree.file("src/lib.rs", 12);
+                let mut guard = WholeFileGuard::default();
+
+                let text = reply(&tree, &mut guard, 3, "sed -n '1,5p' src/lib.rs");
+                assert!(
+                text.starts_with(
+                    "[harness: src/lib.rs has 12 lines; showing the whole file instead of the requested range]"
+                ),
+                "the answer must say what the harness did: {text:?}"
+            );
+                // Every line is present and numbered, not just the requested range.
+                assert!(text.contains("\tline 6\n"), "line 6 is missing: {text:?}");
+                assert!(
+                    text.contains("\tline 12\n"),
+                    "the last line is missing: {text:?}"
+                );
+                assert!(
+                    !text.contains("\tline 13\n"),
+                    "a line past the end was invented: {text:?}"
+                );
+            }
+
+            /// The other spellings of one range read of one file are the same read,
+            /// with or without the `cd` prefix and the quotes.
+            #[test]
+            fn every_range_read_spelling_expands() {
+                for (tag, command) in [
+                    ("quoted", "sed -n '1,5p' src/lib.rs"),
+                    ("spaced", "sed -n '1,5 p' src/lib.rs"),
+                    ("bare", "sed -n 1,5p src/lib.rs"),
+                    ("cd", "cd src && sed -n '1,5p' lib.rs"),
+                    ("head-n", "head -n 5 src/lib.rs"),
+                    ("head", "head -5 src/lib.rs"),
+                    ("tail", "tail -n 5 src/lib.rs"),
+                ] {
+                    let tree = Tree::new(tag);
+                    tree.file("src/lib.rs", 9);
+                    let mut guard = WholeFileGuard::default();
+                    let text = reply(&tree, &mut guard, 1, command);
+                    assert!(
+                        text.contains("\tline 9\n"),
+                        "{command:?} must show the whole file: {text:?}"
+                    );
+                }
+            }
+
+            /// A file past the line bound keeps the command's own output: the model
+            /// asked for a slice of a big file on purpose.
+            #[test]
+            fn a_large_file_keeps_its_range() {
+                let tree = Tree::new("large");
+                tree.file("big.rs", 701);
+                let mut guard = WholeFileGuard::default();
+                assert_eq!(
+                    whole_file_reply("sed -n '1,20p' big.rs", tree.path(), &mut guard, 1),
+                    WholeFileReply::Keep,
+                    "a 700-line file must not be shown whole"
+                );
+            }
+
+            /// A pipeline is not one range read of one file: what the harness would
+            /// substitute would not be what the command produced.
+            #[test]
+            fn a_pipeline_keeps_its_own_output() {
+                let tree = Tree::new("pipe");
+                tree.file("src/lib.rs", 5);
+                for command in [
+                    "sed -n '1,3p' src/lib.rs | grep line",
+                    "sed -n '1,3p' src/lib.rs > out.txt",
+                    "sed -n '1,3p' src/lib.rs other.rs",
+                    "sed -n '1,3p' src/*.rs",
+                    "sed -n '1,3{s/a/b/}' src/lib.rs",
+                    "sed -n '1,3p'",
+                ] {
+                    let mut guard = WholeFileGuard::default();
+                    assert_eq!(
+                        whole_file_reply(command, tree.path(), &mut guard, 1),
+                        WholeFileReply::Keep,
+                        "{command:?} must keep the command's own output"
+                    );
+                }
+            }
+
+            /// The harness reads outside the sandbox, so it must never read what
+            /// the sandboxed command could not: a path outside the worktree, a
+            /// `..` escape, and a link pointing out are all refused.
+            #[test]
+            fn a_path_outside_the_worktree_is_refused() {
+                let tree = Tree::new("escape");
+                tree.file("src/lib.rs", 4);
+                let outside = std::env::temp_dir().join(format!(
+                    "turn-whole-file-secret-{}-{}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ));
+                std::fs::write(&outside, "secret line\n").expect("write the outside file");
+                // A link inside the worktree pointing at it, and one pointing at
+                // an absolute path outside the worktree.
+                std::os::unix::fs::symlink(&outside, tree.path().join("link.rs")).unwrap();
+                std::os::unix::fs::symlink(&outside, tree.path().join("abs.rs")).unwrap();
+                let depth = tree.path().join("src/deep");
+                std::fs::create_dir_all(&depth).unwrap();
+                std::os::unix::fs::symlink(&outside, depth.join("rel.rs")).unwrap();
+
+                let mut guard = WholeFileGuard::default();
+                for command in [
+                    "sed -n '1,2p' ../escape.rs".to_string(),
+                    format!("sed -n '1,2p' {}", outside.display()),
+                    format!("sed -n '1,2p' {}", Path::new("/etc/hostname").display()),
+                    "sed -n '1,2p' link.rs".to_string(),
+                    "sed -n '1,2p' abs.rs".to_string(),
+                    "sed -n '1,2p' deep/rel.rs".to_string(),
+                ] {
+                    assert_eq!(
+                        whole_file_reply(&command, tree.path(), &mut guard, 1),
+                        WholeFileReply::Keep,
+                        "{command:?} must not be read by the harness"
+                    );
+                }
+                let _ = std::fs::remove_file(&outside);
+            }
+
+            /// The byte bound is the edge the harness reads at, so both sides of
+            /// it are pinned here: a file of exactly the bound is shown whole,
+            /// down to its last line, and one byte more keeps its own output.
+            ///
+            /// The whole-file answer claims to be the whole file, so the read must
+            /// be complete; a file at the bound is the case where an off-by-one
+            /// would hand the model a truncated file under a header that says it
+            /// is complete.
+            #[test]
+            fn the_byte_bound_is_inclusive_and_complete() {
+                let tree = Tree::new("bound");
+                let bound = 48 * 1024;
+                let path = tree.path().join("at.rs");
+                // Few enough lines to be inside the line bound, and long ones so
+                // the file still sits exactly on the byte bound; the last line
+                // ends in a marker the answer has to carry.
+                let mut body = String::new();
+                for _ in 0..399 {
+                    body.push_str("ab\n");
+                }
+                body.push_str("theend\n");
+                while body.len() < bound {
+                    body.push('x');
+                }
+                // The marker line is the file's last line, so an answer that cut
+                // the file short cannot contain it.
+                body.truncate(bound - "theend\n".len());
+                body.push_str("theend\n");
+                assert_eq!(
+                    body.len(),
+                    bound,
+                    "the fixture must sit exactly on the bound"
+                );
+                std::fs::write(&path, &body).unwrap();
+                std::fs::write(tree.path().join("over.rs"), format!("{body}z")).unwrap();
+
+                let mut guard = WholeFileGuard::default();
+                let at_bound = reply(&tree, &mut guard, 1, "sed -n '1,2p' at.rs");
+                assert!(
+                    at_bound.contains("\ttheend\n"),
+                    "a file of exactly the bound must be shown whole, last line included: {:?}",
+                    &at_bound[at_bound.len().saturating_sub(120)..]
+                );
+
+                let mut guard = WholeFileGuard::default();
+                assert_eq!(
+                    whole_file_reply("sed -n '1,2p' over.rs", tree.path(), &mut guard, 1),
+                    WholeFileReply::Keep,
+                    "one byte past the bound must keep its own output"
+                );
+            }
+
+            /// A second slice of an unchanged file keeps the range and says where
+            /// the whole file was already shown, so the payload is paid once.
+            #[test]
+            fn an_unchanged_repeat_slice_is_not_shown_twice() {
+                let tree = Tree::new("repeat");
+                tree.file("src/lib.rs", 20);
+                let mut guard = WholeFileGuard::default();
+
+                let first = reply(&tree, &mut guard, 4, "sed -n '1,5p' src/lib.rs");
+                assert!(first.contains("\tline 20\n"), "first slice: {first:?}");
+
+                assert_eq!(
+                    whole_file_reply("sed -n '10,15p' src/lib.rs", tree.path(), &mut guard, 6),
+                    WholeFileReply::AlreadyShown { step: 4 },
+                    "an unchanged repeat slice must point at the step that showed it"
+                );
+
+                // A file that changed is worth showing again: the guard is about
+                // repeating a payload, not about showing a file once ever.
+                tree.file("src/lib.rs", 21);
+                let changed = reply(&tree, &mut guard, 7, "sed -n '1,5p' src/lib.rs");
+                assert!(
+                    changed.contains("\tline 21\n"),
+                    "a changed file must be shown whole again: {changed:?}"
+                );
+            }
+
+            /// Content the harness cannot render faithfully keeps the command's own
+            /// output: binary bytes, a missing file and a directory are answers the
+            /// model's own command gives, and the harness must not guess at them.
+            #[test]
+            fn unreadable_content_keeps_the_commands_own_output() {
+                let tree = Tree::new("unreadable");
+                tree.file("src/lib.rs", 4);
+                // Invalid UTF-8: `read_to_string` fails, so nothing is substituted.
+                std::fs::write(tree.path().join("bin.rs"), [0xffu8, 0xfe, 0x00, 0x41]).unwrap();
+                std::fs::create_dir_all(tree.path().join("adir")).unwrap();
+
+                let mut guard = WholeFileGuard::default();
+                for command in [
+                    "sed -n '1,2p' bin.rs",
+                    "sed -n '1,2p' missing.rs",
+                    "sed -n '1,2p' adir",
+                ] {
+                    assert_eq!(
+                        whole_file_reply(command, tree.path(), &mut guard, 1),
+                        WholeFileReply::Keep,
+                        "{command:?} must keep the command's own output"
+                    );
+                }
+            }
+
+            /// A backslash escape keeps the character it escapes, so the harness
+            /// resolves the very name the shell read: a path spelled `a\ b.rs` is
+            /// one file called `a b.rs`, not a different file called `ab.rs`.
+            #[test]
+            fn an_escaped_character_stays_in_the_name() {
+                let tree = Tree::new("escape-name");
+                // Both names exist, so resolving the wrong one is observable.
+                tree.file("a b.rs", 6);
+                tree.file("ab.rs", 6);
+                let mut guard = WholeFileGuard::default();
+                let text = reply(&tree, &mut guard, 1, r"sed -n '1,2p' a\ b.rs");
+                assert!(
+                    text.starts_with("[harness: a b.rs has 6 lines;"),
+                    "the harness must resolve the name the shell read: {text:?}"
+                );
+            }
+
+            /// A bare `head` is a range read of the default ten lines, so it expands
+            /// like any other; a byte count is not a line range and does not.
+            #[test]
+            fn a_bare_head_expands_and_another_flag_does_not() {
+                let tree = Tree::new("headflag");
+                tree.file("src/lib.rs", 30);
+                let mut guard = WholeFileGuard::default();
+                let text = reply(&tree, &mut guard, 1, "head src/lib.rs");
+                assert!(text.contains("\tline 30\n"), "bare head: {text:?}");
+                assert_eq!(
+                    whole_file_reply("head -c 100 src/lib.rs", tree.path(), &mut guard, 2),
+                    WholeFileReply::Keep,
+                    "a byte count is not a line range"
+                );
+            }
+
+            /// A note that is older than the repeat window is not a pointer worth
+            /// giving: by then the model has lost the earlier answer.
+            #[test]
+            fn an_old_show_is_not_pointed_at() {
+                let tree = Tree::new("old");
+                tree.file("src/lib.rs", 8);
+                let mut guard = WholeFileGuard::default();
+                reply(&tree, &mut guard, 1, "sed -n '1,3p' src/lib.rs");
+                let far = 1 + WHOLE_FILE_REPEAT_TURNS + 1;
+                let again = reply(&tree, &mut guard, far, "sed -n '5,7p' src/lib.rs");
+                assert!(
+                    again.contains("\tline 8\n"),
+                    "past the window the file is shown again: {again:?}"
+                );
+            }
+
+            /// The harness reads outside the sandbox, so a directory swapped for a
+            /// symlink after the path was resolved must not hand the model a file
+            /// from outside the worktree.
+            ///
+            /// `O_NOFOLLOW` covers only the final component, so the two steps the
+            /// real path takes are driven directly here: the name is resolved while
+            /// it is still a real directory inside the worktree, then that directory
+            /// is replaced by a symlink pointing outside, and the open which
+            /// follows lands on the outside file. Only the descriptor-level check
+            /// stands between that open and the answer.
+            #[test]
+            fn a_directory_swapped_after_resolution_is_not_read() {
+                let tree = Tree::new("swap");
+                tree.file("d/secret.rs", 3);
+                let outside = scratch_dir("outside");
+                std::fs::write(outside.join("secret.rs"), "outside line\n")
+                    .expect("write outside file");
+
+                let root = tree.path().canonicalize().expect("canonical root");
+                // Step one: resolve the name while `d` is still a real directory.
+                let resolved = tree
+                    .path()
+                    .join("d/secret.rs")
+                    .canonicalize()
+                    .expect("resolve");
+                assert!(
+                    resolved.starts_with(&root),
+                    "the test must start with a path inside the worktree: {resolved:?}"
+                );
+
+                // Step two: the intermediate directory becomes a symlink out, so
+                // the same name now resolves outside the worktree.
+                std::fs::remove_dir_all(tree.path().join("d")).expect("remove the real dir");
+                std::os::unix::fs::symlink(&outside, tree.path().join("d"))
+                    .expect("plant the symlink");
+
+                // The check the harness runs after opening is exactly this one: open
+                // the escaping name and ask whether the descriptor is inside.
+                let opened = std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                    .open(&resolved)
+                    .expect("the swapped path still opens");
+                let before = std::fs::symlink_metadata(&resolved).expect("identity before");
+                assert!(
+                    !descriptor_is_inside(&root, &opened, &before),
+                    "a descriptor reached through a swapped directory must never pass as inside"
+                );
+
+                // And end to end: the command names the directory and the harness
+                // resolves it through the swap, so the answer must stay the
+                // command's own output.
+                let mut guard = WholeFileGuard::default();
+                assert_eq!(
+                    whole_file_reply("sed -n '1,2p' d/secret.rs", tree.path(), &mut guard, 1),
+                    WholeFileReply::Keep,
+                    "a file reached through a swapped directory must not be shown"
+                );
+                let _ = std::fs::remove_dir_all(&outside);
+            }
+
+            /// The same check must refuse a descriptor whose file is not the one the
+            /// resolution named, which a rename-over achieves without touching the
+            /// path at all.
+            #[test]
+            fn a_file_replaced_after_resolution_is_not_read() {
+                let tree = Tree::new("replace");
+                tree.file("d/lib.rs", 3);
+                // A file outside the worktree, moved onto the resolved name:
+                // the path never changes, only what it resolves to.
+                let outside = scratch_dir("replaced").join("lib.rs");
+                std::fs::write(&outside, "outside line\n").expect("write outside file");
+
+                let root = tree.path().canonicalize().expect("canonical root");
+                let resolved = tree
+                    .path()
+                    .join("d/lib.rs")
+                    .canonicalize()
+                    .expect("resolve");
+                let before = std::fs::symlink_metadata(&resolved).expect("identity before");
+                // The name now holds a different file than the one resolved.
+                std::fs::rename(&outside, &resolved).expect("swap the file under the name");
+
+                let opened = std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                    .open(&resolved)
+                    .expect("the replaced path still opens");
+                assert!(
+                    !descriptor_is_inside(&root, &opened, &before),
+                    "a descriptor that is not the resolved file must be refused"
+                );
+                let _ = std::fs::remove_file(&resolved);
+                let _ = std::fs::remove_dir_all(outside.parent().expect("scratch parent"));
+            }
         }
 
         /// The success map is bounded: a new command past the cap evicts the
