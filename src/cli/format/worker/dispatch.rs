@@ -120,11 +120,17 @@ pub(super) fn format_batch_dispatch(
 ///
 /// Keeping the two apart here, in a pure formatter, is what lets the binary
 /// keep stdout a clean id list for a script while the failure stays visible.
+#[derive(Debug)]
 pub struct QuietDispatch {
     /// The `worker_id` of every entry that started, in payload order.
     pub worker_ids: Vec<String>,
     /// The error of every entry that never started, in payload order.
     pub errors: Vec<String>,
+    /// The watch command to wait on these workers with.
+    ///
+    /// Empty exactly when no worker started, so the caller can gate the
+    /// reminder on "something is running" alone and never on the command's
+    /// own emptiness: a caller with no token store still needs the reminder.
     pub watch_command: String,
 }
 
@@ -146,7 +152,50 @@ pub fn format_dispatch_quiet(val: &serde_json::Value) -> QuietDispatch {
     } else if let Some(wid) = val.get("worker_id").and_then(|v| v.as_str()) {
         worker_ids.push(wid.to_string());
     }
-    QuietDispatch { worker_ids, errors, watch_command: String::new() }
+    // A dispatch that started nothing has nothing to wait on, so the reminder
+    // is withheld rather than pointing at a watch with no worker behind it.
+    let watch_command = match worker_ids.is_empty() {
+        true => String::new(),
+        false => quiet_watch_command(val),
+    };
+    QuietDispatch {
+        worker_ids,
+        errors,
+        watch_command,
+    }
+}
+
+/// The watch command a `--quiet` dispatch reminder names.
+///
+/// Same precedence as the human-facing [`format_dispatch`]: the hub's
+/// token-bound `watch_command` when it minted one, the round command for a
+/// consolidated dispatch, and the plain `mini-swe-mcp watch` otherwise -- which
+/// follows every worker the caller owns, so it is right even with no token and
+/// no group.
+fn quiet_watch_command(val: &serde_json::Value) -> String {
+    if let Some(command) = val.get("watch_command").and_then(|v| v.as_str()) {
+        return command.to_string();
+    }
+    match val.get("group").and_then(|v| v.as_str()) {
+        Some(group) => {
+            format!("mini-swe-mcp watch --group {} --all", shell_word(group))
+        }
+        None => "mini-swe-mcp watch".to_string(),
+    }
+}
+
+/// `word` as one shell word: quoted only when it holds something a shell would
+/// act on, so an ordinary group name stays the readable command the help text
+/// shows and a crafted one cannot become a second command.
+fn shell_word(word: &str) -> String {
+    let safe = !word.is_empty()
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./:=@,+".contains(c));
+    match safe {
+        true => word.to_string(),
+        false => crate::agent::exec::shell_quote(word),
+    }
 }
 
 #[cfg(test)]
@@ -237,8 +286,7 @@ mod tests {
             r#"{"workers":[{"index":0,"worker_id":"w1"}],"group":"r; touch /tmp/pwned"}"#,
         ));
         assert_eq!(
-            hostile.watch_command,
-            "mini-swe-mcp watch --group 'r; touch /tmp/pwned' --all",
+            hostile.watch_command, "mini-swe-mcp watch --group 'r; touch /tmp/pwned' --all",
             "{hostile:?}"
         );
 
