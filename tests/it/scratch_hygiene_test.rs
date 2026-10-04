@@ -15,7 +15,7 @@
 //! A pool's own scratch root is a different property, covered where the pool is
 //! built: `consolidate_steer_log_hardening_test` and the `IsolatedPool` seam.
 
-use crate::common::TestRepo;
+use crate::common::{TempDir, TestRepo};
 use mini_swe_mcp::worktree::swe_base_dir;
 
 /// Whether `dir` exists, without following a symlink.
@@ -55,6 +55,12 @@ fn a_dropped_test_repository_takes_its_private_scratch_with_it() {
     std::fs::create_dir_all(&companions[0]).expect("create the derived scratch");
     assert!(exists(&companions[0]), "precondition: the companion exists");
 
+    // Own the planted stand-in so a *failing* assertion -- which is the whole
+    // point of this property -- still reclaims it. Leaving it behind on the
+    // failure path is exactly the leak this round exists to remove, so the
+    // guard has to outlive the assertion, not be sequenced after it.
+    let planted = TempDir::own(companions[0].clone());
+
     drop(repo);
 
     for path in &companions {
@@ -64,6 +70,7 @@ fn a_dropped_test_repository_takes_its_private_scratch_with_it() {
             path.display()
         );
     }
+    drop(planted);
 }
 
 /// A checkout made through [`TestRepo::guard`] leaves nothing behind.
@@ -153,6 +160,14 @@ fn a_guard_drop_removes_only_the_companion_under_its_own_root() {
     let foreign_probe = foreign.join("sibling-agent-probe");
     std::fs::write(&foreign_probe, b"another process's scratch").expect("write the probe");
 
+    // The stand-in in the *real* scratch base is owned for the whole test, so
+    // the assertion below -- which fires precisely when this property is
+    // violated -- cannot leave it behind. A sequential cleanup after the assert
+    // would do the opposite of what it looks like: the failure this test exists
+    // to catch is the one path that leaks a `swe-tmp-*` entry into the
+    // operator's scratch directory.
+    let _planted = TempDir::own(foreign.clone());
+
     drop(guard);
 
     // The security property first: a guard must never reach outside its own
@@ -169,6 +184,6 @@ fn a_guard_drop_removes_only_the_companion_under_its_own_root() {
         owned.display()
     );
 
-    // Clean up the stand-in the test itself planted in the real base.
-    let _ = std::fs::remove_dir_all(&foreign);
+    // `_planted` reclaims the stand-in this test planted in the real base, on
+    // the success path and on the failure path alike.
 }
