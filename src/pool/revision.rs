@@ -1454,61 +1454,6 @@ impl SteerOutcome {
     }
 }
 
-/// The turn budget a continuation of an *interrupted* run resumes under.
-///
-/// Read from the worker's registry row, which the run kept current on every
-/// step: `max_turns` is the ceiling it was running under -- an automatic
-/// extension already granted raises it above the dispatch budget -- and
-/// `step` is how many of those turns it had spent. Resuming with both keeps
-/// the run's ceiling absolute, so a hub handover costs a worker only the
-/// turns it had already spent, never a fresh default budget on top.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ResumedTurns {
-    /// Ceiling the interrupted run was running under.
-    pub max_turns: usize,
-    /// Turns of that ceiling the run had already spent.
-    pub step: usize,
-}
-
-/// Turns a resumed run gets past the step it was interrupted at, at minimum.
-///
-/// A run interrupted near its ceiling -- 248 of 250, say -- would otherwise
-/// resume with almost nothing left and die `exhausted` mid-gate; the floor
-/// keeps it able to finish and REPORT.
-const RESUME_FLOOR_TURNS: usize = 10;
-
-impl ResumedTurns {
-    /// The budget of an interrupted run, off the row that run kept current.
-    ///
-    /// `None` for any other status: a finished worker's revision is a new run
-    /// with its own budget (`--max-turns`, else [`DEFAULT_REVISION_TURNS`]).
-    /// A row without a usable ceiling -- a synthetic one, or one written
-    /// before budgets were recorded -- is `None` too, so such a worker still
-    /// gets the default instead of a zero-turn run.
-    pub(crate) fn of_interrupted(entry: &super::WorkerRegistryEntry) -> Option<Self> {
-        if entry.status != super::RegistryStatus::Interrupted || entry.max_turns == 0 {
-            return None;
-        }
-        Some(Self {
-            max_turns: entry.max_turns,
-            step: entry.step,
-        })
-    }
-
-    /// The ceiling the resumed run continues under.
-    ///
-    /// The row's own ceiling, but never below `step` +
-    /// [`RESUME_FLOOR_TURNS`] -- a run interrupted near its ceiling would
-    /// otherwise resume with almost nothing left -- and never above
-    /// [`MAX_TURNS_LIMIT`], so a corrupt or inflated row cannot grant an
-    /// unbounded budget.
-    pub(crate) fn ceiling(&self) -> usize {
-        self.max_turns
-            .max(self.step.saturating_add(RESUME_FLOOR_TURNS))
-            .min(crate::manifest::MAX_TURNS_LIMIT)
-    }
-}
-
 /// Revision counter of a [`SteerOutcome::Continuing`], for the reply.
 pub(crate) fn outcome_revision(outcome: &SteerOutcome) -> usize {
     match outcome {
@@ -1526,12 +1471,6 @@ impl super::WorkerPool {
     /// worker, or one whose log was lost -- it is continued cold: the same id
     /// and branch, a fresh conversation that names the work the branch already
     /// holds. Only a missing branch is an error.
-    ///
-    /// `revision_turns` is the fresh budget of a revision (`None` takes
-    /// [`DEFAULT_REVISION_TURNS`]). A continuation that resumes an *interrupted*
-    /// run -- a hub restart or handover -- instead keeps the budget that run was
-    /// under, ceiling and step counter, so it costs the worker only the turns it
-    /// had already spent; an explicit budget still wins.
     pub async fn continue_worker(
         &self,
         id: &str,
@@ -1544,9 +1483,7 @@ impl super::WorkerPool {
                 // A history from before base-branch tracking would never sync
                 // the base before completing; detect and store it now.
                 let detected = ensure_base_branch(&mut history, &repo_path).await;
-                let entry = super::load_registry_entry_in(&self.scratch, id);
-                let reason = entry
-                    .as_ref()
+                let reason = super::load_registry_entry_in(&self.scratch, id)
                     .map(|e| e.status)
                     .unwrap_or(super::RegistryStatus::Stopped);
                 let prefix = match reason {
@@ -1556,16 +1493,8 @@ impl super::WorkerPool {
                         reason = other.display_name()
                     ),
                 };
-                // A continuation that resumes an interrupted run keeps the
-                // budget that run was under, so a hub handover costs it only
-                // the turns it had already spent. An explicit budget -- the
-                // orchestrator's `--max-turns` -- still wins.
-                let resume = match revision_turns {
-                    Some(_) => None,
-                    None => entry.as_ref().and_then(ResumedTurns::of_interrupted),
-                };
                 let outcome = self
-                    .revise_with_prefix(id, history, prefix, message, revision_turns, resume)
+                    .revise_with_prefix(id, history, prefix, message, revision_turns)
                     .await?;
                 if let Some(branch) = detected {
                     // Persist the detected base branch on the row so the next
@@ -1762,15 +1691,7 @@ impl super::WorkerPool {
         // row's recorded head before anything is relaunched.
         self.ensure_worker_branch(id, &repo_path, &branch).await?;
 
-        // The same rule as the warm path: an interrupted run resumes its own
-        // ceiling and counter, a finished one gets a fresh budget.
-        let resume = match revision_turns {
-            Some(_) => None,
-            None => ResumedTurns::of_interrupted(&entry),
-        };
-        let max_turns = revision_turns
-            .or(resume.map(|r| r.max_turns))
-            .unwrap_or(super::DEFAULT_REVISION_TURNS);
+        let max_turns = revision_turns.unwrap_or(super::DEFAULT_REVISION_TURNS);
         if max_turns == 0 {
             anyhow::bail!("Revision budget for worker {id} must be at least 1 turn");
         }
@@ -1823,14 +1744,7 @@ impl super::WorkerPool {
             ],
         };
         let outcome = self
-            .revise_with_prefix(
-                id,
-                history,
-                String::new(),
-                String::new(),
-                Some(max_turns),
-                resume,
-            )
+            .revise_with_prefix(id, history, String::new(), String::new(), Some(max_turns))
             .await?;
         Ok(SteerOutcome::Continuing {
             revision: outcome_revision(&outcome),
@@ -1872,7 +1786,6 @@ impl super::WorkerPool {
                 REVISION_PREFIX.to_string(),
                 message,
                 revision_turns,
-                None,
             )
             .await?;
         if let Some(branch) = detected {
@@ -1887,11 +1800,6 @@ impl super::WorkerPool {
     /// A completed worker is revised with [`REVISION_PREFIX`]; one that stopped
     /// for any other reason is continued with [`CONTINUE_PREFIX`], which names
     /// the reason so the model knows what it is picking up from.
-    ///
-    /// `resume` is the budget of an interrupted run being picked up again: its
-    /// ceiling and its step counter, so the run continues under the same
-    /// absolute ceiling. `None` starts the counter at zero, which is what a
-    /// fresh budget means.
     pub(crate) async fn revise_with_prefix(
         &self,
         id: &str,
@@ -1899,15 +1807,11 @@ impl super::WorkerPool {
         prefix: String,
         message: String,
         revision_turns: Option<usize>,
-        resume: Option<ResumedTurns>,
     ) -> anyhow::Result<SteerOutcome> {
-        let max_turns = revision_turns
-            .or(resume.map(|r| r.max_turns))
-            .unwrap_or(super::DEFAULT_REVISION_TURNS);
+        let max_turns = revision_turns.unwrap_or(super::DEFAULT_REVISION_TURNS);
         if max_turns == 0 {
             anyhow::bail!("Revision budget for worker {id} must be at least 1 turn");
         }
-        let resume_step = resume.map(|r| r.step).unwrap_or(0);
 
         let repo_path = std::path::PathBuf::from(&history.repo_path);
         if !repo_path.is_dir() {
@@ -1986,7 +1890,7 @@ impl super::WorkerPool {
             .clone()
             .unwrap_or_else(|| super::UNATTRIBUTED_OWNER.to_string());
         let running = super::WorkerState::Running {
-            step: resume_step,
+            step: 0,
             last_command: format!("revision {revision} starting"),
             started_at: now,
         };
@@ -2047,7 +1951,7 @@ impl super::WorkerPool {
             task: history.task.clone(),
             model: history.model.clone(),
             status: super::RegistryStatus::Running,
-            step: resume_step,
+            step: 0,
             max_turns,
             last_command: format!("revision {revision} starting"),
             question: None,
@@ -2119,7 +2023,6 @@ impl super::WorkerPool {
             resume_messages: Some(std::mem::take(&mut history.messages)),
             resume_base_commit: Some(base_commit.clone()),
             resume_base_branch: history.base_branch.clone(),
-            resume_step,
         };
         let handle = tokio::spawn(async move {
             if let Err(e) = pool

@@ -52,24 +52,20 @@ impl McpServer {
         // resumed, a stopped one continued -- as a revision of its saved
         // conversation, or cold when none survived.
         if let SteerOutcome::Continuing { revision, cold } = outcome {
-            // The reply names a budget only when the orchestrator set one: an
-            // interrupted run resumed without one keeps the budget it was
-            // running under, so naming the revision default here would lie.
-            let budget = match revision_turns {
-                Some(turns) => format!(" with a fresh budget of {turns} turns"),
-                None => String::new(),
-            };
+            let budget = self.revision_await_budget(revision_turns);
             let (status, message) = if cold {
                 (
                     "continuing",
                     format!(
-                        "Continuing worker {wid} on branch worker-{wid} with a fresh conversation (no saved history){budget}"
+                        "Continuing worker {wid} on branch worker-{wid} with a fresh conversation (no saved history) and a fresh budget of {budget} turns"
                     ),
                 )
             } else {
                 (
                     "revising",
-                    format!("Revision {revision} started on branch worker-{wid}{budget}"),
+                    format!(
+                        "Revision {revision} started on branch worker-{wid} with a fresh budget of {budget} turns"
+                    ),
                 )
             };
             let mut payload = json!({
@@ -96,6 +92,12 @@ impl McpServer {
         });
         self.with_watch_command(&mut payload, ctx).await;
         Ok(payload)
+    }
+
+    /// Fresh turn budget a revision started by steering a finished worker runs
+    /// on: the explicit `max_turns`, or the default revision budget.
+    pub(super) fn revision_await_budget(&self, explicit: Option<usize>) -> usize {
+        explicit.unwrap_or(crate::pool::DEFAULT_REVISION_TURNS)
     }
 }
 

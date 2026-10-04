@@ -88,9 +88,6 @@ pub struct RunConfig<'a> {
     pub repo_path_str: &'a str,
     /// The dispatcher's ambient environment for the differential verify run.
     pub client_env: &'a [(String, String)],
-    /// Step the loop's monotonic counter starts at: `0` unless this run
-    /// continues an interrupted one, which keeps the counter it had.
-    pub resume_step: usize,
 }
 
 /// Everything the execution loop needs to start one worker.
@@ -120,10 +117,6 @@ pub struct WorkerLaunchConfig {
     /// a fresh one, so a revision keeps its id, its branch and its checkpoints.
     pub resume_base_commit: Option<String>,
     pub resume_base_branch: Option<String>,
-    /// Step counter the run resumes at. `0` for a fresh dispatch and for a
-    /// revision, which both get a whole new budget; an interrupted run that is
-    /// continued keeps the counter it had, so its ceiling stays absolute.
-    pub resume_step: usize,
 }
 
 /// Deletes a worker's steering mailbox when the worker exits.
@@ -264,7 +257,6 @@ impl WorkerPool {
             resume_messages,
             resume_base_commit,
             resume_base_branch,
-            resume_step,
         } = config;
 
         let repo_path_str = repo_path.to_string_lossy().to_string();
@@ -423,7 +415,6 @@ impl WorkerPool {
                 verify: verify.as_deref(),
                 repo_path_str: &repo_path_str,
                 client_env: &client_env,
-                resume_step,
             },
             meta,
             &mut worktree,
@@ -486,10 +477,7 @@ impl WorkerPool {
             worker_id,
         };
 
-        // A continuation of an interrupted run resumes its own counter, so the
-        // ceiling it resumes under stays absolute: 30 turns spent of 250 leaves
-        // 220, not a fresh 250 (or the revision default).
-        let mut step = config.resume_step;
+        let mut step = 0;
         let mut current_max_turns = max_turns;
         let mut consecutive_no_cmd = 0;
         let mut last_assistant_text = String::new();
