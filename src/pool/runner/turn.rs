@@ -1961,6 +1961,12 @@ pub(super) struct TurnConfig<'a> {
     pub steer_prefix: &'a str,
     /// Whether REQUEST_TURNS / ASK_ORCHESTRATOR sentinels apply.
     pub apply_sentinels: bool,
+    /// Whether the phase may self-grant turns through `REQUEST_TURNS` even
+    /// when the other sentinels are off. The review phase sizes its budget to
+    /// the diff, so a large or tricky audit must be able to ask for more;
+    /// checkpointing, change detectors and report scanning stay off for the
+    /// reviewer.
+    pub request_turns: bool,
     /// Whether the read-only nudge/plan/pause escalation is armed at all.
     /// It is a guard against an implementer that reads instead of writing, so
     /// a consolidator and the review phases set this: reviewing, merging,
@@ -2474,8 +2480,12 @@ impl<'a> TurnEngine<'a> {
             }
         }
 
-        // --- Orchestrator control sentinels (implementer only) ---
-        if config.apply_sentinels {
+        // --- Orchestrator control sentinels ---
+        // REQUEST_TURNS is available to the implementer and to the reviewer:
+        // the review phase sizes its budget to the diff, so a large or tricky
+        // audit must be able to ask for more. ASK_ORCHESTRATOR stays
+        // implementer-only -- there is nobody to steer a review.
+        if config.apply_sentinels || config.request_turns {
             // REQUEST_TURNS, bounded by the self-grant budget: a worker may
             // add at most half of the budget its dispatch was given, so no
             // model can walk itself to the manifest ceiling unattended.
@@ -2520,7 +2530,9 @@ impl<'a> TurnEngine<'a> {
                     ));
                 }
             }
+        }
 
+        if config.apply_sentinels {
             // ASK_ORCHESTRATOR
             if let Some(question) = parse_ask_orchestrator(&cmd_str) {
                 let answer = self

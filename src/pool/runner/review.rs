@@ -1594,7 +1594,9 @@ fn review_turn_budget(
         return explicit;
     }
     let sized = 20 + changed_lines / 20 + 3 * changed_files;
-    sized.clamp(20, previous_budget)
+    // The 20-turn floor wins over the cap: a security review never gets fewer,
+    // even when the implementer's own budget was smaller.
+    sized.clamp(20, previous_budget.max(20))
 }
 
 /// The size of a diff as the turn budget reads it: the number of changed
@@ -1786,6 +1788,11 @@ impl WorkerPool {
                 label_prefix: "[review] ",
                 steer_prefix: "ORCHESTRATOR GUIDANCE:\n",
                 apply_sentinels: false,
+                // The review budget is sized to the diff, so a large or tricky
+                // audit must be able to ask for more turns; the implementer's
+                // other sentinels (checkpoint, change detectors, report
+                // scanning) stay off for the reviewer.
+                request_turns: true,
                 // Inspecting the diff and re-running the gate is the reviewer's
                 // job in both modes, so a turn that changes nothing is the
                 // review, not a stall: the read-only escalation stays off.
@@ -2006,5 +2013,62 @@ mod tests {
             warnings.iter().any(|w| w.contains("strongest")),
             "a `strongest:` key must warn: {warnings:?}"
         );
+    }
+
+    /// A small sensitive diff gets a small review budget: a 10-line single-file
+    /// change is 23 turns, not the reviewer model's full ceiling.
+    #[test]
+    fn a_10_line_single_file_diff_gets_23_turns() {
+        let diff = [
+            "diff --git a/src/reminder.rs b/src/reminder.rs",
+            "index 1111111..2222222 100644",
+            "--- a/src/reminder.rs",
+            "+++ b/src/reminder.rs",
+            "@@ -1,10 +1,11 @@",
+            "+line1",
+            "+line2",
+            "+line3",
+            "+line4",
+            "+line5",
+            "+line6",
+            "+line7",
+            "+line8",
+            "+line9",
+            "+line10",
+        ]
+        .join("\n");
+        let (changed_lines, changed_files) = diff_size(&diff);
+        assert_eq!((changed_lines, changed_files), (10, 1));
+        assert_eq!(
+            review_turn_budget(0, changed_lines, changed_files, 150),
+            23,
+            "20 + 10/20 + 3*1 = 23"
+        );
+    }
+
+    /// A large diff is capped at the budget the reviewer model would otherwise
+    /// have had, so sizing never makes a big audit cost more than before.
+    #[test]
+    fn a_2000_line_30_file_diff_is_capped_at_the_previous_budget() {
+        assert_eq!(
+            review_turn_budget(0, 2000, 30, 150),
+            150,
+            "20 + 2000/20 + 3*30 = 210, clamped to the previous budget"
+        );
+    }
+
+    /// An explicit dispatch `max_turns` wins over the sized budget whatever the
+    /// diff looks like.
+    #[test]
+    fn an_explicit_budget_is_unchanged() {
+        assert_eq!(review_turn_budget(150, 2000, 30, 100), 150);
+        assert_eq!(review_turn_budget(150, 10, 1, 100), 150);
+    }
+
+    /// The 20-turn floor wins over the cap: a security review never gets fewer
+    /// turns, even when the implementer's own budget was smaller.
+    #[test]
+    fn a_security_review_never_gets_fewer_than_20_turns() {
+        assert_eq!(review_turn_budget(0, 1, 1, 10), 20);
     }
 }
