@@ -304,33 +304,6 @@ pub(crate) fn salvage_dirty_worktree(dir: &Path) -> bool {
         .unwrap_or("unknown");
     let msg = format!("worker({id}): salvaged uncommitted work before prune");
     let branch = checked_out_branch(dir).unwrap_or_else(|| format!("worker-{id}"));
-    if !git(dir, "add -A", &["add", "-A"]).is_ok_and(|out| out.status.success()) {
-        return false;
-    }
-    let committed = git(
-        dir,
-        "commit",
-        &[
-            "-c",
-            "user.name=mini-swe",
-            "-c",
-            "user.email=mini-swe@localhost",
-            "commit",
-            "-m",
-            &msg,
-        ],
-    );
-    match committed {
-        Ok(out) if out.status.success() => {
-            info!(path = %dir.display(), "Salvaged uncommitted worker changes before prune");
-            return true;
-        }
-        _ => {
-            error!(path = %dir.display(), "Could not salvage uncommitted worker changes");
-            return false;
-        }
-    }
-    #[allow(unreachable_code)]
     match WorktreeGuard::commit_all(dir, "", &branch, &msg) {
         Ok(report) => {
             if report.committed() {
