@@ -4309,6 +4309,71 @@ mod tests {
         assert_eq!(nudges, 1);
     }
 
+    /// The observed run: a worker that had already written its REPORT went on
+    /// echoing `ORCHESTRATOR_CHECK_<n>` with only the number moving, and the
+    /// window never filled, because the digits in the *command* were not folded
+    /// the way the digits in its output were. An `echo`/`printf` of ordinary
+    /// text is a command like any other, so its base folds digits too and the
+    /// fourth unchanged run nudges.
+    #[test]
+    fn an_echo_of_a_moving_marker_is_a_loop() {
+        let mut detector = LoopDetector::default();
+        let mut nudges = 0;
+        for step in 1..=4usize {
+            let command = format!(r#"echo "ORCHESTRATOR_CHECK_{step}""#);
+            let base = normalize_command_base(&command);
+            assert_eq!(base, r#"echo "ORCHESTRATOR_CHECK_#""#, "{command}");
+            let output = format!("ORCHESTRATOR_CHECK_{step}\n");
+            match detector.record(step, &base, Some(0), output_digest(&output), Some(7)) {
+                LoopVerdict::None => {}
+                LoopVerdict::Nudge { count } => {
+                    assert_eq!(step, 4, "the fourth run is the one that nudges");
+                    assert_eq!(count, 4);
+                    nudges += 1;
+                }
+                LoopVerdict::Pause { .. } => {
+                    panic!("the first detection nudges, it does not pause")
+                }
+            }
+        }
+        assert_eq!(nudges, 1, "the marker loop must reach the nudge");
+    }
+
+    /// A harness sentinel keeps its own spelling: the engine answers each of
+    /// those itself, and waiting on four different jobs is the sanctioned
+    /// alternative to sleep-polling rather than a loop, even though the answers
+    /// differ only in a number the output digest folds away.
+    #[test]
+    fn a_harness_sentinel_is_not_folded_into_one_base() {
+        for template in [
+            r#"echo "WAIT_JOB: {n}""#,
+            r#"echo "KILL_JOB: {n}""#,
+            r#"echo "REQUEST_TURNS: {n}""#,
+            r#"echo "ASK_ORCHESTRATOR: what about step {n}?""#,
+            r#"echo "CONSOLIDATE_WAIT w{n}""#,
+        ] {
+            let mut detector = LoopDetector::default();
+            for step in 1..=4usize {
+                let command = template.replace("{n}", &step.to_string());
+                let base = normalize_command_base(&command);
+                assert_eq!(base, command, "{command}: a sentinel is not digit-folded");
+                assert!(
+                    matches!(
+                        detector.record(
+                            step,
+                            &base,
+                            Some(0),
+                            output_digest("job 3 is still running"),
+                            Some(7)
+                        ),
+                        LoopVerdict::None
+                    ),
+                    "{command}: four sentinel turns are not a loop"
+                );
+            }
+        }
+    }
+
     /// The nudge and the pause question carry the phrases the orchestrator and
     /// the worker are told to look for, and name the base command.
     #[test]
