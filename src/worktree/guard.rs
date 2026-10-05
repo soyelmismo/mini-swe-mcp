@@ -1277,7 +1277,9 @@ impl WorktreeGuard {
     /// * a deletion is always staged, because it only shrinks the tree;
     /// * a path the base commit already tracks is always staged, so a
     ///   repository that legitimately carries a large fixture or a `target/`
-    ///   directory keeps committing it;
+    ///   directory keeps committing it -- but only when the caller named a base
+    ///   it actually knows, since a commit without one would otherwise exempt
+    ///   the worker's own earlier checkpoints;
     /// * anything else is refused when a path component names a cache or tool
     ///   directory ([`SKIP_DIR_NAMES`]), when it sits under a directory the
     ///   worker created that holds a `.cache` entry, or when the file is larger
@@ -1307,11 +1309,19 @@ impl WorktreeGuard {
             return Ok(Staging::default());
         }
         let base = base_tree_at(path, base_commit)?;
+        // The tracked exemption needs a base the caller actually knows. A
+        // commit without one (the pool's kill path, the prune sweep's salvage)
+        // reads the checkout's `HEAD` for the directory rule alone, and must not
+        // exempt anything by it: `HEAD` carries the worker's own earlier
+        // checkpoints, and a path those carry can still hold content the worker
+        // grew past the cap after the last checkpoint -- exactly the blob a kill
+        // must keep out, at the one moment no notice can reach the worker.
+        let known_base = !base_commit.is_empty();
         let mut keep: Vec<String> = Vec::new();
         let mut skipped: Vec<SkippedPath> = Vec::new();
         for (index_status, worktree_status, rel) in changed {
             let deleted = index_status == 'D' || worktree_status == 'D';
-            if deleted || base.tracks(&rel) {
+            if deleted || (known_base && base.tracks(&rel)) {
                 keep.push(rel);
                 continue;
             }
@@ -1756,11 +1766,15 @@ impl BaseTree {
 
 /// Read the tree `base_commit` tracks.
 ///
-/// A caller without a base (the pool's kill path) reads the checkout's own
-/// `HEAD` instead: whatever that commit carries is in history either way, so it
-/// keeps being committed normally. A base the checkout cannot read yields an
-/// empty tree, which refuses nothing by the tracked rule and leaves the cache
-/// and size rules to apply to every path.
+/// A caller without a base (the pool's kill path, the prune sweep's salvage)
+/// reads the checkout's own `HEAD` instead, but only so
+/// [`throwaway_home`] can tell a directory the checkout already carries from
+/// one the worker created: `HEAD` also carries the worker's own earlier
+/// checkpoints, and a path those carry can still hold content the worker grew
+/// past the cap after the last checkpoint, so [`BaseTree::tracks`] is not
+/// consulted for such a commit. A base the checkout cannot read yields an empty
+/// tree, which refuses nothing by the tracked rule and leaves the cache and
+/// size rules to apply to every path.
 fn base_tree_at(path: &Path, base_commit: &str) -> Result<BaseTree> {
     let reference = if base_commit.is_empty() {
         "HEAD"

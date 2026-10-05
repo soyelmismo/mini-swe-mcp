@@ -281,10 +281,13 @@ fn checked_out_branch(dir: &Path) -> Option<String> {
 /// The salvage is a harness commit like any other, so it stages through the
 /// same gate as [`WorktreeGuard::commit_all`]: a cache or an oversized file the
 /// dead worker's tooling left behind dies with the directory instead of
-/// reaching the branch the sweep is about to preserve as unmerged. The
-/// checkout's own `HEAD` is the base -- whatever it carries is in history
-/// already -- and a checkout with no readable branch keeps the worker's own
-/// name, which is what the harness would have given it. `Ok` answers "the
+/// reaching the branch the sweep is about to preserve as unmerged. The sweep
+/// knows no base commit for a dead worker, so nothing is exempt from the cap or
+/// the cache rules here: a path the checkout's `HEAD` already carries can still
+/// hold content the worker grew past the cap after its last checkpoint, and a
+/// salvage is the one commit that can never ask the worker to move it. A
+/// checkout with no readable branch keeps the worker's own name, which is what
+/// the harness would have given it. `Ok` answers "the
 /// worktree holds nothing left to save", so a caller deciding whether it may
 /// release the checkout is never held by a cache.
 pub(crate) fn salvage_dirty_worktree(dir: &Path) -> bool {

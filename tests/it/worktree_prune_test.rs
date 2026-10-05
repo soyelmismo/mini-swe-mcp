@@ -486,6 +486,65 @@ fn salvage_leaves_cache_and_oversized_paths_out_of_the_commit() {
     );
 }
 
+/// A salvage must not re-commit content the worker grew past the cap after its
+/// own last checkpoint. The sweep knows no base commit for a dead worker, so
+/// the checkout's `HEAD` -- which already carries the small version the worker
+/// checkpointed -- must not exempt the path from the cap: a salvage is the one
+/// harness commit that can never ask the worker to move the file.
+#[test]
+fn salvage_refuses_a_committed_file_the_worker_grew_past_the_cap() {
+    let f = Fixture::new("salvage-grown");
+    let id = unique("salvage-grown");
+    let dir = f.base.join(format!("swe-wt-{id}"));
+    let branch = format!("worker-{id}");
+    let pid_file = {
+        let mut s = dir.clone().into_os_string();
+        s.push(".pid");
+        PathBuf::from(s)
+    };
+    run(
+        &f.repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            &branch,
+            dir.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    // An earlier checkpoint committed the file small, so the checkout's `HEAD`
+    // tracks it from here on.
+    std::fs::write(dir.join("data.bin"), vec![0u8; 1024 * 1024]).unwrap();
+    run(&dir, &["add", "data.bin"]);
+    run(&dir, &["commit", "-m", "worker: checkpoint"]);
+
+    // The worker then grew it past the cap and left a real edit behind.
+    std::fs::write(dir.join("data.bin"), vec![7u8; 20 * 1024 * 1024]).unwrap();
+    std::fs::write(dir.join("edit.rs"), "fn kept() {}\n").unwrap();
+    f.write_dead_lease(&pid_file);
+
+    f.sweep();
+
+    assert!(!dir.exists(), "the worktree directory survived the sweep");
+    assert!(
+        branch_exists(&f.repo, &branch),
+        "salvaged branch {branch} was destroyed"
+    );
+    let committed = run(&f.repo, &["ls-tree", "-r", "--name-only", &branch]);
+    assert!(
+        committed.contains("edit.rs"),
+        "the worker's edit was not salvaged: {committed:?}"
+    );
+    let size = run(&f.repo, &["cat-file", "-s", &format!("{branch}:data.bin")])
+        .trim()
+        .to_string();
+    assert_eq!(
+        size, "1048576",
+        "content the worker grew past the cap was salvaged onto {branch}"
+    );
+}
+
 fn branch_exists(repo: &Path, branch: &str) -> bool {
     Command::new("git")
         .current_dir(repo)
