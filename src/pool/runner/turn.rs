@@ -58,7 +58,7 @@ use tracing::{info, warn};
 use crate::agent::exec::tree_fingerprint;
 use crate::agent::{AgentRunner, ChatMessage, LlmResponse, Role, ToolCall};
 use crate::manifest::MAX_TURNS_LIMIT;
-use crate::worktree::{BaseSync, WorktreeGuard, git};
+use crate::worktree::{BaseSync, CommitReport, WorktreeGuard, git};
 
 use super::super::WorkerPool;
 use super::super::admission::AdmissionClass;
@@ -2143,16 +2143,18 @@ impl<'a> TurnEngine<'a> {
                     // `commit_changes` shells out to git, so it runs off the runtime thread.
                     {
                         let path = self.worktree.path.clone();
+                        let base_commit = self.worktree.base_commit.clone();
+                        let branch = self.worktree.branch.clone();
                         let message = format!(
                             "worker({}): checkpoint step {} before pause (error: {})",
                             self.worker_id, *self.step, e
                         );
                         let committed = tokio::task::spawn_blocking(move || {
-                            WorktreeGuard::commit_all(&path, &message)
+                            WorktreeGuard::commit_all(&path, &base_commit, &branch, &message)
                         })
                         .await
-                        .unwrap_or(Ok(false));
-                        if committed.unwrap_or(false) {
+                        .unwrap_or(Ok(CommitReport::default()));
+                        if committed.map(|r| r.committed()).unwrap_or(false) {
                             self.worktree.preserve_branch = true;
                         }
                     }
@@ -3161,6 +3163,12 @@ impl<'a> TurnEngine<'a> {
     /// how many files went in and names the base commit it can diff against to
     /// see the whole change set.
     ///
+    /// The commit also refuses what must never reach history -- a file over the
+    /// commit cap, a compile cache under a tool home the worker pointed inside
+    /// its worktree -- and names each refused path in the same notice, so the
+    /// model learns where its files went instead of re-running the command that
+    /// produced them.
+    ///
     /// `commit_changes` shells out to git, so it runs off the runtime thread.
     async fn checkpoint(&mut self) {
         let message = format!(
@@ -3175,26 +3183,34 @@ impl<'a> TurnEngine<'a> {
             WorktreeGuard::commit_changes_at(&path, &repo_root, &branch, &base_commit, &message)
         })
         .await
-        .unwrap_or(Ok(None));
+        .unwrap_or(Ok(CommitReport::default()));
         match committed {
-            Ok(Some(kept)) => {
-                self.worktree.preserve_branch = true;
-                let files = self.changed_file_count().await;
-                self.push_message(ChatMessage::text(
-                    Role::User,
-                    format!(
+            Ok(report) => {
+                if report.committed() {
+                    self.worktree.preserve_branch = true;
+                    let files = self.changed_file_count().await;
+                    let mut notice = format!(
                         "Checkpoint committed ({files} files); your full change set: `git diff {base}`.",
                         base = self.worktree.base_commit,
-                    ),
-                ));
-                info!(
-                    worker = %self.worker_id,
-                    step = *self.step,
-                    branch = %kept,
-                    "Committed worker checkpoint"
-                )
+                    );
+                    if let Some(skipped) = report.notice_lines() {
+                        notice.push_str("\n\n");
+                        notice.push_str(&skipped);
+                    }
+                    self.push_message(ChatMessage::text(Role::User, notice));
+                    info!(
+                        worker = %self.worker_id,
+                        step = *self.step,
+                        branch = %self.worktree.branch,
+                        "Committed worker checkpoint"
+                    )
+                } else if let Some(skipped) = report.notice_lines() {
+                    self.push_message(ChatMessage::text(
+                        Role::User,
+                        format!("Checkpoint committed nothing; {skipped}"),
+                    ));
+                }
             }
-            Ok(None) => {}
             Err(e) => warn!(
                 worker = %self.worker_id,
                 step = *self.step,

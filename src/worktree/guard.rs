@@ -31,13 +31,15 @@ use super::{
     remove_target_dirs_in,
 };
 use anyhow::{Context, Result};
-use std::collections::BTreeMap;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::UNIX_EPOCH;
 use tracing::{debug, info, warn};
+
+use crate::config::env_parse;
 
 /// Unversioned dirs copied into a fresh worktree (readable without git
 /// tracking) and synced back on the way out.
@@ -60,13 +62,139 @@ const SKIP_DIR_NAMES: &[&str] = &[
     ".pytest_cache",
     ".ruff_cache",
     ".cargo",
+    ".rustup",
+    ".cache",
     ".next",
     ".turbo",
 ];
 
-/// True when a directory entry must never be copied out of a worktree.
+/// True when a directory entry must never be copied out of a worktree, and a
+/// path component must never be staged into a harness commit.
 fn is_skipped_dir_name(name: &str) -> bool {
     SKIP_DIR_NAMES.contains(&name)
+}
+
+/// Ceiling, in megabytes, on one file a harness commit may stage.
+///
+/// A worker that points `HOME` (or a tool's own state directory) inside its
+/// worktree fills the tree with a compile cache; committing it pushed 164 MB
+/// blobs into history that a remote then refused. The cap is read at each
+/// commit, so a test can lower it without touching process state.
+const MAX_COMMIT_FILE_MB_ENV: &str = "MINI_SWE_MAX_COMMIT_FILE_MB";
+
+/// The commit cap used when [`MAX_COMMIT_FILE_MB_ENV`] is unset or unparsable.
+const DEFAULT_MAX_COMMIT_FILE_MB: u64 = 10;
+
+/// The commit cap in bytes, `0` when the operator disabled it.
+fn commit_file_cap_bytes() -> u64 {
+    cap_bytes(env_parse::<u64>(MAX_COMMIT_FILE_MB_ENV).unwrap_or(DEFAULT_MAX_COMMIT_FILE_MB))
+}
+
+/// The commit cap in bytes for a cap the operator gave in megabytes.
+///
+/// Saturating, like every other env-derived byte count in this crate: a value
+/// no byte count can hold means "no cap", while a wrapping multiply would panic
+/// a debug build in the middle of every harness commit and hand a release build
+/// a meaningless number instead.
+fn cap_bytes(megabytes: u64) -> u64 {
+    megabytes.saturating_mul(1024 * 1024)
+}
+
+/// Why a harness commit left a path out of the index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SkipReason {
+    /// The file is larger than the commit cap.
+    TooLarge,
+    /// The path sits in a cache directory or a tool home the worker created.
+    CacheDir,
+}
+
+/// One path a harness commit refused to stage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedPath {
+    /// Repository-relative path, as `git status` spelled it.
+    pub path: String,
+    /// The file's size in bytes, when it could be measured.
+    pub bytes: Option<u64>,
+    reason: SkipReason,
+}
+
+impl SkippedPath {
+    /// The one-line explanation a checkpoint notice shows the worker.
+    fn notice_line(&self) -> String {
+        let why = match self.reason {
+            SkipReason::TooLarge => "larger than the commit cap",
+            SkipReason::CacheDir => "cache directory",
+        };
+        let size = self
+            .bytes
+            .map(format_size)
+            .unwrap_or_else(|| "unknown size".to_string());
+        format!(
+            "not committed: {} ({size}), {why} -- move it to $TMPDIR",
+            self.path
+        )
+    }
+}
+
+/// Render a byte count the way a worker reads it: megabytes once the number is
+/// large enough to matter, kilobytes below that, bytes below that.
+fn format_size(bytes: u64) -> String {
+    const MIB: f64 = 1024.0 * 1024.0;
+    const KIB: f64 = 1024.0;
+    let bytes = bytes as f64;
+    if bytes >= MIB {
+        format!("{:.1} MB", bytes / MIB)
+    } else if bytes >= KIB {
+        format!("{:.1} KB", bytes / KIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// What one staging pass kept and refused.
+#[derive(Default)]
+struct Staging {
+    /// True when at least one path reached the index, so a commit has content.
+    staged: bool,
+    /// Paths the pass refused to stage.
+    skipped: Vec<SkippedPath>,
+}
+
+/// What one harness commit did: whether it committed, and what it left out.
+#[derive(Debug, Default, Clone)]
+pub struct CommitReport {
+    /// The branch that carries the commit, when one was made.
+    pub branch: Option<String>,
+    /// Paths the commit refused to stage, deduplicated, in path order.
+    pub skipped: Vec<SkippedPath>,
+}
+
+impl CommitReport {
+    /// True when a commit was created.
+    pub fn committed(&self) -> bool {
+        self.branch.is_some()
+    }
+
+    /// The lines a checkpoint notice shows the worker, in path order and
+    /// capped so a worktree full of cache files cannot flood the model.
+    /// `None` when nothing was refused.
+    pub fn notice_lines(&self) -> Option<String> {
+        if self.skipped.is_empty() {
+            return None;
+        }
+        const MAX_REPORTED: usize = 20;
+        let shown = self.skipped.len().min(MAX_REPORTED);
+        let mut lines: Vec<String> = self.skipped[..shown]
+            .iter()
+            .map(SkippedPath::notice_line)
+            .collect();
+        let rest = self.skipped.len() - shown;
+        if rest > 0 {
+            lines.push(format!("... and {rest} more paths left out"));
+        }
+        Some(lines.join("\n"))
+    }
 }
 
 /// Ceiling on a sanitized worker id, so a caller cannot force a path or branch
@@ -1000,34 +1128,57 @@ impl WorktreeGuard {
         }
     }
 
-    /// Stage and commit everything in the worktree at `path`, reporting
-    /// whether a commit was actually created.
+    /// Stage and commit the worktree at `path`, naming `branch` when this pass
+    /// created a commit on it and reporting what was left out.
     ///
     /// Split out of [`WorktreeGuard::commit_changes`] so the pool's `kill`
     /// path can commit the uncommitted work of a worker whose guard it does
     /// not own: a `kill` must not lose work, and the aborted task tears its
     /// worktree down on the way out. A clean tree is not an error and simply
-    /// reports `false`, so the caller can stay quiet about it.
-    pub(crate) fn commit_all(path: &Path, message: &str) -> Result<bool> {
+    /// reports no commit, so the caller can stay quiet about it.
+    ///
+    /// Every harness commit goes through here, so the staging rules of
+    /// [`stage_commitable_changes_at`] hold for auto-checkpoints, the final
+    /// commit and the checkpoint before a merge alike.
+    pub(crate) fn commit_all(
+        path: &Path,
+        base_commit: &str,
+        branch: &str,
+        message: &str,
+    ) -> Result<CommitReport> {
+        Self::commit_all_capped(path, base_commit, branch, commit_file_cap_bytes(), message)
+    }
+
+    /// [`WorktreeGuard::commit_all`] with the per-file cap in bytes supplied
+    /// instead of read from `MINI_SWE_MAX_COMMIT_FILE_MB`, so a test can lower
+    /// it without touching process state. `0` disables the cap.
+    fn commit_all_capped(
+        path: &Path,
+        base_commit: &str,
+        branch: &str,
+        cap_bytes: u64,
+        message: &str,
+    ) -> Result<CommitReport> {
         // Completion owns merge resolution; checkpoints must not commit markers.
         if Self::merge_in_progress_at(path)? {
             anyhow::bail!("Base merge is still in progress; resolve it and request completion");
         }
-        // Stage all changes (both tracked and untracked).
-        let _ = git(path, "add", &["add", "-A"]);
-
-        // Check if there are changes to commit.
-        let status = git(path, "status", &["status", "--porcelain"])?;
-        if !status.status.success() {
-            let stderr = String::from_utf8_lossy(&status.stderr);
-            anyhow::bail!("git status failed: {}", stderr.trim());
-        }
-        if status.stdout.is_empty() {
-            return Ok(false);
+        let staging = Self::stage_commitable_changes_at(path, base_commit, cap_bytes)?;
+        let skipped = staging.skipped;
+        if !staging.staged {
+            // Nothing the rules allowed reached the index, so a commit here
+            // would be an empty one preserving a branch that carries no work.
+            return Ok(CommitReport {
+                branch: None,
+                skipped,
+            });
         }
 
         Self::commit_staged_at(path, message)?;
-        Ok(true)
+        Ok(CommitReport {
+            branch: Some(branch.to_string()),
+            skipped,
+        })
     }
 
     fn commit_staged_at(path: &Path, message: &str) -> Result<()> {
@@ -1055,18 +1206,26 @@ impl WorktreeGuard {
 
     /// Commit all dirty changes in the worktree to preserve work in git history,
     /// marking the branch to be retained upon worktree cleanup.
-    pub fn commit_changes(&mut self, message: &str) -> Result<Option<String>> {
-        let committed = Self::commit_changes_at(
+    pub fn commit_changes(&mut self, message: &str) -> Result<CommitReport> {
+        self.commit_changes_capped(message, commit_file_cap_bytes())
+    }
+
+    /// [`WorktreeGuard::commit_changes`] with the per-file cap in bytes
+    /// supplied instead of read from `MINI_SWE_MAX_COMMIT_FILE_MB`, so a test
+    /// can lower it without touching process state. `0` disables the cap.
+    pub fn commit_changes_capped(&mut self, message: &str, cap_bytes: u64) -> Result<CommitReport> {
+        let report = Self::commit_changes_capped_at(
             &self.path,
             &self.repo_root,
             &self.branch,
             &self.base_commit,
+            cap_bytes,
             message,
         )?;
-        if committed.is_some() {
+        if report.committed() {
             self.preserve_branch = true;
         }
-        Ok(committed)
+        Ok(report)
     }
 
     /// Shared core of [`WorktreeGuard::commit_changes`] on owned paths, so it
@@ -1079,13 +1238,143 @@ impl WorktreeGuard {
         branch: &str,
         base_commit: &str,
         message: &str,
-    ) -> Result<Option<String>> {
-        if Self::commit_all(path, message)?
-            || Self::branch_has_commits_at(repo_root, base_commit, branch)
-        {
-            return Ok(Some(branch.to_string()));
+    ) -> Result<CommitReport> {
+        Self::commit_changes_capped_at(
+            path,
+            repo_root,
+            branch,
+            base_commit,
+            commit_file_cap_bytes(),
+            message,
+        )
+    }
+
+    /// [`WorktreeGuard::commit_changes_at`] with the per-file cap in bytes
+    /// supplied instead of read from `MINI_SWE_MAX_COMMIT_FILE_MB`, so a test
+    /// can lower it without touching process state. `0` disables the cap.
+    pub fn commit_changes_capped_at(
+        path: &Path,
+        repo_root: &Path,
+        branch: &str,
+        base_commit: &str,
+        cap_bytes: u64,
+        message: &str,
+    ) -> Result<CommitReport> {
+        let mut report = Self::commit_all_capped(path, base_commit, branch, cap_bytes, message)?;
+        if !report.committed() && Self::branch_has_commits_at(repo_root, base_commit, branch) {
+            report.branch = Some(branch.to_string());
         }
-        Ok(None)
+        Ok(report)
+    }
+
+    /// Stage every change the harness may commit, and report what it refused.
+    ///
+    /// This is the gate every harness commit stages its files through, so a
+    /// compile cache a worker grew inside its own worktree (a `HOME` pointed at
+    /// `.envcheck/home`, say) can never reach the index and the history a
+    /// remote pulls. The rules, in order:
+    ///
+    /// * a deletion is always staged, because it only shrinks the tree;
+    /// * a path the base commit already tracks is always staged, so a
+    ///   repository that legitimately carries a large fixture or a `target/`
+    ///   directory keeps committing it -- but only when the caller named a base
+    ///   it actually knows, since a commit without one would otherwise exempt
+    ///   the worker's own earlier checkpoints;
+    /// * anything else is refused when a path component names a cache or tool
+    ///   directory ([`SKIP_DIR_NAMES`]), when it sits under a directory the
+    ///   worker created that holds a `.cache` entry, or when the file is larger
+    ///   than the commit cap.
+    ///
+    /// A refused path is never staged, so its content never reaches the object
+    /// database, and anything an earlier pass left staged for it is unstaged.
+    /// The caller reports the refusals to the worker.
+    fn stage_commitable_changes_at(
+        path: &Path,
+        base_commit: &str,
+        cap_bytes: u64,
+    ) -> Result<Staging> {
+        let status = git(
+            path,
+            "status",
+            &["status", "--porcelain", "-z", "--untracked-files=all"],
+        )?;
+        if !status.status.success() {
+            anyhow::bail!(
+                "git status failed: {}",
+                String::from_utf8_lossy(&status.stderr).trim()
+            );
+        }
+        let changed = status_entries(&status.stdout);
+        if changed.is_empty() {
+            return Ok(Staging::default());
+        }
+        let base = base_tree_at(path, base_commit)?;
+        // The tracked exemption needs a base the caller actually knows. A
+        // commit without one (the pool's kill path, the prune sweep's salvage)
+        // reads the checkout's `HEAD` for the directory rule alone, and must not
+        // exempt anything by it: `HEAD` carries the worker's own earlier
+        // checkpoints, and a path those carry can still hold content the worker
+        // grew past the cap after the last checkpoint -- exactly the blob a kill
+        // must keep out, at the one moment no notice can reach the worker.
+        let known_base = !base_commit.is_empty();
+        let mut keep: Vec<String> = Vec::new();
+        let mut skipped: Vec<SkippedPath> = Vec::new();
+        for (index_status, worktree_status, rel) in changed {
+            let deleted = index_status == 'D' || worktree_status == 'D';
+            if deleted || (known_base && base.tracks(&rel)) {
+                keep.push(rel);
+                continue;
+            }
+            match Self::commit_refusal(path, &rel, cap_bytes, &base) {
+                Some((reason, bytes)) => skipped.push(SkippedPath {
+                    path: rel,
+                    bytes,
+                    reason,
+                }),
+                None => keep.push(rel),
+            }
+        }
+
+        // A path an earlier pass staged (`add -A` during a merge, `add -N`
+        // while diffing) must not survive in the index once it is refused:
+        // unstaging it keeps the blob out of the commit this pass is about to
+        // make.
+        if !skipped.is_empty() {
+            let refused: Vec<String> = skipped.iter().map(|s| s.path.clone()).collect();
+            run_pathspecs(path, "reset", &["reset", "--quiet"], &refused);
+        }
+        log_skipped(path, &skipped);
+        if !keep.is_empty() {
+            run_pathspecs(path, "add", &["add"], &keep);
+        }
+        Ok(Staging {
+            staged: !keep.is_empty(),
+            skipped,
+        })
+    }
+
+    /// Why a new path must not be staged, or `None` when it may be.
+    ///
+    /// `None` also covers a file that vanished between the status read and this
+    /// pass: staging it would fail the whole `git add`, and the next
+    /// checkpoint's status reports the deletion and stages it then.
+    fn commit_refusal(
+        worktree: &Path,
+        rel: &str,
+        cap: u64,
+        base: &BaseTree,
+    ) -> Option<(SkipReason, Option<u64>)> {
+        let Ok(meta) = std::fs::symlink_metadata(worktree.join(rel)) else {
+            return None;
+        };
+        let bytes = meta.len();
+        if rel.split('/').any(is_skipped_dir_name) || throwaway_home(worktree, rel, base) {
+            return Some((SkipReason::CacheDir, Some(bytes)));
+        }
+        if cap > 0 && bytes > cap {
+            return Some((SkipReason::TooLarge, Some(bytes)));
+        }
+        None
     }
 
     /// True when this worker's branch carries commits beyond `base_commit`.
@@ -1395,6 +1684,194 @@ impl Drop for TeardownMarker {
     }
 }
 
+/// How many paths one `git add` / `git reset` invocation takes.
+///
+/// Small enough that a change set of tens of thousands of files cannot push a
+/// single argv past the kernel's argument limit, large enough that the spawn
+/// cost stays negligible next to the commit itself.
+const PATHSPEC_CHUNK: usize = 256;
+
+/// Run `git args…` once per chunk of `paths`, each path wrapped in literal
+/// pathspec magic so a filename that starts with `:` or holds a glob character
+/// is never read as a pattern.
+///
+/// A chunk git refuses is retried path by path, because git aborts the whole
+/// invocation when a single pathspec matches nothing -- a file that vanished
+/// between the status read and this pass, or a name that is not valid UTF-8 --
+/// and one such path must not cost the other 255 their place in the commit. A
+/// path that still fails alone is logged and skipped rather than propagated:
+/// the `git add -A` this replaces was ignored on failure too, and one unreadable
+/// path must not cost a worker its whole checkpoint.
+fn run_pathspecs(path: &Path, operation: &str, args: &[&str], paths: &[String]) {
+    for chunk in paths.chunks(PATHSPEC_CHUNK) {
+        if run_pathspec_chunk(path, operation, args, chunk) {
+            continue;
+        }
+        for single in chunk {
+            run_pathspec_chunk(path, operation, args, std::slice::from_ref(single));
+        }
+    }
+}
+
+/// Run one `git args… -- <pathspecs>` invocation, answering whether git took it.
+fn run_pathspec_chunk(path: &Path, operation: &str, args: &[&str], chunk: &[String]) -> bool {
+    let specs: Vec<String> = chunk.iter().map(|p| format!(":(literal){p}")).collect();
+    let mut argv: Vec<&str> = args.to_vec();
+    argv.push("--");
+    argv.extend(specs.iter().map(String::as_str));
+    match git(path, operation, &argv) {
+        Ok(output) if output.status.success() => true,
+        Ok(output) => {
+            warn!(
+                worktree = %path.display(),
+                paths = chunk.len(),
+                error = %String::from_utf8_lossy(&output.stderr).trim(),
+                "git {} could not stage every path it was given", operation
+            );
+            false
+        }
+        Err(error) => {
+            warn!(
+                worktree = %path.display(),
+                error = %error,
+                "git {} could not run", operation
+            );
+            false
+        }
+    }
+}
+
+/// The paths and directories a commit's base commit tracks.
+///
+/// A path the base tracks is pre-existing work, so neither the size cap nor the
+/// cache rules apply to it: the repository chose to carry it before this worker
+/// started, and it is already in history.
+#[derive(Default)]
+struct BaseTree {
+    files: HashSet<String>,
+    dirs: HashSet<String>,
+}
+
+impl BaseTree {
+    /// True when `rel` is a file the base commit tracks.
+    fn tracks(&self, rel: &str) -> bool {
+        self.files.contains(rel)
+    }
+
+    /// True when `dir`, a repository-relative directory, existed in the base.
+    fn tracks_dir(&self, dir: &str) -> bool {
+        self.dirs.contains(dir)
+    }
+}
+
+/// Read the tree `base_commit` tracks.
+///
+/// A caller without a base (the pool's kill path, the prune sweep's salvage)
+/// reads the checkout's own `HEAD` instead, but only so
+/// [`throwaway_home`] can tell a directory the checkout already carries from
+/// one the worker created: `HEAD` also carries the worker's own earlier
+/// checkpoints, and a path those carry can still hold content the worker grew
+/// past the cap after the last checkpoint, so [`BaseTree::tracks`] is not
+/// consulted for such a commit. A base the checkout cannot read yields an empty
+/// tree, which refuses nothing by the tracked rule and leaves the cache and
+/// size rules to apply to every path.
+fn base_tree_at(path: &Path, base_commit: &str) -> Result<BaseTree> {
+    let reference = if base_commit.is_empty() {
+        "HEAD"
+    } else {
+        base_commit
+    };
+    let out = git(
+        path,
+        "ls-tree",
+        &["ls-tree", "-r", "--name-only", "-z", reference],
+    )?;
+    let mut tree = BaseTree::default();
+    if !out.status.success() {
+        debug!(
+            base = %reference,
+            "Could not read the base tree; the commit rules apply to every path"
+        );
+        return Ok(tree);
+    }
+    for entry in out.stdout.split(|b| *b == 0).filter(|e| !e.is_empty()) {
+        let rel = String::from_utf8_lossy(entry).into_owned();
+        let mut dir = rel.as_str();
+        while let Some((parent, _)) = dir.rsplit_once('/') {
+            dir = parent;
+            tree.dirs.insert(dir.to_string());
+        }
+        tree.files.insert(rel);
+    }
+    Ok(tree)
+}
+
+/// Whether `rel` sits under a throwaway tool home the worker created.
+///
+/// A worker that points `HOME` (or one tool's state directory) inside its
+/// worktree fills that directory with caches and tool state. The marker is a
+/// `.cache` entry: a directory the base commit does not track that holds one is
+/// a home a tool made for itself, and everything under it is tool state rather
+/// than work product. The checkout root is never one, so a repository that
+/// keeps a `.cache` of its own is unaffected -- its paths are refused by name
+/// instead.
+fn throwaway_home(worktree: &Path, rel: &str, base: &BaseTree) -> bool {
+    let mut dir = rel;
+    while let Some((parent, _)) = dir.rsplit_once('/') {
+        dir = parent;
+        if base.tracks_dir(dir) {
+            continue;
+        }
+        if worktree.join(dir).join(".cache").is_dir() {
+            return true;
+        }
+    }
+    false
+}
+
+/// The changed paths `git status --porcelain -z` reported, as
+/// `(index status, worktree status, path)` triples.
+///
+/// `-z` keeps the records NUL-terminated and the paths unquoted, so a filename
+/// holding a quote or a newline survives the round trip. A rename or a copy
+/// carries its origin as a second NUL-terminated field, consumed here and
+/// dropped: the new name is the one that has to be staged.
+fn status_entries(bytes: &[u8]) -> Vec<(char, char, String)> {
+    let mut out = Vec::new();
+    let mut fields = bytes.split(|b| *b == 0).filter(|f| !f.is_empty());
+    while let Some(field) = fields.next() {
+        let text = String::from_utf8_lossy(field).into_owned();
+        let mut chars = text.chars();
+        let (Some(x), Some(y), Some(' ')) = (chars.next(), chars.next(), chars.next()) else {
+            continue;
+        };
+        if x == 'R' || x == 'C' || y == 'R' || y == 'C' {
+            fields.next();
+        }
+        out.push((x, y, text[3..].to_string()));
+    }
+    out
+}
+
+/// Log the paths a harness commit refused, once per commit, at INFO.
+fn log_skipped(worktree: &Path, skipped: &[SkippedPath]) {
+    if skipped.is_empty() {
+        return;
+    }
+    let named = skipped
+        .iter()
+        .take(5)
+        .map(|s| s.path.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    info!(
+        worktree = %worktree.display(),
+        count = skipped.len(),
+        paths = %named,
+        "Left cache or oversized paths out of the harness commit"
+    );
+}
+
 fn checked_git(path: &Path, operation: &str, args: &[&str]) -> Result<std::process::Output> {
     let output = git(path, operation, args)?;
     if !output.status.success() {
@@ -1601,6 +2078,20 @@ fn copy_dir_all(
 mod tests {
     use super::*;
 
+    /// A cap the operator typed that no byte count can hold must mean "no cap",
+    /// not a harness commit that panics (a debug build) or wraps to a
+    /// meaningless number (a release build).
+    #[test]
+    fn a_huge_commit_cap_saturates_instead_of_overflowing() {
+        assert_eq!(cap_bytes(u64::MAX), u64::MAX);
+        assert_eq!(
+            cap_bytes(0),
+            0,
+            "0 is the documented off switch and must stay 0"
+        );
+        assert_eq!(cap_bytes(10), 10 * 1024 * 1024);
+    }
+
     /// The sanitized id is spliced into a branch name and into a path that
     /// `Drop` recursively deletes, so these are the two properties it must hold.
     #[test]
@@ -1707,6 +2198,79 @@ mod tests {
             .join(format!("swe-lease-{tag}-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&path).expect("repository root must be creatable");
         path
+    }
+
+    /// Run one git command in `dir`, failing the test when git refuses it.
+    fn git_ok(dir: &Path, args: &[&str]) {
+        let out = git(dir, args[0], args).expect("git must run");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A throwaway repository with one baseline commit, plus the scratch root
+    /// its checkouts are filed under. Both live under the process temp dir, so
+    /// the test never touches the real scratch base.
+    fn repo_with_worktree(tag: &str) -> (PathBuf, WorktreeGuard) {
+        let scratch =
+            std::env::temp_dir().join(format!("swe-guard-{tag}-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&scratch).expect("create scratch root");
+        let repo = scratch.join("repo");
+        std::fs::create_dir_all(&repo).expect("create repo");
+        git_ok(&repo, &["init", "-b", "master"]);
+        git_ok(&repo, &["config", "user.name", "mini-swe-test"]);
+        git_ok(&repo, &["config", "user.email", "test@localhost"]);
+        std::fs::write(repo.join("README.md"), "# scratch\n").expect("seed file");
+        git_ok(&repo, &["add", "README.md"]);
+        git_ok(&repo, &["commit", "-m", "baseline"]);
+        let root = scratch.join("worktrees");
+        std::fs::create_dir_all(&root).expect("create worktree root");
+        let guard = WorktreeGuard::new_in(&ScratchRoot::new(&root), &repo, tag)
+            .expect("worktree must be created");
+        (scratch, guard)
+    }
+
+    /// `commit_all` is what the pool's kill path and the phase checkpoints
+    /// consult, so its report is the only signal those callers have that a
+    /// commit was created: a dirty worktree must name the branch, a clean one
+    /// must not.
+    #[test]
+    fn commit_all_reports_the_commit_it_made() {
+        let (scratch, guard) = repo_with_worktree("commit-all-report");
+
+        let clean = WorktreeGuard::commit_all(
+            &guard.path,
+            &guard.base_commit,
+            &guard.branch,
+            "worker: nothing to do",
+        )
+        .expect("a clean tree is not an error");
+        assert!(
+            !clean.committed(),
+            "a clean worktree must not report a commit: {clean:?}"
+        );
+
+        std::fs::write(guard.path.join("edit.rs"), "fn main() {}\n").expect("write edit");
+        let report = WorktreeGuard::commit_all(
+            &guard.path,
+            &guard.base_commit,
+            &guard.branch,
+            "worker: checkpoint",
+        )
+        .expect("commit must succeed");
+        assert!(
+            report.committed(),
+            "the commit was created and must be reported: {report:?}"
+        );
+        assert_eq!(
+            report.branch.as_deref(),
+            Some(guard.branch.as_str()),
+            "the report must name the branch the commit landed on"
+        );
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 
     /// The worker's dir is leased once and held for its whole lifetime, so a
