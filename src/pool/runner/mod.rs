@@ -518,6 +518,9 @@ impl WorkerPool {
                     label_prefix: "",
                     steer_prefix: "STEER / ORCHESTRATOR GUIDANCE:\n",
                     apply_sentinels: true,
+                    // The implementer already has REQUEST_TURNS through
+                    // `apply_sentinels`; the reviewer's separate flag stays off.
+                    request_turns: false,
                     // A consolidator reviews, merges, steers and waits; it is not
                     // paid to edit, so the read-only escalation would pause it for
                     // doing its job. An ordinary implementer keeps the guard.
