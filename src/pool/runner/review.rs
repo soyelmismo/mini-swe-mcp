@@ -1610,9 +1610,9 @@ fn diff_size(diff: &str) -> (usize, usize) {
     for line in diff.lines() {
         if line.starts_with("diff --git") {
             changed_files += 1;
-        } else if line.starts_with('+') && !line.starts_with("+++") {
-            changed_lines += 1;
-        } else if line.starts_with('-') && !line.starts_with("---") {
+        } else if (line.starts_with('+') && !line.starts_with("+++"))
+            || (line.starts_with('-') && !line.starts_with("---"))
+        {
             changed_lines += 1;
         }
     }
