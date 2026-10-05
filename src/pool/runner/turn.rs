@@ -27,7 +27,11 @@
 //! consolidator or a reviewer. [`normalize_command_base`] maps each spelling
 //! to one base command, [`LoopDetector`] counts the runs inside a sliding
 //! window, and the escalation is a concrete nudge followed by an orchestrator
-//! pause that quotes the loop back.
+//! pause that quotes the loop back. An `echo`/`printf` of ordinary text is one
+//! of those commands, its digits folded like its output's, so a marker that
+//! only moves by its number (`echo "ORCHESTRATOR_CHECK_8"`) is one command said
+//! again; the sentinels the harness answers itself keep their own spelling
+//! ([`is_harness_sentinel`]).
 //!
 //! The read-only detector is the one guard with three steps, because a worker
 //! that ignored two nudges will ignore a third: it first demands the edit,
@@ -75,7 +79,7 @@ use super::history::compact_history;
 use super::pause::PauseRequest;
 use super::sentinels::{
     COMPLETION_SENTINEL, REPORT_FIELD_BYTES, REPORT_FOLLOWUP, is_completion_request,
-    parse_ask_orchestrator, parse_consolidate_merge, parse_consolidate_steer,
+    is_harness_sentinel, parse_ask_orchestrator, parse_consolidate_merge, parse_consolidate_steer,
     parse_consolidate_wait, parse_consolidator_verdicts, parse_kill_job, parse_report,
     parse_request_turns, parse_wait_job, summarize_command,
 };
@@ -427,20 +431,39 @@ fn answer_digest(answer: &str) -> u64 {
 /// A hash of `text`, with every run of digits folded to a single `#` when
 /// `fold_digits` is set.
 fn digest(text: &str, fold_digits: bool) -> u64 {
+    let text = if fold_digits {
+        fold_digit_runs(text)
+    } else {
+        text.to_string()
+    };
     let mut hasher = DefaultHasher::new();
+    for byte in text.as_bytes() {
+        hasher.write_u8(*byte);
+    }
+    hasher.finish()
+}
+
+/// `text` with every run of digits replaced by a single `#`.
+///
+/// Shared by the output digest and by the base of an `echo`/`printf`, so a
+/// command and what it prints are read the same way: a marker that only moves
+/// by its number (`echo "ORCHESTRATOR_CHECK_8"`) is one command said again, not
+/// a new one every turn.
+fn fold_digit_runs(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
     let mut in_digits = false;
-    for byte in text.bytes() {
-        if fold_digits && byte.is_ascii_digit() {
+    for c in text.chars() {
+        if c.is_ascii_digit() {
             if !in_digits {
-                hasher.write_u8(b'#');
+                out.push('#');
                 in_digits = true;
             }
             continue;
         }
         in_digits = false;
-        hasher.write_u8(byte);
+        out.push(c);
     }
-    hasher.finish()
+    out
 }
 
 /// What [`bounded_tail`] prepends to a tail it had to cut, so a reader can see
@@ -593,6 +616,17 @@ fn normalize_command_base(command: &str) -> String {
     // dropped bytes occupied behind.
     let base = base.split_whitespace().collect::<Vec<_>>().join(" ");
     let base = strip_prefixes(&base);
+    // An `echo`/`printf` of ordinary text is a command like any other, and the
+    // marker it prints is often the only thing that moves between two runs
+    // (`echo "ORCHESTRATOR_CHECK_8"`), so its digits fold the way the output
+    // digest folds them. A harness sentinel keeps its own spelling: the engine
+    // answers each of those itself, and waiting on four different jobs is the
+    // sanctioned alternative to sleep-polling, not a loop.
+    let base = if is_echo_base(&base) && !is_harness_sentinel(command) {
+        fold_digit_runs(&base)
+    } else {
+        base
+    };
     // Bound the base itself, not just its message: a command can be
     // arbitrarily long, and the window holds one base per run.
     if base.len() > LOOP_BASE_BYTES {
@@ -771,6 +805,16 @@ fn redirect_span(kept: &[u8], bytes: &[u8], i: usize) -> Option<(usize, usize)> 
         end += 1;
     }
     Some((start, end))
+}
+
+/// Whether `base` is an `echo`/`printf`: the one command whose argument is text
+/// the worker wrote rather than a path or a flag, and so the one place a marker
+/// that only moves by its number can hide from the base.
+fn is_echo_base(base: &str) -> bool {
+    matches!(
+        base.split_whitespace().next(),
+        Some("echo") | Some("printf")
+    )
 }
 
 /// Drop the wrappers a segment is dressed in: a leading `cd`, a leading
