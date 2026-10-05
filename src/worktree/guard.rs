@@ -87,7 +87,17 @@ const DEFAULT_MAX_COMMIT_FILE_MB: u64 = 10;
 
 /// The commit cap in bytes, `0` when the operator disabled it.
 fn commit_file_cap_bytes() -> u64 {
-    env_parse::<u64>(MAX_COMMIT_FILE_MB_ENV).unwrap_or(DEFAULT_MAX_COMMIT_FILE_MB) * 1024 * 1024
+    cap_bytes(env_parse::<u64>(MAX_COMMIT_FILE_MB_ENV).unwrap_or(DEFAULT_MAX_COMMIT_FILE_MB))
+}
+
+/// The commit cap in bytes for a cap the operator gave in megabytes.
+///
+/// Saturating, like every other env-derived byte count in this crate: a value
+/// no byte count can hold means "no cap", while a wrapping multiply would panic
+/// a debug build in the middle of every harness commit and hand a release build
+/// a meaningless number instead.
+fn cap_bytes(megabytes: u64) -> u64 {
+    megabytes.saturating_mul(1024 * 1024)
 }
 
 /// Why a harness commit left a path out of the index.
@@ -1130,10 +1140,6 @@ impl WorktreeGuard {
     /// Every harness commit goes through here, so the staging rules of
     /// [`stage_commitable_changes_at`] hold for auto-checkpoints, the final
     /// commit and the checkpoint before a merge alike.
-    ///
-    /// Every harness commit goes through here, so the staging rules of
-    /// [`stage_commitable_changes_at`] hold for auto-checkpoints, the final
-    /// commit and the checkpoint before a merge alike.
     pub(crate) fn commit_all(
         path: &Path,
         base_commit: &str,
@@ -2057,6 +2063,20 @@ fn copy_dir_all(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A cap the operator typed that no byte count can hold must mean "no cap",
+    /// not a harness commit that panics (a debug build) or wraps to a
+    /// meaningless number (a release build).
+    #[test]
+    fn a_huge_commit_cap_saturates_instead_of_overflowing() {
+        assert_eq!(cap_bytes(u64::MAX), u64::MAX);
+        assert_eq!(
+            cap_bytes(0),
+            0,
+            "0 is the documented off switch and must stay 0"
+        );
+        assert_eq!(cap_bytes(10), 10 * 1024 * 1024);
+    }
 
     /// The sanitized id is spliced into a branch name and into a path that
     /// `Drop` recursively deletes, so these are the two properties it must hold.
