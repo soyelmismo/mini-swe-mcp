@@ -1367,7 +1367,10 @@ async fn serve_checkpoint_revision_script(
         let command = match turn {
             19 => "echo checkpoint > kept.txt".to_string(),
             21 => "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT".to_string(),
-            _ => format!("echo turn {turn}"),
+            // `common::filler_turn`, not `echo turn <n>`: the loop detector
+            // folds an echo's digits, so that filler is one command said again
+            // and would park the worker before turn 20.
+            _ => common::filler_turn(turn),
         };
         // The closing turn carries the REPORT block the system prompt asks
         // for, so the scripted worker is a compliant one and the harness

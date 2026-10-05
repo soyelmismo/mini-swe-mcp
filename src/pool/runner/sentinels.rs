@@ -247,6 +247,27 @@ fn bound_question(question: &str) -> String {
     format!("{}{QUESTION_TRUNCATED}", &question[..cut])
 }
 
+/// Whether `cmd` is an `echo`/`printf` the turn engine answers itself rather
+/// than a command the sandbox runs: one of the control sentinels above, or the
+/// REPORT block the completion sequence carries.
+///
+/// The loop detector folds the digits of an ordinary `echo`'s base, so a marker
+/// that only moves by its number (`echo "ORCHESTRATOR_CHECK_8"`) reads as one
+/// command said again. These must keep their own spelling: the harness answers
+/// each of them without a bash step, and waiting on four different jobs is the
+/// sanctioned alternative to sleep-polling, not a loop.
+pub fn is_harness_sentinel(cmd: &str) -> bool {
+    is_completion_request(cmd)
+        || parse_request_turns(cmd).is_some()
+        || parse_ask_orchestrator(cmd).is_some()
+        || parse_wait_job(cmd).is_some()
+        || parse_kill_job(cmd).is_some()
+        || parse_consolidate_merge(cmd).is_some()
+        || parse_consolidate_steer(cmd).is_some()
+        || parse_consolidate_wait(cmd).is_some()
+        || cmd.lines().any(opens_report_block)
+}
+
 /// `echo "WAIT_JOB: <n>"` → the background job to block on.
 ///
 /// Echo/`printf` form only, like every other sentinel: the job number is the

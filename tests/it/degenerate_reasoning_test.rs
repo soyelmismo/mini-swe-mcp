@@ -445,7 +445,11 @@ async fn a_legitimate_reasoning_block_never_triggers_the_guard() {
         .map(|turn| {
             ScriptedServer::bash_turn(
                 &format!("call_{turn}"),
-                &format!("printf 'x{turn}\\n' >> lib.rs"),
+                // A distinct file per turn, so the worktree sample changes and
+                // the equivalent-command loop detector reads the run as work:
+                // appending to one file leaves `git status --porcelain` the
+                // same, and an `echo`/`printf` base has its digits folded.
+                &format!("printf 'x{turn}\\n' > x{turn}.txt"),
                 &legitimate_reasoning(turn),
             )
         })

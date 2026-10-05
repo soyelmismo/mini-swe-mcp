@@ -1082,9 +1082,10 @@ async fn every_twenty_turns_a_dirty_worktree_is_checkpointed() {
             // Dirty the worktree on turn 19, so turn 20 has something to commit.
             19 => ScriptedSseServer::bash_turn("call_19", "echo checkpoint > note.txt"),
             25 => ScriptedSseServer::completion_turn("call_done"),
-            _ => {
-                ScriptedSseServer::bash_turn(&format!("call_{turn}"), &format!("echo turn {turn}"))
-            }
+            // `common::filler_turn`, not `echo turn <n>`: the loop detector
+            // folds an echo's digits, so that filler is one command said again
+            // and would park the worker before turn 20.
+            _ => ScriptedSseServer::bash_turn(&format!("call_{turn}"), &common::filler_turn(turn)),
         })
         .collect();
     let server = ScriptedSseServer::spawn(script).await;
@@ -1210,7 +1211,10 @@ async fn a_worker_that_stops_changing_anything_is_told_to_stop_exploring() {
     // so the streak reaches 30 turns on the fourth one.
     let script: Vec<ScriptedTurn> = (1..=40)
         .map(|turn| {
-            ScriptedSseServer::bash_turn(&format!("call_{turn}"), &format!("echo turn {turn}"))
+            // `common::filler_turn`, not `echo turn <n>`: the loop detector
+            // folds an echo's digits, so that filler is one command said again
+            // and would park the worker long before the stagnation sample.
+            ScriptedSseServer::bash_turn(&format!("call_{turn}"), &common::filler_turn(turn))
         })
         .chain(std::iter::once(ScriptedSseServer::completion_turn(
             "call_done",
@@ -1280,7 +1284,10 @@ async fn long_conversation_requests_keep_full_exchanges_within_byte_budget() {
         .map(|turn| {
             let mut response = ScriptedSseServer::bash_turn(
                 &format!("call_{turn}"),
-                &format!("printf '%016000d\\n' {turn}"),
+                // Wrapped in `bash -c` so the base is not an `echo`/`printf`
+                // one: the loop detector folds those bases' digits, and a
+                // 16000-digit payload folds to the same digest every turn.
+                &format!("bash -c \"printf '%016000d\\n' {turn}\""),
             );
             response.push(frame(&json!({
                 "choices": [{"delta": {"reasoning_content": reasonings[turn - 1], "content": prose}}]

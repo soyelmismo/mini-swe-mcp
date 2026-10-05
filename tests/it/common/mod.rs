@@ -98,6 +98,22 @@ pub fn scratch_name(tag: &str) -> String {
 }
 
 // ----------
+// Scripted filler turns
+// ----------
+
+/// The filler command a scripted worker runs on turn `turn`.
+///
+/// The equivalent-command loop detector folds the digits of an `echo`/`printf`
+/// base, so a scripted `echo turn <n>` is one command said again: four of those
+/// on an unchanged worktree is the loop that guard parks, not the neutral
+/// filler a turn-count test needs. Wrapping the same sentence in `bash -c`
+/// keeps every turn its own command, and `bash` is not a pure read, so the
+/// read-only detector stays out of the way as well.
+pub fn filler_turn(turn: usize) -> String {
+    format!(r#"bash -c "echo turn {turn}""#)
+}
+
+// ----------
 // Isolated scratch roots
 // ----------
 
