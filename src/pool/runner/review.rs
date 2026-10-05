@@ -402,7 +402,8 @@ fn custom_prompt(
         5. Re-run the gate and the tests you touched and see them pass before completing.\n\
         6. In your REPORT block list every finding you did NOT fix in the `risks:` line, one line each.\n\
         7. When verified and 100% clean, execute:\n\
-           echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT",
+           echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT\n\
+        If the audit needs more turns than this budget, execute `echo \"REQUEST_TURNS: <number>\"` to ask for more.",
     )
 }
 
@@ -492,6 +493,24 @@ impl SecurityScope {
             Self::Since { base, branch, .. } => {
                 incremental_diff(repo, &format!("{base}..{branch}"), true).await
             }
+        }
+    }
+
+    /// The diff the review actually audits, for sizing its turn budget: the
+    /// incremental scope's unaudited range when one applies, else the whole
+    /// change since the base commit (working tree included). The same diff the
+    /// incremental prompt embeds, so the budget is measured once, never with a
+    /// second git diff.
+    pub async fn audited_diff(&self, repo: &Path, worktree_base: &str, branch: &str) -> String {
+        match self {
+            Self::Full => incremental_diff(repo, &format!("{worktree_base}..{branch}"), true).await,
+            Self::Since { commits, .. } if commits.is_empty() => {
+                // No committed change since the approval: the working tree is
+                // the change the review audits.
+                let base = self.base_commit().unwrap_or(worktree_base);
+                incremental_diff(repo, &format!("{base}..{branch}"), true).await
+            }
+            _ => self.reviewed_diff(repo).await,
         }
     }
 
@@ -785,6 +804,7 @@ fn incremental_prompt(task: &str, base: &str, approved: &[String], diff: &str) -
          Fix every real defect you find, with a regression test that fails without the fix.\n\
          1. Report honestly: list every finding you did NOT fix in the `risks:` line.\n\
          2. Print a line `FINDINGS: <n>` with the total number of findings you found.\n\
+         If the audit needs more turns than this budget, execute `echo \"REQUEST_TURNS: <number>\"` to ask for more.\n\
          When done, execute:\n\
          \x20  echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT\n\n\
          INCREMENTAL DIFF SINCE {base}:\n",
@@ -1558,6 +1578,47 @@ pub enum SecurityScope {
     },
 }
 
+/// The review phase's turn budget. An explicit dispatch `max_turns` wins
+/// unchanged; without one, the budget is sized to the diff the review audits
+/// (`changed_lines`/`changed_files`), floored at 20 turns -- a security review
+/// never gets fewer -- and capped at the budget the reviewer model would
+/// otherwise have had (`previous_budget`), so a large diff never costs more
+/// than it did before.
+fn review_turn_budget(
+    explicit: usize,
+    changed_lines: usize,
+    changed_files: usize,
+    previous_budget: usize,
+) -> usize {
+    if explicit > 0 {
+        return explicit;
+    }
+    let sized = 20 + changed_lines / 20 + 3 * changed_files;
+    // The 20-turn floor wins over the cap: a security review never gets fewer,
+    // even when the implementer's own budget was smaller.
+    sized.clamp(20, previous_budget.max(20))
+}
+
+/// The size of a diff as the turn budget reads it: the number of changed
+/// lines (added plus deleted) and the number of files it touches.
+///
+/// A `+`/`-` line that is a hunk header (`+++`/`---`) or a `\ No newline`
+/// marker is not a changed line; a `diff --git` header names one file.
+fn diff_size(diff: &str) -> (usize, usize) {
+    let mut changed_lines = 0usize;
+    let mut changed_files = 0usize;
+    for line in diff.lines() {
+        if line.starts_with("diff --git") {
+            changed_files += 1;
+        } else if (line.starts_with('+') && !line.starts_with("+++"))
+            || (line.starts_with('-') && !line.starts_with("---"))
+        {
+            changed_lines += 1;
+        }
+    }
+    (changed_lines, changed_files)
+}
+
 impl WorkerPool {
     /// Run the review auditor over the finished implementation.
     ///
@@ -1620,8 +1681,10 @@ impl WorkerPool {
         let review_prompt = review_prompt(&mode, &task, verify.as_deref(), &sensitive);
         // A security review of a revision gets the unaudited diff rather than
         // the whole branch: what it must judge is what came after the earlier
-        // approval, and the earlier approvals are named for context.
-        let security_prompt = match (&scope, mode.is_security()) {
+        // approval, and the earlier approvals are named for context. The same
+        // diff sizes the review's turn budget, so the budget is measured once,
+        // never with a second git diff.
+        let (security_prompt, audited_diff) = match (&scope, mode.is_security()) {
             (
                 incremental @ SecurityScope::Since {
                     commits, approved, ..
@@ -1629,14 +1692,22 @@ impl WorkerPool {
                 true,
             ) if !commits.is_empty() => {
                 let diff = incremental.reviewed_diff(&worktree.path).await;
-                Some(incremental_prompt(
-                    &task,
-                    incremental.base_commit().unwrap_or_default(),
-                    approved,
-                    &diff,
-                ))
+                (
+                    Some(incremental_prompt(
+                        &task,
+                        incremental.base_commit().unwrap_or_default(),
+                        approved,
+                        &diff,
+                    )),
+                    diff,
+                )
             }
-            _ => None,
+            _ => (
+                None,
+                scope
+                    .audited_diff(&worktree.path, &worktree.base_commit, &worktree.branch)
+                    .await,
+            ),
         };
         let review_prompt = security_prompt.unwrap_or(review_prompt);
 
@@ -1671,7 +1742,18 @@ impl WorkerPool {
         let review_max_turns = if max_turns > 0 {
             max_turns
         } else {
-            reviewer_manifest_turns.unwrap_or(current_max_turns)
+            let previous_budget = reviewer_manifest_turns.unwrap_or(current_max_turns);
+            let (changed_lines, changed_files) = diff_size(&audited_diff);
+            let sized = review_turn_budget(0, changed_lines, changed_files, previous_budget);
+            info!(
+                worker = %worker_id,
+                changed_lines,
+                changed_files,
+                previous_budget,
+                review_max_turns = sized,
+                "Review turn budget sized to the audited diff"
+            );
+            sized
         };
 
         self.save_status(
@@ -1706,6 +1788,11 @@ impl WorkerPool {
                 label_prefix: "[review] ",
                 steer_prefix: "ORCHESTRATOR GUIDANCE:\n",
                 apply_sentinels: false,
+                // The review budget is sized to the diff, so a large or tricky
+                // audit must be able to ask for more turns; the implementer's
+                // other sentinels (checkpoint, change detectors, report
+                // scanning) stay off for the reviewer.
+                request_turns: true,
                 // Inspecting the diff and re-running the gate is the reviewer's
                 // job in both modes, so a turn that changes nothing is the
                 // review, not a stall: the read-only escalation stays off.
@@ -1926,5 +2013,62 @@ mod tests {
             warnings.iter().any(|w| w.contains("strongest")),
             "a `strongest:` key must warn: {warnings:?}"
         );
+    }
+
+    /// A small sensitive diff gets a small review budget: a 10-line single-file
+    /// change is 23 turns, not the reviewer model's full ceiling.
+    #[test]
+    fn a_10_line_single_file_diff_gets_23_turns() {
+        let diff = [
+            "diff --git a/src/reminder.rs b/src/reminder.rs",
+            "index 1111111..2222222 100644",
+            "--- a/src/reminder.rs",
+            "+++ b/src/reminder.rs",
+            "@@ -1,10 +1,11 @@",
+            "+line1",
+            "+line2",
+            "+line3",
+            "+line4",
+            "+line5",
+            "+line6",
+            "+line7",
+            "+line8",
+            "+line9",
+            "+line10",
+        ]
+        .join("\n");
+        let (changed_lines, changed_files) = diff_size(&diff);
+        assert_eq!((changed_lines, changed_files), (10, 1));
+        assert_eq!(
+            review_turn_budget(0, changed_lines, changed_files, 150),
+            23,
+            "20 + 10/20 + 3*1 = 23"
+        );
+    }
+
+    /// A large diff is capped at the budget the reviewer model would otherwise
+    /// have had, so sizing never makes a big audit cost more than before.
+    #[test]
+    fn a_2000_line_30_file_diff_is_capped_at_the_previous_budget() {
+        assert_eq!(
+            review_turn_budget(0, 2000, 30, 150),
+            150,
+            "20 + 2000/20 + 3*30 = 210, clamped to the previous budget"
+        );
+    }
+
+    /// An explicit dispatch `max_turns` wins over the sized budget whatever the
+    /// diff looks like.
+    #[test]
+    fn an_explicit_budget_is_unchanged() {
+        assert_eq!(review_turn_budget(150, 2000, 30, 100), 150);
+        assert_eq!(review_turn_budget(150, 10, 1, 100), 150);
+    }
+
+    /// The 20-turn floor wins over the cap: a security review never gets fewer
+    /// turns, even when the implementer's own budget was smaller.
+    #[test]
+    fn a_security_review_never_gets_fewer_than_20_turns() {
+        assert_eq!(review_turn_budget(0, 1, 1, 10), 20);
     }
 }
