@@ -391,10 +391,10 @@ fn test_commit_changes_preserves_branch_on_drop() {
         let new_file = guard.path.join("preserved_feature.txt");
         std::fs::write(&new_file, "Preserved code from subagent\n").expect("write file");
 
-        let committed_branch = guard
+        let committed = guard
             .commit_changes("worker(test): preserve this work")
             .expect("commit failed");
-        assert_eq!(committed_branch, Some(branch.clone()));
+        assert_eq!(committed.branch.as_deref(), Some(branch.as_str()));
         assert!(guard.preserve_branch);
         assert!(path.exists(), "precondition: the checkout exists");
         // Guard drops here
@@ -986,4 +986,273 @@ fn sync_base_env_zero_leaves_worker_untouched() {
     );
     assert!(!guard.path.join("base.txt").exists());
     assert!(!WorktreeGuard::merge_in_progress_at(&guard.path).unwrap());
+}
+/// A harness checkpoint must never stage what a worker's tooling left behind:
+/// a file over the commit cap and a compile cache under a throwaway tool home
+/// stay out of the commit, while the worker's real edit goes in.
+#[test]
+fn checkpoint_refuses_oversized_and_cache_paths_but_commits_the_edit() {
+    let test_repo = TestRepo::new("commit-cap");
+    let repo = test_repo.path();
+    let id = unique_worker_id("commit-cap");
+    let mut guard = test_repo.guard(&id);
+
+    // The worker's real edit, a file over the default 10 MB cap, and a compile
+    // cache under a `HOME` the worker pointed inside its own worktree.
+    std::fs::write(guard.path.join("src.rs"), "fn main() {}\n").unwrap();
+    std::fs::write(guard.path.join("big.bin"), vec![0u8; 20 * 1024 * 1024]).unwrap();
+    let home = guard.path.join(".envcheck/home");
+    std::fs::create_dir_all(home.join(".cache/kache/store/blobs")).unwrap();
+    std::fs::write(
+        home.join(".cache/kache/store/blobs/abcd"),
+        "cache payload\n",
+    )
+    .unwrap();
+
+    let report = guard.commit_changes("worker: checkpoint").unwrap();
+    assert!(
+        report.committed(),
+        "the source edit should have been committed"
+    );
+    let skipped: Vec<&str> = report.skipped.iter().map(|s| s.path.as_str()).collect();
+    assert!(
+        skipped.contains(&"big.bin"),
+        "the oversized file was not reported as skipped: {skipped:?}"
+    );
+    assert!(
+        skipped
+            .iter()
+            .any(|p| p.starts_with(".envcheck/home/.cache/")),
+        "the cache file was not reported as skipped: {skipped:?}"
+    );
+    let notice = report.notice_lines().expect("the skips must be reported");
+    assert!(
+        notice.contains("not committed: big.bin"),
+        "the notice must name the refused path: {notice}"
+    );
+    assert!(
+        notice.contains("larger than the commit cap") && notice.contains("cache directory"),
+        "the notice must say why each path was refused: {notice}"
+    );
+
+    // The commit carries the edit and neither refused path.
+    let committed = run(
+        repo,
+        &[
+            "ls-tree",
+            "-r",
+            "--name-only",
+            &format!("refs/heads/{}", guard.branch),
+        ],
+    );
+    assert!(
+        committed.contains("src.rs"),
+        "the source edit was not committed: {committed:?}"
+    );
+    assert!(
+        !committed.contains("big.bin"),
+        "a file over the commit cap was committed: {committed:?}"
+    );
+    assert!(
+        !committed.contains(".envcheck"),
+        "a cache path was committed: {committed:?}"
+    );
+    // The refused content never reached the object database either, so a later
+    // push cannot trip over it.
+    let objects = run(
+        &guard.path,
+        &["cat-file", "--batch-all-objects", "--batch-check"],
+    );
+    assert!(
+        !objects.lines().any(|line| {
+            let size = line.split_whitespace().nth(2).unwrap_or("0");
+            size.parse::<u64>().unwrap_or(0) > 1024 * 1024
+        }),
+        "a large blob reached the object database: {objects}"
+    );
+
+    drop(guard);
+}
+
+/// A file the base commit already tracks is pre-existing work: the cap and the
+/// cache rules do not apply to it, so the repository keeps committing it.
+#[test]
+fn checkpoint_still_commits_a_large_file_the_base_tracks() {
+    let test_repo = TestRepo::new("commit-tracked");
+    let repo = test_repo.path();
+
+    // A fixture the repository carried before the worker started, so the
+    // worker's checkout inherits it already tracked.
+    let fixture = repo.join("fixtures/large.bin");
+    std::fs::create_dir_all(fixture.parent().unwrap()).unwrap();
+    std::fs::write(&fixture, vec![0u8; 20 * 1024 * 1024]).unwrap();
+    run(repo, &["add", "fixtures/large.bin"]);
+    run(repo, &["commit", "-m", "carry a large fixture"]);
+
+    let id = unique_worker_id("commit-tracked");
+    let mut guard = test_repo.guard(&id);
+    std::fs::write(
+        guard.path.join("fixtures/large.bin"),
+        vec![1u8; 20 * 1024 * 1024],
+    )
+    .unwrap();
+    std::fs::create_dir_all(guard.path.join(".cache/kache")).unwrap();
+    std::fs::write(guard.path.join(".cache/kache/blob"), "cache\n").unwrap();
+
+    let report = guard.commit_changes("worker: checkpoint").unwrap();
+    assert!(
+        report.committed(),
+        "the tracked fixture must still be committed"
+    );
+    assert!(
+        report.skipped.iter().any(|s| s.path == ".cache/kache/blob"),
+        "the cache path was not refused: {:?}",
+        report.skipped
+    );
+    let committed = run(
+        repo,
+        &[
+            "ls-tree",
+            "-r",
+            "--name-only",
+            &format!("refs/heads/{}", guard.branch),
+        ],
+    );
+    assert!(
+        committed.contains("fixtures/large.bin"),
+        "a tracked file the base carries was dropped from the commit: {committed:?}"
+    );
+
+    drop(guard);
+}
+
+/// `MINI_SWE_MAX_COMMIT_FILE_MB=0` disables the cap, so an operator whose
+/// repository legitimately carries large generated files keeps committing them.
+#[test]
+fn a_zero_commit_cap_disables_the_size_limit() {
+    let test_repo = TestRepo::new("commit-cap-zero");
+    let id = unique_worker_id("commit-cap-zero");
+    let mut guard = test_repo.guard(&id);
+
+    std::fs::write(guard.path.join("big.bin"), vec![0u8; 20 * 1024 * 1024]).unwrap();
+
+    // The default cap refuses it...
+    let refused = guard
+        .commit_changes_capped("worker: capped", 10 * 1024 * 1024)
+        .unwrap();
+    assert!(
+        refused
+            .skipped
+            .iter()
+            .any(|s| s.path == "big.bin" && s.bytes == Some(20 * 1024 * 1024)),
+        "a 20 MB file was not refused under a 10 MB cap: {:?}",
+        refused.skipped
+    );
+    // ...and `0` commits it.
+    let allowed = guard.commit_changes_capped("worker: uncapped", 0).unwrap();
+    assert!(allowed.committed(), "cap 0 must disable the cap");
+    assert!(
+        allowed.skipped.is_empty(),
+        "cap 0 still refused paths: {:?}",
+        allowed.skipped
+    );
+    let committed = run(
+        test_repo.path(),
+        &[
+            "ls-tree",
+            "-r",
+            "--name-only",
+            &format!("refs/heads/{}", guard.branch),
+        ],
+    );
+    assert!(
+        committed.contains("big.bin"),
+        "a zero cap still refused the file: {committed:?}"
+    );
+
+    drop(guard);
+}
+
+/// A directory the worker created that holds a `.cache` entry is a tool home,
+/// so everything under it is tool state rather than work product -- even the
+/// files a cache does not own.
+#[test]
+fn checkpoint_refuses_everything_under_a_throwaway_tool_home() {
+    let test_repo = TestRepo::new("commit-tool-home");
+    let id = unique_worker_id("commit-tool-home");
+    let mut guard = test_repo.guard(&id);
+
+    let home = guard.path.join(".envcheck/home");
+    std::fs::create_dir_all(home.join(".cache")).unwrap();
+    std::fs::write(home.join("tool-state.json"), "{\"home\": true}\n").unwrap();
+    std::fs::write(home.join(".cache/blob"), "cache\n").unwrap();
+    std::fs::write(guard.path.join("keep.rs"), "fn kept() {}\n").unwrap();
+
+    let report = guard.commit_changes("worker: checkpoint").unwrap();
+    assert!(
+        report.committed(),
+        "the source edit must still be committed"
+    );
+    let skipped: Vec<&str> = report.skipped.iter().map(|s| s.path.as_str()).collect();
+    assert!(
+        skipped.contains(&".envcheck/home/tool-state.json"),
+        "a file under a throwaway tool home was not refused: {skipped:?}"
+    );
+    let committed = run(
+        test_repo.path(),
+        &[
+            "ls-tree",
+            "-r",
+            "--name-only",
+            &format!("refs/heads/{}", guard.branch),
+        ],
+    );
+    assert!(
+        committed.contains("keep.rs") && !committed.contains(".envcheck/"),
+        "the tool home leaked into the commit: {committed:?}"
+    );
+
+    drop(guard);
+}
+
+/// One path git cannot stage must not cost the rest of the change set its
+/// place in the commit. Git aborts a whole `git add` invocation when a single
+/// pathspec matches nothing, so a file that vanished between the status read
+/// and the staging pass -- or one whose name is not valid UTF-8, which the
+/// pathspec can no longer spell -- would otherwise take every path chunked
+/// with it out of the checkpoint.
+#[test]
+fn one_unstageable_path_does_not_drop_the_rest_of_the_change_set() {
+    let test_repo = TestRepo::new("commit-chunk");
+    let repo = test_repo.path();
+    let id = unique_worker_id("commit-chunk");
+    let mut guard = test_repo.guard(&id);
+
+    std::fs::write(guard.path.join("good.rs"), "fn kept() {}\n").unwrap();
+    // A name no pathspec can spell: `git status -z` reports it as raw bytes,
+    // while the staging pass can only name its lossy rendering.
+    use std::os::unix::ffi::OsStrExt;
+    let unspellable = std::ffi::OsStr::from_bytes(b"bad\xffname");
+    std::fs::write(guard.path.join(unspellable), "x\n").unwrap();
+
+    let report = guard.commit_changes("worker: checkpoint").unwrap();
+    assert!(
+        report.committed(),
+        "the change set must still reach a commit: {report:?}"
+    );
+    let committed = run(
+        repo,
+        &[
+            "ls-tree",
+            "-r",
+            "--name-only",
+            &format!("refs/heads/{}", guard.branch),
+        ],
+    );
+    assert!(
+        committed.contains("good.rs"),
+        "a sibling path lost its place in the commit: {committed:?}"
+    );
+
+    drop(guard);
 }

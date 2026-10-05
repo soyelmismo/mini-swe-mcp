@@ -18,7 +18,9 @@
 //!   the sweep converges to the same state no matter how `read_dir` orders the
 //!   entries, and re-running it changes nothing (audit §01/§09).
 
-use super::{force_remove_dir, git, pid_file_for, remove_target_dirs, swe_base_dirs};
+use super::{
+    WorktreeGuard, force_remove_dir, git, pid_file_for, remove_target_dirs, swe_base_dirs,
+};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{error, info};
@@ -251,6 +253,22 @@ fn reclaim_abandoned_worktree(dir: &Path) -> bool {
     true
 }
 
+/// The branch a checkout at `dir` has checked out, or `None` when it is
+/// detached or its metadata is unreadable.
+fn checked_out_branch(dir: &Path) -> Option<String> {
+    let out = git(
+        dir,
+        "symbolic-ref",
+        &["symbolic-ref", "--quiet", "--short", "HEAD"],
+    )
+    .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!name.is_empty()).then_some(name)
+}
+
 /// Commit any uncommitted changes in a dead worker's worktree onto the branch
 /// it has checked out, so an interrupted worker's work survives the prune.
 ///
@@ -258,7 +276,20 @@ fn reclaim_abandoned_worktree(dir: &Path) -> bool {
 /// is on its own `worker-<id>` branch; the salvage commit makes that branch
 /// unmerged, so the branch sweep preserves it. An orphan directory whose git
 /// metadata is already gone cannot be committed and is skipped (the status
-/// probe fails). Fallback credentials match `guard::commit_changes`.
+/// probe fails).
+///
+/// The salvage is a harness commit like any other, so it stages through the
+/// same gate as [`WorktreeGuard::commit_all`]: a cache or an oversized file the
+/// dead worker's tooling left behind dies with the directory instead of
+/// reaching the branch the sweep is about to preserve as unmerged. The sweep
+/// knows no base commit for a dead worker, so nothing is exempt from the cap or
+/// the cache rules here: a path the checkout's `HEAD` already carries can still
+/// hold content the worker grew past the cap after its last checkpoint, and a
+/// salvage is the one commit that can never ask the worker to move it. A
+/// checkout with no readable branch keeps the worker's own name, which is what
+/// the harness would have given it. `Ok` answers "the
+/// worktree holds nothing left to save", so a caller deciding whether it may
+/// release the checkout is never held by a cache.
 pub(crate) fn salvage_dirty_worktree(dir: &Path) -> bool {
     let Ok(status) = git(dir, "status --porcelain", &["status", "--porcelain"]) else {
         return false;
@@ -275,29 +306,22 @@ pub(crate) fn salvage_dirty_worktree(dir: &Path) -> bool {
         .map(|n| n.strip_prefix("swe-wt-").unwrap_or(n))
         .unwrap_or("unknown");
     let msg = format!("worker({id}): salvaged uncommitted work before prune");
-    if !git(dir, "add -A", &["add", "-A"]).is_ok_and(|out| out.status.success()) {
-        return false;
-    }
-    let committed = git(
-        dir,
-        "commit",
-        &[
-            "-c",
-            "user.name=mini-swe",
-            "-c",
-            "user.email=mini-swe@localhost",
-            "commit",
-            "-m",
-            &msg,
-        ],
-    );
-    match committed {
-        Ok(out) if out.status.success() => {
-            info!(path = %dir.display(), "Salvaged uncommitted worker changes before prune");
+    let branch = checked_out_branch(dir).unwrap_or_else(|| format!("worker-{id}"));
+    match WorktreeGuard::commit_all(dir, "", &branch, &msg) {
+        Ok(report) => {
+            if report.committed() {
+                info!(path = %dir.display(), "Salvaged uncommitted worker changes before prune");
+            } else {
+                info!(
+                    path = %dir.display(),
+                    refused = report.skipped.len(),
+                    "Nothing salvageable in the worktree; cache and oversized paths die with it"
+                );
+            }
             true
         }
-        _ => {
-            error!(path = %dir.display(), "Could not salvage uncommitted worker changes");
+        Err(error) => {
+            error!(path = %dir.display(), error = %error, "Could not salvage uncommitted worker changes");
             false
         }
     }

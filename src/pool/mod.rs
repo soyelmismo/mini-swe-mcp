@@ -2422,20 +2422,19 @@ impl WorkerPool {
             return;
         }
         let worker_id = id.to_string();
+        let branch = format!("worker-{worker_id}");
+        let message = format!("worker({worker_id}): checkpoint before kill");
         let committed = tokio::task::spawn_blocking(move || {
-            WorktreeGuard::commit_all(
-                &path,
-                &format!("worker({worker_id}): checkpoint before kill"),
-            )
+            WorktreeGuard::commit_all(&path, "", &branch, &message)
         })
         .await;
         match committed {
-            Ok(Ok(true)) => info!(
+            Ok(Ok(report)) if report.committed() => info!(
                 worker = %id,
                 "Committed the killed worker's uncommitted changes"
             ),
             // A clean worktree has nothing to preserve, which is not a problem.
-            Ok(Ok(false)) => {}
+            Ok(Ok(_)) => {}
             Ok(Err(e)) => warn!(
                 worker = %id,
                 error = %e,

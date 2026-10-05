@@ -418,6 +418,133 @@ fn dirty_worktree_is_salvaged_before_prune() {
     );
 }
 
+/// A dead worker's worktree is salvaged through the same gate as every other
+/// harness commit: the cache and the oversized file its tooling left behind die
+/// with the directory, while its real edit is committed onto the branch the
+/// sweep preserves.
+#[test]
+fn salvage_leaves_cache_and_oversized_paths_out_of_the_commit() {
+    let f = Fixture::new("salvage-gate");
+    let id = unique("salvage-gate");
+    let dir = f.base.join(format!("swe-wt-{id}"));
+    let branch = format!("worker-{id}");
+    let pid_file = {
+        let mut s = dir.clone().into_os_string();
+        s.push(".pid");
+        PathBuf::from(s)
+    };
+    run(
+        &f.repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            &branch,
+            dir.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    f.write_dead_lease(&pid_file);
+    std::fs::write(dir.join("edit.rs"), "fn kept() {}\n").unwrap();
+    std::fs::write(dir.join("big.bin"), vec![0u8; 20 * 1024 * 1024]).unwrap();
+    let home = dir.join(".envcheck/home");
+    std::fs::create_dir_all(home.join(".cache/kache/store")).unwrap();
+    std::fs::write(home.join(".cache/kache/store/blob"), "cache payload\n").unwrap();
+
+    f.sweep();
+
+    assert!(!dir.exists(), "the worktree directory survived the sweep");
+    assert!(
+        branch_exists(&f.repo, &branch),
+        "salvaged branch {branch} was destroyed"
+    );
+    let committed = run(&f.repo, &["ls-tree", "-r", "--name-only", &branch]);
+    assert!(
+        committed.contains("edit.rs"),
+        "the worker's edit was not salvaged: {committed:?}"
+    );
+    assert!(
+        !committed.contains("big.bin"),
+        "an oversized file was salvaged: {committed:?}"
+    );
+    assert!(
+        !committed.contains(".envcheck"),
+        "a cache path was salvaged: {committed:?}"
+    );
+    // The worktree shared the repository's object database, so a refused file
+    // must not have left a large blob behind for a later push to trip over.
+    let objects = run(
+        &f.repo,
+        &["cat-file", "--batch-all-objects", "--batch-check"],
+    );
+    assert!(
+        !objects.lines().any(|line| {
+            let size = line.split_whitespace().nth(2).unwrap_or("0");
+            size.parse::<u64>().unwrap_or(0) > 1024 * 1024
+        }),
+        "a large blob reached the object database: {objects}"
+    );
+}
+
+/// A salvage must not re-commit content the worker grew past the cap after its
+/// own last checkpoint. The sweep knows no base commit for a dead worker, so
+/// the checkout's `HEAD` -- which already carries the small version the worker
+/// checkpointed -- must not exempt the path from the cap: a salvage is the one
+/// harness commit that can never ask the worker to move the file.
+#[test]
+fn salvage_refuses_a_committed_file_the_worker_grew_past_the_cap() {
+    let f = Fixture::new("salvage-grown");
+    let id = unique("salvage-grown");
+    let dir = f.base.join(format!("swe-wt-{id}"));
+    let branch = format!("worker-{id}");
+    let pid_file = {
+        let mut s = dir.clone().into_os_string();
+        s.push(".pid");
+        PathBuf::from(s)
+    };
+    run(
+        &f.repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            &branch,
+            dir.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    // An earlier checkpoint committed the file small, so the checkout's `HEAD`
+    // tracks it from here on.
+    std::fs::write(dir.join("data.bin"), vec![0u8; 1024 * 1024]).unwrap();
+    run(&dir, &["add", "data.bin"]);
+    run(&dir, &["commit", "-m", "worker: checkpoint"]);
+
+    // The worker then grew it past the cap and left a real edit behind.
+    std::fs::write(dir.join("data.bin"), vec![7u8; 20 * 1024 * 1024]).unwrap();
+    std::fs::write(dir.join("edit.rs"), "fn kept() {}\n").unwrap();
+    f.write_dead_lease(&pid_file);
+
+    f.sweep();
+
+    assert!(!dir.exists(), "the worktree directory survived the sweep");
+    assert!(
+        branch_exists(&f.repo, &branch),
+        "salvaged branch {branch} was destroyed"
+    );
+    let committed = run(&f.repo, &["ls-tree", "-r", "--name-only", &branch]);
+    assert!(
+        committed.contains("edit.rs"),
+        "the worker's edit was not salvaged: {committed:?}"
+    );
+    let size = run(&f.repo, &["cat-file", "-s", &format!("{branch}:data.bin")])
+        .trim()
+        .to_string();
+    assert_eq!(
+        size, "1048576",
+        "content the worker grew past the cap was salvaged onto {branch}"
+    );
+}
+
 fn branch_exists(repo: &Path, branch: &str) -> bool {
     Command::new("git")
         .current_dir(repo)
