@@ -332,8 +332,10 @@ pub fn host_identity() -> Option<Host> {
 /// `fallback` for a client whose ancestry names no host.
 pub fn identity(fallback: &str) -> Identity {
     let override_id = std::env::var("MINI_SWE_AGENT_ID").ok();
+    let me = std::process::id();
     identity_of(
-        std::process::id(),
+        &ancestry(me),
+        me,
         override_id.as_deref(),
         session_from_env,
         watch_token_identity,
@@ -341,19 +343,22 @@ pub fn identity(fallback: &str) -> Identity {
     )
 }
 
-/// The identity of `pid`, with the environment-derived lookups passed in the
-/// way the override is: the session this process runs in, and the identity a
-/// `MINI_SWE_WATCH_TOKEN` names.
+/// The identity of `pid` within `ancestry`, with the environment-derived
+/// lookups passed in the way the override is: the session this process runs in,
+/// and the identity a `MINI_SWE_WATCH_TOKEN` names.
 ///
-/// The seam every identity rule is tested through: the environment is
-/// process-global, so a test cannot set `CLAUDE_CODE_SESSION_ID` for one case
-/// and clear it for the next, and a variable the suite happens to inherit must
-/// not reach an identity it did not choose. [`identity`] is the one caller that
-/// reads the environment.
+/// The seam every identity rule is tested through, for two process-global
+/// reasons: the environment is process-global, so a test cannot set
+/// `CLAUDE_CODE_SESSION_ID` for one case and clear it for the next, and a
+/// variable the suite happens to inherit must not reach an identity it did not
+/// choose; and `/proc` is the host's, so a pid a test invents resolves to
+/// whatever process this machine happens to have there. [`identity`] is the one
+/// caller that reads both.
 ///
 /// `session` and `token` are looked up only when the rule above them did not
 /// answer, so a pinned agent is never made to read the token store.
 pub fn identity_of(
+    ancestry: &Ancestry,
     pid: u32,
     override_id: Option<&str>,
     session: impl FnOnce() -> Option<String>,
@@ -375,7 +380,7 @@ pub fn identity_of(
         };
     }
     let session = session().filter(|session| !session.is_empty());
-    match (resolve(&ancestry(pid), pid), session) {
+    match (resolve(ancestry, pid), session) {
         (Some(resolution), Some(session)) => Identity {
             id: format!("{}/session:{session}", resolution.host),
             source: Source::Session {
@@ -564,6 +569,7 @@ mod tests {
     #[test]
     fn the_override_outranks_the_host() {
         let resolved = identity_of(
+            &ancestry(std::process::id()),
             std::process::id(),
             Some("orchestrator-7"),
             || None,
@@ -574,7 +580,14 @@ mod tests {
         assert_eq!(resolved.source, Source::Override);
         assert_eq!(resolved.explain(), "MINI_SWE_AGENT_ID");
 
-        let resolved = identity_of(std::process::id(), Some(""), || None, || None, "cli");
+        let resolved = identity_of(
+            &ancestry(std::process::id()),
+            std::process::id(),
+            Some(""),
+            || None,
+            || None,
+            "cli",
+        );
         assert_ne!(resolved.id, "", "a blank override is not an identity");
         assert!(
             matches!(resolved.source, Source::Host { .. } | Source::Fallback),
@@ -587,6 +600,7 @@ mod tests {
     #[test]
     fn a_session_qualifies_the_host() {
         let resolved = identity_of(
+            &ancestry(std::process::id()),
             std::process::id(),
             None,
             || Some("tab-7".to_string()),
@@ -619,7 +633,14 @@ mod tests {
         let mut table = Ancestry::new();
         table.insert(80, row(80, "mini-swe-mcp", 79, 1));
         table.insert(79, row(79, "systemd", 1, 1));
-        let resolved = identity_of(80, None, || Some("tab-9".to_string()), || None, "cli");
+        let resolved = identity_of(
+            &table,
+            80,
+            None,
+            || Some("tab-9".to_string()),
+            || None,
+            "cli",
+        );
         assert_eq!(resolved.id, "session:tab-9");
         assert_eq!(
             resolved.source,
@@ -628,7 +649,7 @@ mod tests {
             }
         );
 
-        let bare = identity_of(80, None, || None, || None, "cli");
+        let bare = identity_of(&table, 80, None, || None, || None, "cli");
         assert_eq!(bare.id, "cli");
         assert_eq!(bare.source, Source::Fallback);
     }
@@ -638,6 +659,7 @@ mod tests {
     #[test]
     fn the_override_outranks_the_session() {
         let resolved = identity_of(
+            &ancestry(std::process::id()),
             std::process::id(),
             Some("orchestrator-7"),
             || Some("tab-7".to_string()),
@@ -648,6 +670,7 @@ mod tests {
         assert_eq!(resolved.source, Source::Override);
 
         let host_only = identity_of(
+            &ancestry(std::process::id()),
             std::process::id(),
             None,
             || Some(String::new()),
@@ -672,6 +695,7 @@ mod tests {
     fn a_watch_token_outranks_the_host_and_the_session() {
         let token = "host:opencode:730:12/session:tab-a";
         let resolved = identity_of(
+            &ancestry(std::process::id()),
             std::process::id(),
             None,
             || Some("tab-b".to_string()),
@@ -683,6 +707,7 @@ mod tests {
         assert_eq!(resolved.explain(), "MINI_SWE_WATCH_TOKEN");
 
         let pinned = identity_of(
+            &ancestry(std::process::id()),
             std::process::id(),
             Some("orchestrator-7"),
             || panic!("the override must answer before the session is looked up"),

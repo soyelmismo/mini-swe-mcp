@@ -445,7 +445,7 @@ pub(super) struct WatchSelection {
 }
 
 impl WatchSelection {
-    /// The selection a `hub/watch` (or MCP `watch`) request asked for.
+    /// The selection a `hub/watch` request asked for.
     pub(super) fn from_params(params: &serde_json::Value) -> Self {
         Self::new(
             params["worker_ids"]
@@ -1010,10 +1010,9 @@ impl EventRouter {
     ///
     /// The widening is a push, not a new watch: the running process keeps its
     /// connection, its place in the stream and its unacknowledged events, and
-    /// only its filter changes. A connection that is not registered (an
-    /// in-process MCP `watch` call, or a channel-less client) learns the same
-    /// union on its next poll, because the stored selection is what that poll
-    /// is filtered with.
+    /// only its filter changes. A connection that is not registered (a
+    /// channel-less client) learns the same union on its next poll, because the
+    /// stored selection is what that poll is filtered with.
     fn push_widen(&self, connection: u64, selection: &WatchSelection) {
         let Some((_, _, tx)) = self.connections.get(&connection) else {
             return;
@@ -2375,9 +2374,10 @@ impl EventRouter {
 
 /// The groups a watch or round call selected.
 ///
-/// `hub/watch` takes the CLI's set; the MCP `watch` action accepts one name or
-/// an array of them, because an orchestrator with several rounds running names
-/// all of them in one call. An omitted value selects every group the caller owns.
+/// `hub/watch` takes the CLI's set. The MCP `watch` action accepts one name or
+/// an array of them and spells each one out as a `--group` flag, because an
+/// orchestrator with several rounds running names all of them in one call. An
+/// omitted value selects every group the caller owns.
 pub(crate) fn watch_groups(params: &serde_json::Value) -> std::collections::BTreeSet<String> {
     params["group"]
         .as_array()

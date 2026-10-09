@@ -428,9 +428,9 @@ async fn the_stdio_proxy_reconnects_to_a_replacement_daemon() {
 
     // A request the daemon cannot answer stays in flight when it is killed
     // underneath it. No tool call blocks any more -- a host aborts one that
-    // outlives its own deadline, and the abort is where an event would be lost --
-    // so the daemon is stopped instead: it reads nothing, so the requests sit
-    // in the socket unanswered until the cut.
+    // outlives its own deadline, and the abort is where an event would be lost
+    // -- so the daemon is stopped instead: it reads nothing, so the frame the
+    // proxy hands it is never answered.
     let pid = daemon_pid(&hub_dir).expect("the auto-started daemon logged its pid");
     // SAFETY: `kill` takes plain integers; a stale pid only yields ESRCH.
     assert_eq!(
@@ -454,6 +454,8 @@ async fn the_stdio_proxy_reconnects_to_a_replacement_daemon() {
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    let proxy = child.id().expect("the proxy process is running");
+    let written = bytes_written(proxy);
     send(
         &mut stdin,
         3,
@@ -461,7 +463,12 @@ async fn the_stdio_proxy_reconnects_to_a_replacement_daemon() {
         json!({"name": "worker", "arguments": {"action": "watch"}}),
     )
     .await;
-    send(&mut stdin, 4, "tools/list", json!({})).await;
+    // Wait for the frame to reach the daemon's socket before cutting it. The
+    // proxy adds a request to its pending map only as it writes it out, so a
+    // rising byte counter is what makes "in flight" a property of the set-up:
+    // a frame still unread at the cut is not cut at all -- it is forwarded to
+    // the replacement daemon and answered, which is the opposite claim.
+    wait_for_write(proxy, written).await;
 
     // Kill the daemon the proxy is talking to: the socket goes stale and the
     // proxy's connection is cut, exactly as a handover cuts it. The guard kills
@@ -473,18 +480,17 @@ async fn the_stdio_proxy_reconnects_to_a_replacement_daemon() {
         "kill the daemon"
     );
 
-    // The requests that were in flight at the cut are each answered once, with
-    // an error that says to retry them: their replies died with the old daemon.
-    for id in [3, 4] {
-        let cut = read_reply(&mut stdout, id).await;
-        assert_eq!(cut["error"]["code"], -32000, "{cut}");
-        assert!(
-            cut["error"]["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("retry")),
-            "{cut}"
-        );
-    }
+    // The request that was in flight at the cut is answered once, with an error
+    // that says to retry it: its reply died with the old daemon, and the proxy
+    // will not send it again.
+    let cut = read_reply(&mut stdout, 3).await;
+    assert_eq!(cut["error"]["code"], -32000, "{cut}");
+    assert!(
+        cut["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("retry")),
+        "{cut}"
+    );
 
     // The proxy reconnects -- auto-starting the replacement daemon itself -- and
     // keeps serving the same MCP client.
@@ -746,6 +752,44 @@ impl Drop for StoppedDaemon {
     fn drop(&mut self) {
         // SAFETY: `kill` takes plain integers; a stale pid only yields ESRCH.
         unsafe { libc::kill(self.0, libc::SIGKILL) };
+    }
+}
+
+/// The bytes `pid` has written through its `write` syscalls so far.
+///
+/// `wchar` rather than `write_bytes`: the latter counts only what reached
+/// storage, and the proxy writes to a socket and a pipe, neither of which is.
+/// Its writes to stdout are counted too, so a caller takes its baseline at a
+/// moment when only the daemon socket is in play.
+fn bytes_written(pid: u32) -> u64 {
+    std::fs::read_to_string(format!("/proc/{pid}/io"))
+        .ok()
+        .and_then(|io| {
+            io.lines()
+                .find(|line| line.starts_with("wchar:"))
+                .and_then(|line| line["wchar:".len()..].trim().parse().ok())
+        })
+        .expect("read the proxy's write counters")
+}
+
+/// Wait until `pid` has written more than `baseline`.
+///
+/// The counter only moves once the proxy has taken a frame off its stdin and
+/// handed it to the daemon's socket -- the same moment it enters the request in
+/// its pending map -- so this is what makes a request "in flight across the
+/// cut" a property of the set-up instead of a race with the kill.
+async fn wait_for_write(pid: u32, baseline: u64) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let written = bytes_written(pid);
+        if written > baseline {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the proxy never wrote the frame out ({baseline} -> {written})"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
 
