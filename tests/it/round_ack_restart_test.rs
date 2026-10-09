@@ -2,7 +2,7 @@
 use crate::common;
 use mini_swe_mcp::mcp::{ConnectionContext, McpServer};
 use mini_swe_mcp::pool::{LogBuffer, WorkerMetrics, WorkerRecord, WorkerState};
-use serde_json::json;
+use std::collections::BTreeSet;
 #[tokio::test]
 async fn a_round_acknowledgment_survives_router_restart() {
     let isolated = common::IsolatedPool::new(2, "round-ack");
@@ -37,15 +37,11 @@ async fn a_round_acknowledgment_survives_router_restart() {
         .await;
     let mut ctx = ConnectionContext::hub_connection(1);
     ctx.agent_id = Some("round-owner".into());
+    let one = ["round-worker".to_string()].into_iter().collect();
     let server = McpServer::new(isolated.pool.clone(), "test".into());
     let events = server.start_hub_events(Some(hub.path())).await;
     let result = server
-        .execute_tool_for(
-            "worker",
-            json!({"action":"watch", "all":true,
-                "worker_ids":["round-worker"], "timeout_secs":1}),
-            &ctx,
-        )
+        .watch_poll(&ctx, &one, &BTreeSet::new(), true, true)
         .await
         .unwrap();
     assert_eq!(result["events"][0]["event"], "round", "{result}");
@@ -54,14 +50,13 @@ async fn a_round_acknowledgment_survives_router_restart() {
     let restarted = McpServer::new(isolated.pool.clone(), "test".into());
     let events = restarted.start_hub_events(Some(hub.path())).await;
     let result = restarted
-        .execute_tool_for(
-            "worker",
-            json!({"action":"watch", "worker_ids":["round-worker"], "timeout_secs":1}),
-            &ctx,
-        )
+        .watch_poll(&ctx, &one, &BTreeSet::new(), true, false)
         .await
         .unwrap();
-    assert_eq!(result["status"], "no_event", "round replayed: {result}");
+    assert!(
+        result["events"].as_array().is_some_and(Vec::is_empty),
+        "the acknowledged round must not replay: {result}"
+    );
     events.abort();
     let _ = events.await;
 }

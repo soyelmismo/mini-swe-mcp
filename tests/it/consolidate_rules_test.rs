@@ -136,11 +136,22 @@ async fn steered_question_goes_to_consolidator_not_orchestrator_watch() {
     let server = mini_swe_mcp::mcp::McpServer::new(pool.clone(), "test-model".into());
     let mut ctx = mini_swe_mcp::mcp::ConnectionContext::stdio();
     ctx.agent_id = Some("owner".into());
-    let watch = serde_json::json!({"action":"watch", "worker_ids":[worker], "timeout_secs":0});
-    let initial = server
-        .execute_tool_for("worker", watch.clone(), &ctx)
-        .await
-        .unwrap();
+    // The wait is a `hub/watch` poll: the wire the shell watch speaks, which is
+    // where the MCP action's blocking wait now belongs.
+    let ids = [worker.clone()]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    /// One poll of `ids` against the server's own event router.
+    async fn watch(
+        server: &mini_swe_mcp::mcp::McpServer,
+        ctx: &mini_swe_mcp::mcp::ConnectionContext,
+        ids: &std::collections::BTreeSet<String>,
+    ) -> anyhow::Result<serde_json::Value> {
+        server
+            .watch_poll(ctx, ids, &std::collections::BTreeSet::new(), true, false)
+            .await
+    }
+    let initial = watch(&server, &ctx, &ids).await.unwrap();
     assert!(initial.to_string().contains("needs_input"), "{initial}");
     let result = pool
         .consolidate_steer(&actor, &worker, "answer".into())
@@ -157,10 +168,7 @@ async fn steered_question_goes_to_consolidator_not_orchestrator_watch() {
         .consolidate_wait(&actor, std::slice::from_ref(&worker), Some(60))
         .await;
     assert!(waited.contains("steered question"), "{waited}");
-    let event = server
-        .execute_tool_for("worker", watch.clone(), &ctx)
-        .await
-        .unwrap();
+    let event = watch(&server, &ctx, &ids).await.unwrap();
     assert!(!event.to_string().contains("needs_input"), "{event}");
     // An orchestrator steer takes back responsibility for the next question.
     pool.steer(&worker, "orchestrator answer".into())

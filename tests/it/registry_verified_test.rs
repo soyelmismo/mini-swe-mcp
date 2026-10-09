@@ -270,8 +270,16 @@ async fn the_watch_view_reads_the_verdict_from_the_row() {
 
     let pool = WorkerPool::with_scratch(1, "http://localhost:1".to_string(), "k".to_string(), root);
     let server = McpServer::new(pool, "test-model".to_string());
+    let mut ctx = mini_swe_mcp::mcp::ConnectionContext::stdio();
+    ctx.agent_id = Some(OWNER.to_string());
     let result = server
-        .execute_tool("worker", json!({"action":"watch","worker_id":id}))
+        .watch_poll(
+            &ctx,
+            &[id.to_string()].into_iter().collect(),
+            &std::collections::BTreeSet::new(),
+            true,
+            false,
+        )
         .await
         .expect("a completed row is reported on the first poll");
 

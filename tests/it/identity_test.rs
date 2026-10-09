@@ -324,14 +324,19 @@ async fn an_mcp_connection_and_a_cli_call_of_one_host_share_workers() {
             ids.contains(&"shared-1"),
             "the caller must see the worker its host dispatched: {ids:?}"
         );
-        // `watch` is the verb the agent's shell blocks on; the owner may wait
-        // on the worker, and `steer` proves it controls it.
-        caller
-            .worker(
-                serde_json::json!({"action": "watch", "worker_id": "shared-1", "timeout_secs": 0}),
-            )
+        // `steer` proves it controls the worker, and the watch answer it is
+        // handed is the one bound to this identity.
+        let watch = caller
+            .worker(serde_json::json!({"action": "watch", "worker_id": "shared-1"}))
             .await
-            .expect("the owner may watch its own worker");
+            .expect("watch answers for the caller's own worker");
+        assert_eq!(watch["status"], "use_shell", "{watch}");
+        assert!(
+            watch["watch_command"]
+                .as_str()
+                .is_some_and(|command| command.ends_with(" mini-swe-mcp watch shared-1")),
+            "the shell watch follows this caller's worker, as this caller: {watch}"
+        );
         let steered = caller
             .worker(serde_json::json!({"action": "steer", "worker_id": "shared-1", "message": "carry on"}))
             .await

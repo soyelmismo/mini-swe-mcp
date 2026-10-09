@@ -814,7 +814,6 @@ async fn a_hub_connection_only_controls_its_own_workers() {
         serde_json::json!({"action": "collect", "worker_id": "h3-hub-worker"}),
         serde_json::json!({"action": "status", "worker_id": "h3-hub-worker"}),
         serde_json::json!({"action": "logs", "worker_id": "h3-hub-worker"}),
-        serde_json::json!({"action": "watch", "worker_id": "h3-hub-worker", "timeout_secs": 0}),
     ] {
         let action = arguments["action"].as_str().expect("action").to_string();
         let error = b

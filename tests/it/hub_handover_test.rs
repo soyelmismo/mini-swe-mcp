@@ -426,44 +426,70 @@ async fn the_stdio_proxy_reconnects_to_a_replacement_daemon() {
     let tools = read_reply(&mut stdout, 2).await;
     assert!(tools["result"]["tools"].is_array(), "{tools}");
 
-    // A watch with nothing to watch blocks until its own deadline, so it is
-    // still in flight when the daemon is killed underneath it.
+    // A request the daemon cannot answer stays in flight when it is killed
+    // underneath it. No tool call blocks any more -- a host aborts one that
+    // outlives its own deadline, and the abort is where an event would be lost --
+    // so the daemon is stopped instead: it reads nothing, so the requests sit
+    // in the socket unanswered until the cut.
+    let pid = daemon_pid(&hub_dir).expect("the auto-started daemon logged its pid");
+    // SAFETY: `kill` takes plain integers; a stale pid only yields ESRCH.
+    assert_eq!(
+        unsafe { libc::kill(pid, libc::SIGSTOP) },
+        0,
+        "stop the daemon"
+    );
+    // A stopped process never handles the SIGTERM the test Reaper sends, so a
+    // failure between here and the kill below would otherwise leave this daemon
+    // stopped for good: the guard owns it from the moment it is stopped.
+    let _stopped = StoppedDaemon(pid);
+    // The stop is delivered asynchronously, and a daemon that has not stopped
+    // yet would answer the request instead of leaving it in flight, so wait
+    // for the state rather than assuming it.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while process_state(pid).as_deref() != Some("T") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the daemon never stopped (state {:?})",
+            process_state(pid)
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     send(
         &mut stdin,
         3,
         "tools/call",
-        json!({"name": "worker", "arguments": {"action": "watch", "timeout_secs": 30}}),
+        json!({"name": "worker", "arguments": {"action": "watch"}}),
     )
     .await;
-    // A later ping proves the preceding watch reached the daemon before the cut.
-    send(&mut stdin, 5, "ping", json!({})).await;
-    assert_eq!(read_reply(&mut stdout, 5).await["result"], json!({}));
+    send(&mut stdin, 4, "tools/list", json!({})).await;
 
     // Kill the daemon the proxy is talking to: the socket goes stale and the
-    // proxy's connection is cut, exactly as a handover cuts it.
-    let pid = daemon_pid(&hub_dir).expect("the auto-started daemon logged its pid");
-    // SAFETY: `kill` takes plain integers; a stale pid only yields ESRCH.
+    // proxy's connection is cut, exactly as a handover cuts it. The guard kills
+    // it again on the way out, where a dead pid only yields ESRCH.
+    // SAFETY: as above.
     assert_eq!(
         unsafe { libc::kill(pid, libc::SIGKILL) },
         0,
         "kill the daemon"
     );
 
-    // The request that was in flight at the cut is answered once, with an error
-    // that says to retry it: its reply died with the old daemon.
-    let cut = read_reply(&mut stdout, 3).await;
-    assert_eq!(cut["error"]["code"], -32000, "{cut}");
-    assert!(
-        cut["error"]["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("retry")),
-        "{cut}"
-    );
+    // The requests that were in flight at the cut are each answered once, with
+    // an error that says to retry them: their replies died with the old daemon.
+    for id in [3, 4] {
+        let cut = read_reply(&mut stdout, id).await;
+        assert_eq!(cut["error"]["code"], -32000, "{cut}");
+        assert!(
+            cut["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("retry")),
+            "{cut}"
+        );
+    }
 
-    // The proxy reconnects — auto-starting the replacement daemon itself — and
+    // The proxy reconnects -- auto-starting the replacement daemon itself -- and
     // keeps serving the same MCP client.
-    send(&mut stdin, 4, "tools/list", json!({})).await;
-    let replayed = read_reply(&mut stdout, 4).await;
+    send(&mut stdin, 6, "tools/list", json!({})).await;
+    let replayed = read_reply(&mut stdout, 6).await;
     assert!(
         replayed["result"]["tools"].is_array(),
         "the proxy must answer after the daemon went away: {replayed}"
@@ -706,6 +732,30 @@ async fn daemon_respawns_itself_after_handover_without_a_client() {
     wait_for_log(hub.path(), "listening", 2).await;
     let mut replacement = Client::connect(&paths.socket()).await;
     assert!(replacement.request("tools/list", json!({})).await["result"]["tools"].is_array());
+}
+
+/// A daemon this test stopped with SIGSTOP, killed again on the way out.
+///
+/// SIGSTOP is not something a process recovers from, and a stopped one never
+/// handles the SIGTERM the hub `Reaper` sends, so it cannot be the one to clean
+/// this up: whatever happens between the stop and the explicit kill, the guard
+/// still takes the daemon down.
+struct StoppedDaemon(i32);
+
+impl Drop for StoppedDaemon {
+    fn drop(&mut self) {
+        // SAFETY: `kill` takes plain integers; a stale pid only yields ESRCH.
+        unsafe { libc::kill(self.0, libc::SIGKILL) };
+    }
+}
+
+/// The scheduler state of `pid` from `/proc`, or `None` once it is gone.
+fn process_state(pid: i32) -> Option<String> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The comm field is parenthesised and may hold spaces, so the state is the
+    // first word after the last `)`.
+    stat.rsplit_once(')')
+        .map(|(_, rest)| rest.split_whitespace().next().unwrap_or("?").to_string())
 }
 
 /// The pid of the daemon the hub log last reported listening.

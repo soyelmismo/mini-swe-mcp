@@ -1,7 +1,7 @@
 {
   "tools": [
     {
-      "description": "Git-worktree workers. Parallel work is a ROUND: dispatch tasks+group+consolidate, cheap worker gate, wait with watch --group <g> --all (MCP all:true), read its report, merge it. mini-swe-mcp watch: run it again after each event. MCP watch: timeout_secs. Only own workers; admin excepted. Topics: `help <topic>` (CLI) or action 'help' (MCP).",
+      "description": "Git-worktree workers. Parallel work is a ROUND: dispatch tasks+group+consolidate, cheap worker gate, wait with `mini-swe-mcp watch --group <g> --all` in your shell (run it again after each event), read its report, merge it. The MCP 'watch' action never blocks: it answers with the shell command. Only own workers; admin excepted. Topics: `help <topic>` (CLI) or action 'help' (MCP).",
       "inputSchema": {
         "properties": {
           "action": {
@@ -99,7 +99,7 @@
             "type": "integer"
           },
           "message": {
-            "description": "Required for steer: resumes the worker's own branch with full context; never dispatch a replacement. max_turns sets budget.",
+            "description": "Required for steer: resumes the worker's own branch; never dispatch a replacement.",
             "type": "string"
           },
           "model": {
@@ -108,7 +108,7 @@
           },
           "network": {
             "default": "allow",
-            "description": "Network: 'offline' isolates every step (no egress); 'allow' (default) keeps it.",
+            "description": "Network: 'offline' isolates every step (no egress); 'allow' keeps it.",
             "enum": [
               "offline",
               "allow"
@@ -197,7 +197,7 @@
             "type": "number"
           },
           "timeout_secs": {
-            "description": "Watch deadline secs; expiry: no_event.",
+            "description": "Watch deadline secs; the MCP action answers with the shell command.",
             "minimum": 0,
             "type": "integer"
           },
@@ -206,11 +206,11 @@
             "type": "string"
           },
           "verify": {
-            "description": "Completion gate: auto-detect if omitted; empty string disables. On consolidate: Cheap for workers, full consolidator.",
+            "description": "Completion gate: auto-detect if omitted; empty string disables. Consolidate round: Cheap for workers.",
             "type": "string"
           },
           "worker_id": {
-            "description": "Target worker (alias 'id'): 3+ char prefix or 'last'; required by targeting verbs.",
+            "description": "Target worker (alias 'id'): 3+ char prefix or 'last'.",
             "type": "string"
           },
           "worker_ids": {

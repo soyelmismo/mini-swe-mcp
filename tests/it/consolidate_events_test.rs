@@ -7,11 +7,16 @@
 //! consolidator has finished the stopped worker is visible to its owner again.
 
 use crate::common::IsolatedPool;
-use mini_swe_mcp::mcp::{ConnectionContext, McpServer};
+use mini_swe_mcp::hub::{HubConfig, HubPaths, HubServer};
+use mini_swe_mcp::mcp::McpServer;
 use mini_swe_mcp::pool::{
     RegistryStatus, WorkerMeta, WorkerPool, WorkerRole, save_registry_entry_in,
 };
 use mini_swe_mcp::worktree::ScratchRoot;
+use serde_json::json;
+use std::sync::Arc;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
 
 /// The owner of every worker in this test.
 const OWNER: &str = "owner";
@@ -43,8 +48,59 @@ fn write_steer_source(root: &ScratchRoot, worker: &str, consolidator: &str) {
     .unwrap();
 }
 
+/// The `hub/watch` parameters the owner's shell watch polls with: the same
+/// wire the `watch` action used to sit on, and the one that still delivers.
 fn watch_args(worker: &str) -> serde_json::Value {
-    serde_json::json!({"action": "watch", "worker_ids": [worker], "timeout_secs": 0})
+    json!({"worker_ids": [worker], "group": [], "initial": true, "all": false})
+}
+
+/// A minimal JSON-RPC client, so this test polls the same `hub/watch` frames
+/// the shell watch does without spawning a binary.
+struct Watch {
+    reader: BufReader<tokio::net::unix::OwnedReadHalf>,
+    writer: tokio::net::unix::OwnedWriteHalf,
+    next_id: u64,
+}
+
+impl Watch {
+    async fn connect(socket: &std::path::Path) -> Self {
+        let (reader, writer) = UnixStream::connect(socket)
+            .await
+            .expect("connect to the test daemon")
+            .into_split();
+        Self {
+            reader: BufReader::new(reader),
+            writer,
+            next_id: 1,
+        }
+    }
+
+    async fn request(&mut self, method: &str, params: serde_json::Value) -> serde_json::Value {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.writer
+            .write_all(
+                format!(
+                    "{}\n",
+                    json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write");
+        self.writer.flush().await.expect("flush");
+        loop {
+            let mut line = String::new();
+            assert!(
+                self.reader.read_line(&mut line).await.expect("read") > 0,
+                "the daemon closed the connection"
+            );
+            let reply: serde_json::Value = serde_json::from_str(line.trim()).expect("JSON");
+            if reply.get("id") == Some(&json!(id)) {
+                return reply;
+            }
+        }
+    }
 }
 
 #[tokio::test]
@@ -64,13 +120,29 @@ async fn a_steered_completion_waits_for_the_consolidator_to_finish() {
     write_steer_source(&root, "w1", "c1");
 
     let server = McpServer::new(WorkerPool::clone(&harness.pool), "test-model".into());
-    let mut ctx = ConnectionContext::stdio();
-    ctx.agent_id = Some(OWNER.to_string());
+    let hub = crate::common::TempDir::new_in_tmp("consolidate-events-hub");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(hub.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let socket = HubPaths::new(hub.path().to_path_buf()).socket();
+    let daemon = HubServer::new(
+        Arc::new(server),
+        HubConfig::new(HubPaths::new(hub.path().to_path_buf()), 60),
+    );
+    let task = tokio::spawn(async move {
+        let _ = daemon.run().await;
+    });
+    for _ in 0..100 {
+        if UnixStream::connect(&socket).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let mut watch = Watch::connect(&socket).await;
+    watch.request("hub/hello", json!({"agent_id": OWNER})).await;
 
-    let hidden = server
-        .execute_tool_for("worker", watch_args("w1"), &ctx)
-        .await
-        .unwrap();
+    let hidden = watch.request("hub/watch", watch_args("w1")).await;
     assert!(
         !hidden.to_string().contains("completed"),
         "a completion steered to a live consolidator must not wake the owner: {hidden}"
@@ -84,12 +156,12 @@ async fn a_steered_completion_waits_for_the_consolidator_to_finish() {
         WorkerRole::Consolidate,
         RegistryStatus::Completed,
     );
-    let shown = server
-        .execute_tool_for("worker", watch_args("w1"), &ctx)
-        .await
-        .unwrap();
+    let shown = watch.request("hub/watch", watch_args("w1")).await;
     assert!(
         shown.to_string().contains("completed"),
         "the stopped worker must be visible once its consolidator is gone: {shown}"
     );
+
+    task.abort();
+    let _ = task.await;
 }

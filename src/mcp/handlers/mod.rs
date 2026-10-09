@@ -12,7 +12,6 @@
 use anyhow::Result;
 use serde_json::{Map, Value, json};
 use std::path::PathBuf;
-use std::time::Duration;
 use tokio::sync::mpsc;
 
 use super::server::McpServer;
@@ -90,7 +89,7 @@ impl McpServer {
         self.pool.resolve_worker_id(needle, &ctx.agent()).await
     }
 
-    /// Parse the optional `timeout_secs` deadline of a blocking call.
+    /// Parse the optional `timeout_secs` deadline a `watch` call carries.
     ///
     /// Clients disagree wildly on how long a tool call may run, so a caller
     /// that would rather re-poll than risk its own deadline passes the budget

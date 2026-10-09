@@ -5,7 +5,8 @@ impl McpServer {
     ///
     /// Steering a finished worker starts a revision on its preserved branch
     /// (same id, full context, fresh turn budget). The reply is immediate:
-    /// `watch` is the only way to wait for the revision's next event.
+    /// the shell `mini-swe-mcp watch` is the way to wait for the revision's
+    /// next event.
     pub(super) async fn handle_steer(
         &self,
         args: &Value,
@@ -84,7 +85,7 @@ impl McpServer {
             let mut payload = json!({
                 "worker_id": wid,
                 "status": status,
-                "message": format!("{message}. Use watch for the next event."),
+                "message": format!("{message}. Run `mini-swe-mcp watch` in your shell for the next event."),
             });
             self.with_watch_command(&mut payload, ctx).await;
             return Ok(payload);
@@ -93,7 +94,7 @@ impl McpServer {
             let mut payload = json!({
                 "worker_id": wid,
                 "status": "resumed",
-                "message": "Worker resumed with your steering instruction. Use watch for the next event."
+                "message": "Worker resumed with your steering instruction. Run `mini-swe-mcp watch` in your shell for the next event."
             });
             self.with_watch_command(&mut payload, ctx).await;
             return Ok(payload);
@@ -101,14 +102,15 @@ impl McpServer {
         let mut payload = json!({
             "worker_id": wid,
             "status": "steered",
-            "message": "Steering instruction queued for next turn. Use watch for the next event."
+            "message": "Steering instruction queued for next turn. Run `mini-swe-mcp watch` in your shell for the next event."
         });
         self.with_watch_command(&mut payload, ctx).await;
         Ok(payload)
     }
 }
 
-pub(in crate::mcp) const MESSAGE_DESCRIPTION: &str = "Required for steer: resumes the worker's own branch with full context; never dispatch a replacement. max_turns sets budget.";
+pub(in crate::mcp) const MESSAGE_DESCRIPTION: &str =
+    "Required for steer: resumes the worker's own branch; never dispatch a replacement.";
 
 pub(in crate::mcp) const MAX_TURNS_DESCRIPTION: &str =
     "Max bash turns; on 'steer', a stopped worker's budget.";

@@ -548,7 +548,8 @@ fn tool_description_stays_short_and_points_at_the_help_topics() {
         // Topics are reachable from MCP too, so the schema names both paths.
         "`help <topic>` (CLI) or action 'help' (MCP)",
         "own workers",
-        "no_event",
+        // The wait is a shell one, and the action says so instead of blocking.
+        "never blocks",
         "steer",
     ] {
         assert!(
@@ -713,71 +714,6 @@ fn one_watch_call_replays_every_missed_event() {
     assert!(
         replayed.contains(&"w-first".to_string()) && replayed.contains(&"w-second".to_string()),
         "one call must replay every missed event: {stdout}"
-    );
-}
-
-/// A no-arg MCP `watch` follows a worker dispatched after it started: its set
-/// is re-evaluated on every poll instead of frozen at the first one.
-#[tokio::test]
-async fn a_no_arg_watch_action_follows_late_dispatches() {
-    let (pool, _scratch) = isolated_pool("watch-mcp");
-    pool.__test_insert_worker(record(
-        "w-mcp-first",
-        mini_swe_mcp::mcp::LOCAL_AGENT,
-        WorkerState::Running {
-            step: 1,
-            last_command: "cargo test".to_string(),
-            started_at: 0,
-        },
-    ))
-    .await;
-    let server = Arc::new(McpServer::new(pool.clone(), "test".to_string()));
-
-    let watch = tokio::spawn({
-        let server = server.clone();
-        async move {
-            server
-                .execute_tool(
-                    "worker",
-                    serde_json::json!({"action": "watch", "timeout_secs": 10}),
-                )
-                .await
-        }
-    });
-    // Let the watch resolve its initial set to w-mcp-first.
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    // The late dispatch: only its completion should wake the watch.
-    pool.__test_insert_worker(record(
-        "w-mcp-second",
-        mini_swe_mcp::mcp::LOCAL_AGENT,
-        WorkerState::Completed {
-            turns: 2,
-            diff: String::new(),
-            summary: "late worker done".to_string(),
-            completed_at: 0,
-            artifacts: Vec::new(),
-            branch: Some("worker-w-mcp-second".to_string()),
-            verified: Some(true),
-            metrics: WorkerMetrics::default(),
-            revision: 0,
-            report: None,
-            verdicts: None,
-        },
-    ))
-    .await;
-
-    let result = tokio::time::timeout(std::time::Duration::from_secs(8), watch)
-        .await
-        .expect("a late dispatch must wake the no-arg watch")
-        .expect("the watch task stays alive")
-        .expect("the watch answers");
-    assert_eq!(result["status"], "event", "{result}");
-    let events = result["events"].as_array().expect("events array");
-    assert!(
-        events
-            .iter()
-            .any(|event| event["worker_id"] == "w-mcp-second"),
-        "the late worker must be reported: {result}"
     );
 }
 
@@ -1041,12 +977,16 @@ async fn the_daemon_allows_one_watch_per_identity() {
     let _ = task.await;
 }
 
-/// The MCP `watch` action obeys the same one-watch-per-identity rule.
+/// The MCP `watch` action never waits: a tool call is bounded by the client's
+/// own timeout, and the abort that cuts a blocking watch off is not a place an
+/// event can be delivered. It answers at once with the shell command that waits
+/// for the same selection the call asked for, and the shell watch behind it -
+/// backgrounded, with no client deadline - is what delivers the event.
 #[tokio::test]
-async fn the_mcp_watch_action_allows_one_watch_per_identity() {
-    let (pool, _scratch) = isolated_pool("watch-mcp");
+async fn the_mcp_watch_action_names_the_shell_watch_instead_of_waiting() {
+    let (pool, _scratch) = isolated_pool("watch-mcp-shell");
     pool.__test_insert_worker(record(
-        "w-mcp-one",
+        "w-mcp-shell",
         mini_swe_mcp::mcp::LOCAL_AGENT,
         WorkerState::Running {
             step: 1,
@@ -1057,62 +997,42 @@ async fn the_mcp_watch_action_allows_one_watch_per_identity() {
     .await;
     let server = Arc::new(McpServer::new(pool, "test".to_string()));
 
-    let first = tokio::spawn({
-        let server = server.clone();
-        async move {
-            server
-                .execute_tool(
-                    "worker",
-                    serde_json::json!({"action": "watch", "timeout_secs": 10}),
-                )
-                .await
-        }
-    });
-    // Let the first watch reserve the identity's slot.
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-
-    let covered = server
-        .execute_tool(
+    // A running worker is exactly the case that used to block: the answer has
+    // to arrive without the call ever waiting on it.
+    let answered = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        server.execute_tool(
             "worker",
-            serde_json::json!({"action": "watch", "timeout_secs": 10}),
-        )
-        .await
-        .expect("a second watch of the same selection is covered");
-    assert_eq!(covered["status"], "already_covered", "{covered}");
-    assert!(
-        covered["message"]
-            .as_str()
-            .unwrap_or("")
-            .contains("already covered by the running watch"),
-        "{covered}"
+            serde_json::json!({
+                "action": "watch",
+                "worker_ids": ["w-mcp-shell"],
+                "group": "round-1",
+                "all": true,
+                "timeout_secs": 20,
+            }),
+        ),
+    )
+    .await
+    .expect("the watch action answers at once, it never waits")
+    .expect("the watch action answers");
+
+    assert_eq!(answered["status"], "use_shell", "{answered}");
+    assert_eq!(
+        answered["events"].as_array().map(Vec::len),
+        Some(0),
+        "no event is delivered over MCP any more: {answered}"
     );
-
-    // A different identity may watch at the same time.
-    let other = mini_swe_mcp::mcp::ConnectionContext {
-        agent_id: Some("agent-other".to_string()),
-        ..mini_swe_mcp::mcp::ConnectionContext::hub_connection(9)
-    };
-    let reply = server
-        .execute_tool_for(
-            "worker",
-            serde_json::json!({"action": "watch", "timeout_secs": 0}),
-            &other,
-        )
-        .await
-        .expect("a different identity watches concurrently");
-    assert_eq!(reply["status"], "no_event", "{reply}");
-
-    // Cancelling the holder frees its slot.
-    first.abort();
-    let _ = first.await;
-    let reply = server
-        .execute_tool(
-            "worker",
-            serde_json::json!({"action": "watch", "timeout_secs": 0}),
-        )
-        .await
-        .expect("the freed slot accepts a new watch");
-    assert_eq!(reply["status"], "no_event", "{reply}");
+    assert_eq!(
+        answered["watch_command"],
+        serde_json::json!("mini-swe-mcp watch w-mcp-shell --group round-1 --all --timeout 20"),
+        "the command waits for exactly the selection the call asked for: {answered}"
+    );
+    assert!(
+        answered["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("mini-swe-mcp watch")),
+        "the message names the command to run: {answered}"
+    );
 }
 
 /// The CLI maps a covered second watch of one session to exit code 0 and

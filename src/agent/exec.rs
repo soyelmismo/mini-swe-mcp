@@ -712,6 +712,24 @@ pub fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
 
+/// `word` as one shell word: quoted only when it holds something a shell would
+/// act on, so an ordinary id or group name stays the readable command the help
+/// text shows and a crafted one cannot become a second command.
+///
+/// Public for the same reason as [`shell_quote`]: the command lines printed for
+/// the caller to run are built from caller-supplied text in more than one
+/// place, and every one of them must quote the same way.
+pub fn shell_word(word: &str) -> String {
+    let safe = !word.is_empty()
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./:=@,+".contains(c));
+    match safe {
+        true => word.to_string(),
+        false => shell_quote(word),
+    }
+}
+
 /// Message shown to the model when the worktree guardrail rejects a command.
 fn blocked_by_guardrail(reason: &str) -> String {
     format!(

@@ -186,7 +186,10 @@ fn quiet_watch_command(val: &serde_json::Value) -> String {
     if let Some(group) = group
         && crate::mcp::auto_consolidate::consolidate_requested(val)
     {
-        let round = format!("mini-swe-mcp watch --group {} --all", shell_word(group));
+        let round = format!(
+            "mini-swe-mcp watch --group {} --all",
+            crate::agent::exec::shell_word(group)
+        );
         return match watch_token(val) {
             Some(token) => format!("{token} {round}"),
             None => round,
@@ -196,7 +199,10 @@ fn quiet_watch_command(val: &serde_json::Value) -> String {
         Some(command) => command.to_string(),
         None => match group {
             Some(group) => {
-                format!("mini-swe-mcp watch --group {} --all", shell_word(group))
+                format!(
+                    "mini-swe-mcp watch --group {} --all",
+                    crate::agent::exec::shell_word(group)
+                )
             }
             None => "mini-swe-mcp watch".to_string(),
         },
@@ -217,23 +223,9 @@ fn watch_token(val: &serde_json::Value) -> Option<String> {
     let (name, token) = prefix.split_once('=')?;
     match name {
         "MINI_SWE_WATCH_TOKEN" if !token.is_empty() => {
-            Some(format!("{name}={}", shell_word(token)))
+            Some(format!("{name}={}", crate::agent::exec::shell_word(token)))
         }
         _ => None,
-    }
-}
-
-/// `word` as one shell word: quoted only when it holds something a shell would
-/// act on, so an ordinary group name stays the readable command the help text
-/// shows and a crafted one cannot become a second command.
-fn shell_word(word: &str) -> String {
-    let safe = !word.is_empty()
-        && word
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "-_./:=@,+".contains(c));
-    match safe {
-        true => word.to_string(),
-        false => crate::agent::exec::shell_quote(word),
     }
 }
 

@@ -711,14 +711,13 @@ pub(crate) fn start_target_sweep() {
                 let cap = crate::config::env_parse::<u64>("HUB_TARGET_MAX_GB").unwrap_or(40);
                 // Build dirs are created only in the configured base; legacy
                 // per-worktree targets in other temp roots belong to worktree prune.
-                for base in [crate::worktree::swe_base_dir()] {
-                    if let Err(error) = sweep_targets(
-                        &base,
-                        std::time::Duration::from_secs(ttl.saturating_mul(3600)),
-                        cap.saturating_mul(1024 * 1024 * 1024),
-                    ) {
-                        tracing::debug!(%error, "Build target sweep unavailable");
-                    }
+                let base = crate::worktree::swe_base_dir();
+                if let Err(error) = sweep_targets(
+                    &base,
+                    std::time::Duration::from_secs(ttl.saturating_mul(3600)),
+                    cap.saturating_mul(1024 * 1024 * 1024),
+                ) {
+                    tracing::debug!(%error, "Build target sweep unavailable");
                 }
                 std::thread::sleep(std::time::Duration::from_secs(300));
             }

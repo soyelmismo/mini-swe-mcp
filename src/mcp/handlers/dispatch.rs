@@ -132,7 +132,7 @@ impl McpServer {
             "workers": workers,
             "dispatched": dispatched,
             "failed": failed,
-            "message": "Remember to keep a watch running: workers are executing in isolated worktrees in background. Use 'watch' (or mini-swe-mcp watch) to wait for them.",
+            "message": "Remember to keep a watch running: workers are executing in isolated worktrees in background. Run `mini-swe-mcp watch` in your shell to wait for them; re-run it after each event.",
         });
         if let Some(group) = Self::batch_round_group(args, tasks) {
             payload["group"] = json!(group);
@@ -359,7 +359,7 @@ impl McpServer {
             "owner": agent,
             "status": "dispatched",
             "network": if network_offline { "offline" } else { crate::mcp::schema::NETWORK_DEFAULT },
-            "message": "Remember to keep a watch running: worker is executing in isolated worktree in background. Use 'watch' (or mini-swe-mcp watch) to wait for its next event."
+            "message": "Remember to keep a watch running: worker is executing in isolated worktree in background. Run `mini-swe-mcp watch` in your shell to wait for its next event; re-run it after each event."
         });
         if let Some(group) = args.get("group").and_then(Value::as_str) {
             payload["group"] = json!(group);
@@ -385,7 +385,7 @@ pub(in crate::mcp) const REVIEW_AFTER_DESCRIPTION: &str = "`<mode>`/`<model>:<mo
 pub(in crate::mcp) const AUTO_CONSOLIDATE_DESCRIPTION: &str =
     "Auto-consolidate the group when it stops: boolean or model.";
 
-pub(in crate::mcp) const VERIFY_DESCRIPTION: &str = "Completion gate: auto-detect if omitted; empty string disables. On consolidate: Cheap for workers, full consolidator.";
+pub(in crate::mcp) const VERIFY_DESCRIPTION: &str = "Completion gate: auto-detect if omitted; empty string disables. Consolidate round: Cheap for workers.";
 
 pub(in crate::mcp) const NETWORK_DESCRIPTION: &str =
-    "Network: 'offline' isolates every step (no egress); 'allow' (default) keeps it.";
+    "Network: 'offline' isolates every step (no egress); 'allow' keeps it.";

@@ -67,6 +67,23 @@ async fn reap_worker(server: &McpServer, base: &std::path::Path, wid: &str) {
     let _ = std::fs::remove_dir_all(base);
 }
 
+/// Claim `identity`'s one watch slot the way the shell watch behind a
+/// dispatch answer does: a `hub/watch` poll, which claims the slot for the
+/// connection it arrives on and holds it for that connection's lifetime.
+async fn hold_watch_slot(server: &McpServer, identity: &str, connection: u64) {
+    let mut ctx = ConnectionContext::hub_connection(connection);
+    ctx.agent_id = Some(identity.to_string());
+    crate::mcp::events::watch_request(
+        &server.pool,
+        &server.hub_events,
+        &ctx,
+        json!({"worker_ids": [], "group": [], "initial": false, "all": false}),
+        false,
+    )
+    .await
+    .expect("a watch poll claims the identity's slot");
+}
+
 /// The `watch_command` is only useful to a caller with no watch running: once
 /// this identity holds the hub's one watch slot the field is dropped, while a
 /// watch held by another identity does not suppress it.
@@ -130,121 +147,57 @@ async fn watch_command_is_omitted_only_while_the_callers_own_watch_runs() {
     );
 
     // Another identity's watch is not this caller's: the command stays.
-    let other = server
-        .hub_events
-        .lock()
-        .await
-        .begin_watch(
-            "someone-else",
-            2,
-            None,
-            &crate::mcp::events::WatchSelection::default(),
-        )
-        .started()
-        .expect("another identity claims its own slot");
+    hold_watch_slot(&server, "someone-else", 2).await;
     let foreign = steer(&server, &ctx).await;
     assert!(
         foreign["watch_command"].is_string(),
         "another identity's watch must not silence this caller: {foreign}"
     );
-    drop(other);
 
     // This caller's own watch: the hub enforces one watch per session and the
     // running one delivers the next event, so the command is redundant.
-    let own = server
-        .hub_events
-        .lock()
-        .await
-        .begin_watch(
-            "orchestrator",
-            1,
-            None,
-            &crate::mcp::events::WatchSelection::default(),
-        )
-        .started()
-        .expect("this identity claims the slot");
+    hold_watch_slot(&server, "orchestrator", 1).await;
     let watching = steer(&server, &ctx).await;
     assert!(
         watching.get("watch_command").is_none(),
         "a running watch makes the command redundant: {watching}"
     );
-    drop(own);
 
     let _ = std::fs::remove_dir_all(&base);
 }
 
-/// A second `watch` call of the same session never competes for the running
-/// one's events: an identical request is covered, a broader one widens the
-/// stored selection to the union, and the running watch keeps its slot.
+/// The `watch` action's answer carries the command bound to *this* caller: the
+/// hub's watch token is what makes a shell watch follow this identity's
+/// workers, and a plain `mini-swe-mcp watch` would resolve to whichever
+/// identity the operator's shell happens to be.
 #[tokio::test]
-async fn a_second_watch_call_is_covered_or_widens_the_running_one() {
-    use crate::mcp::events::WatchSelection;
-    let base = scratch("second-watch");
-    let server = McpServer::new(
-        WorkerPool::with_scratch(
-            1,
-            "http://localhost:1".to_string(),
-            "test-key".to_string(),
-            ScratchRoot::new(&base),
-        ),
-        "ninja".to_string(),
-    );
-    let tokens_dir = base.join("watch-tokens");
-    std::fs::create_dir_all(&tokens_dir).expect("create the token directory");
-    let mut ctx = ConnectionContext::hub_connection(1)
-        .with_watch_tokens(Arc::new(WatchTokens::new(tokens_dir)));
-    ctx.agent_id = Some("orchestrator".to_string());
+async fn the_watch_action_binds_its_command_to_the_caller() {
+    let base = scratch("watch-action-token");
+    let (server, ctx) = dispatch_server(&base, "action");
 
-    let narrow = WatchSelection::new(Vec::<String>::new(), ["round-a".to_string()], true);
-    let _held = server
-        .hub_events
-        .lock()
+    // No worker is dispatched and none of this caller's ids are resolved: the
+    // answer is the command to run, so a name it does not know rides along
+    // verbatim rather than being refused.
+    let answer = server
+        .execute_tool_for(
+            "worker",
+            json!({"action": "watch", "worker_id": "abc9", "all": true}),
+            &ctx,
+        )
         .await
-        .begin_watch("orchestrator", 1, None, &narrow)
-        .started()
-        .expect("the first watch holds the slot");
+        .expect("the watch action answers");
 
-    // The same request on another connection is covered, not an error.
-    let covered = server.hub_events.lock().await.begin_watch(
-        "orchestrator",
-        2,
-        None,
-        &WatchSelection::new(Vec::<String>::new(), ["round-a".to_string()], true),
+    assert_eq!(answer["status"], "use_shell", "{answer}");
+    let command = answer["watch_command"]
+        .as_str()
+        .expect("the action names the command to run");
+    assert!(
+        command.starts_with("MINI_SWE_WATCH_TOKEN="),
+        "the command must be bound to this caller's identity: {command}"
     );
     assert!(
-        matches!(covered, crate::mcp::events::WatchStart::Covered { .. }),
-        "an identical request must be covered"
-    );
-
-    // A broader request widens the stored selection to the union.
-    let widened = server.hub_events.lock().await.begin_watch(
-        "orchestrator",
-        2,
-        None,
-        &WatchSelection::new(Vec::<String>::new(), Vec::<String>::new(), true),
-    );
-    match widened {
-        crate::mcp::events::WatchStart::Widened { selection, .. } => {
-            assert!(
-                selection.contains("--all"),
-                "the union keeps round mode: {selection}"
-            );
-        }
-        _ => panic!("a broader request must widen the running watch"),
-    }
-    let stored = server
-        .hub_events
-        .lock()
-        .await
-        .selection_of("orchestrator")
-        .expect("the slot is still held");
-    assert!(
-        stored.covers(&WatchSelection::new(
-            Vec::<String>::new(),
-            Vec::<String>::new(),
-            true
-        )),
-        "the running watch now follows the union"
+        command.ends_with(" mini-swe-mcp watch abc9 --all"),
+        "the command must name the selection the call asked for: {command}"
     );
 
     let _ = std::fs::remove_dir_all(&base);

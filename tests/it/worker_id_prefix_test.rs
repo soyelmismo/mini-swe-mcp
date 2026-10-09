@@ -7,12 +7,16 @@
 
 use crate::common::IsolatedPool;
 
+use mini_swe_mcp::hub::{HubConfig, HubPaths, HubServer};
 use mini_swe_mcp::mcp::{ConnectionContext, McpServer};
 use mini_swe_mcp::pool::{
     LogBuffer, WorkerIdLookup, WorkerMetrics, WorkerRecord, WorkerRegistryEntry, WorkerState,
     save_registry_entry_in,
 };
 use serde_json::json;
+use std::sync::Arc;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
 
 /// A connection that announced `agent`, as a hub client would.
 fn agent_context(agent: &str) -> ConnectionContext {
@@ -309,36 +313,105 @@ async fn a_registry_only_worker_resolves_by_prefix_and_by_last() {
     assert_eq!(status["worker_id"], "eee55555");
 }
 
+/// The shell watch's own poll resolves a prefix and `last` exactly like every
+/// other verb: the MCP action no longer waits, so `hub/watch` is the wire a
+/// caller names its worker on.
 #[tokio::test]
-async fn watch_accepts_a_prefix_and_last() {
+async fn the_shell_watch_resolves_a_prefix_and_last() {
     let (owned, server) = server();
     owned
         .pool
         .__test_insert_worker(running_worker("abc99999", "agent-a"))
         .await;
-    let ctx = agent_context("agent-a");
-
-    let by_prefix = server
-        .execute_tool_for(
-            "worker",
-            json!({ "action": "watch", "worker_id": "abc9", "timeout_secs": 0 }),
-            &ctx,
-        )
+    let hub = crate::common::TempDir::new_in_tmp("ux-u2-watch-hub");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(hub.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let paths = HubPaths::new(hub.path().to_path_buf());
+    let socket = paths.socket();
+    let daemon = HubServer::new(
+        Arc::new(server),
+        HubConfig::new(HubPaths::new(hub.path().to_path_buf()), 60),
+    );
+    let task = tokio::spawn(async move {
+        let _ = daemon.run().await;
+    });
+    for _ in 0..100 {
+        if UnixStream::connect(&socket).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let (reader, writer) = UnixStream::connect(&socket)
         .await
-        .expect("watch must resolve the prefix");
-    assert_eq!(by_prefix["status"], "no_event");
-    assert_eq!(by_prefix["watching"], json!(["abc99999"]));
+        .expect("connect to the test daemon")
+        .into_split();
+    let mut reader = BufReader::new(reader);
+    let mut writer = writer;
+    let mut next_id = 0u64;
 
-    let by_last = server
-        .execute_tool_for(
-            "worker",
-            json!({ "action": "watch", "worker_id": "last", "timeout_secs": 0 }),
-            &ctx,
+    /// One JSON-RPC frame, answered by the reply carrying its id.
+    async fn request(
+        reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+        writer: &mut tokio::net::unix::OwnedWriteHalf,
+        id: u64,
+        method: &str,
+        params: serde_json::Value,
+    ) -> serde_json::Value {
+        writer
+            .write_all(
+                format!(
+                    "{}\n",
+                    json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write the frame");
+        writer.flush().await.expect("flush the frame");
+        loop {
+            let mut line = String::new();
+            assert!(
+                reader.read_line(&mut line).await.expect("read the reply") > 0,
+                "the daemon closed the connection"
+            );
+            let reply: serde_json::Value = serde_json::from_str(line.trim()).expect("JSON reply");
+            if reply.get("id") == Some(&json!(id)) {
+                return reply;
+            }
+        }
+    }
+
+    next_id += 1;
+    request(
+        &mut reader,
+        &mut writer,
+        next_id,
+        "hub/hello",
+        json!({"agent_id": "agent-a"}),
+    )
+    .await;
+
+    for needle in ["abc9", "last"] {
+        next_id += 1;
+        let reply = request(
+            &mut reader,
+            &mut writer,
+            next_id,
+            "hub/watch",
+            json!({"worker_ids": [needle], "group": [], "initial": true, "all": false}),
         )
-        .await
-        .expect("watch must resolve last");
-    assert_eq!(by_last["status"], "no_event");
-    assert_eq!(by_last["watching"], json!(["abc99999"]));
+        .await;
+        assert_eq!(
+            reply["result"]["watching"],
+            json!(["abc99999"]),
+            "the watch must resolve {needle}: {reply}"
+        );
+    }
+
+    task.abort();
+    let _ = task.await;
 }
 
 #[tokio::test]

@@ -24,7 +24,6 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde_json::json;
@@ -422,7 +421,6 @@ async fn owns(pool: &WorkerPool, ctx: &super::server::ConnectionContext, id: &st
 /// One agent's live watch: who holds it, what it follows, and what a second
 /// caller of the same session is told.
 struct ActiveWatch {
-    token: u64,
     connection: u64,
     pid: Option<u32>,
     /// What the running watch follows now: its own request, unioned with every
@@ -549,31 +547,6 @@ impl WatchSelection {
     }
 }
 
-/// What a *new* `watch` start found in the identity's slot.
-pub(super) enum WatchStart {
-    /// The caller now holds the slot for the lifetime of its guard.
-    Started(WatchGuard),
-    /// A watch of this session is already running and it already follows
-    /// everything this call asked for.
-    Covered { pid: Option<u32> },
-    /// A watch of this session is already running and was widened to the union
-    /// of both selections; `selection` is that union.
-    Widened { pid: Option<u32>, selection: String },
-}
-
-impl WatchStart {
-    /// The guard when this call took the slot, or `None` when it was covered
-    /// or widened. Tests hold the slot through the guard, so they need the
-    /// same shape the handler keeps.
-    #[cfg(test)]
-    pub(super) fn started(self) -> Option<WatchGuard> {
-        match self {
-            WatchStart::Started(guard) => Some(guard),
-            _ => None,
-        }
-    }
-}
-
 /// The one line a covered `watch` prints: it exits 0, carrying nothing.
 pub fn covered_watch_message(pid: Option<u32>, selection: &str) -> String {
     format!(
@@ -615,10 +588,7 @@ pub(super) enum Admission {
     /// This connection holds (or has just taken) the slot and must follow the
     /// returned selection: its own request, unioned with whatever an earlier
     /// widening already added.
-    Held {
-        token: u64,
-        selection: WatchSelection,
-    },
+    Held { selection: WatchSelection },
     /// Another connection of the same identity is watching, and it already
     /// follows everything this request asked for.
     Covered { pid: Option<u32> },
@@ -634,13 +604,12 @@ pub(super) enum Admission {
 /// Identity -> the single watch that may be active for it.
 ///
 /// A hub connection owns its slot for the connection's lifetime, released from
-/// [`EventRouter::remove`]; an MCP `watch` call owns it for the call's lifetime
-/// through a [`WatchGuard`]. A closed or cancelled watch frees its own slot, so
-/// no stale lock outlives its watcher.
+/// [`EventRouter::remove`]: the shell watch behind it holds the slot for as
+/// long as it polls, and a closed connection frees its own slot, so no stale
+/// lock outlives its watcher.
 #[derive(Default)]
 pub(super) struct WatchRegistry {
     slots: std::sync::Mutex<BTreeMap<String, ActiveWatch>>,
-    next_token: AtomicU64,
 }
 
 impl WatchRegistry {
@@ -655,7 +624,7 @@ impl WatchRegistry {
         self.lock().contains_key(identity)
     }
 
-    /// Claim `identity`'s one watch slot for a *poll* of `selection` on
+    /// Claim `identity`'s watch slot for a *poll* of `selection` on
     /// `connection`: re-entrant, so the connection that holds the slot keeps it
     /// and folds a broader request of its own into the stored selection.
     pub(super) fn admit(
@@ -665,49 +634,17 @@ impl WatchRegistry {
         pid: Option<u32>,
         selection: &WatchSelection,
     ) -> Admission {
-        self.admit_inner(identity, connection, pid, selection, true)
-    }
-
-    /// Claim `identity`'s watch slot for a *new* watch of `selection` on
-    /// `connection`.
-    ///
-    /// Unlike [`Self::admit`] this is not re-entrant: a slot already held by
-    /// any connection, including this one, is another watch, so the caller is
-    /// told it is covered or that the running watch was widened. That is what
-    /// keeps exactly one watch process per session when a client issues two
-    /// watch calls on one connection.
-    pub(super) fn start(
-        &self,
-        identity: &str,
-        connection: u64,
-        pid: Option<u32>,
-        selection: &WatchSelection,
-    ) -> Admission {
-        self.admit_inner(identity, connection, pid, selection, false)
-    }
-
-    /// The shared admission rule for a poll (`reentrant`) or a new watch.
-    ///
-    /// While a watch runs its selection only ever grows: a broader request is
-    /// unioned into the stored selection, and the running watch keeps its
-    /// connection, its place and its unacknowledged events. A request that is
-    /// already covered is answered without touching a single event.
-    fn admit_inner(
-        &self,
-        identity: &str,
-        connection: u64,
-        pid: Option<u32>,
-        selection: &WatchSelection,
-        reentrant: bool,
-    ) -> Admission {
         let mut slots = self.lock();
+        // While a watch runs its selection only ever grows: a broader request
+        // is unioned into the stored selection, and the running watch keeps its
+        // connection, its place and its unacknowledged events. A request that
+        // is already covered is answered without touching a single event.
         if let Some(active) = slots.get_mut(identity) {
-            if reentrant && active.connection == connection {
+            if active.connection == connection {
                 if !active.selection.covers(selection) {
                     active.selection = active.selection.widen(selection);
                 }
                 return Admission::Held {
-                    token: active.token,
                     selection: active.selection.clone(),
                 };
             }
@@ -721,18 +658,15 @@ impl WatchRegistry {
                 selection: active.selection.clone(),
             };
         }
-        let token = self.next_token.fetch_add(1, Ordering::Relaxed);
         slots.insert(
             identity.to_string(),
             ActiveWatch {
-                token,
                 connection,
                 pid,
                 selection: selection.clone(),
             },
         );
         Admission::Held {
-            token,
             selection: selection.clone(),
         }
     }
@@ -745,32 +679,9 @@ impl WatchRegistry {
             .map(|active| active.selection.clone())
     }
 
-    fn release_token(&self, identity: &str, token: u64) {
-        let mut slots = self.lock();
-        if slots
-            .get(identity)
-            .is_some_and(|active| active.token == token)
-        {
-            slots.remove(identity);
-        }
-    }
-
     fn release_connection(&self, connection: u64) {
         self.lock()
             .retain(|_, active| active.connection != connection);
-    }
-}
-
-/// Holds one identity's watch slot for the lifetime of an MCP `watch` call.
-pub(super) struct WatchGuard {
-    registry: Arc<WatchRegistry>,
-    identity: String,
-    token: u64,
-}
-
-impl Drop for WatchGuard {
-    fn drop(&mut self) {
-        self.registry.release_token(&self.identity, self.token);
     }
 }
 
@@ -1095,46 +1006,6 @@ impl EventRouter {
         self.watches.release_connection(id);
     }
 
-    /// Reserve `identity`'s one watch slot for an MCP `watch` call of
-    /// `selection`. The returned guard frees it when the call returns or is
-    /// cancelled.
-    ///
-    /// A second `watch` call of the same session never competes for the same
-    /// events: it is [`WatchStart::Covered`] when the running watch already
-    /// follows its selection, and [`WatchStart::Widened`] when the running
-    /// watch has just been widened to the union of both selections. Either way
-    /// the running watch keeps its connection, its place and its pending
-    /// events, and ownership scoping is unchanged: the union names only what
-    /// the running watch and the new request already named, and every reply
-    /// still filters to the caller, so another owner's workers never appear.
-    pub(super) fn begin_watch(
-        &self,
-        identity: &str,
-        connection: u64,
-        pid: Option<u32>,
-        selection: &WatchSelection,
-    ) -> WatchStart {
-        match self.watches.start(identity, connection, pid, selection) {
-            Admission::Held { token, .. } => WatchStart::Started(WatchGuard {
-                registry: Arc::clone(&self.watches),
-                identity: identity.to_string(),
-                token,
-            }),
-            Admission::Covered { pid } => WatchStart::Covered { pid },
-            Admission::Widened {
-                pid,
-                connection,
-                selection,
-            } => {
-                self.push_widen(connection, &selection);
-                WatchStart::Widened {
-                    pid,
-                    selection: selection.describe(),
-                }
-            }
-        }
-    }
-
     /// Hand the widened filter to the connection that is already watching.
     ///
     /// The widening is a push, not a new watch: the running process keeps its
@@ -1164,13 +1035,6 @@ impl EventRouter {
     /// answer can drop the "start this" line the caller has already acted on.
     pub(super) fn has_watch(&self, identity: &str) -> bool {
         self.watches.has(identity)
-    }
-
-    /// The selection `identity`'s running watch follows, or `None` while no
-    /// watch runs for it. Used by tests to assert a widening landed.
-    #[cfg(test)]
-    pub(super) fn selection_of(&self, identity: &str) -> Option<WatchSelection> {
-        self.watches.selection(identity)
     }
 
     /// Load the persisted acknowledged positions from the hub directory. Called

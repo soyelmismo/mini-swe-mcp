@@ -1225,85 +1225,6 @@ fn running_worker(id: &str) -> WorkerRecord {
     )
 }
 
-/// An unknown worker is a clear error, never a watch that never returns.
-#[tokio::test]
-async fn watch_on_an_unknown_worker_is_a_clear_error() {
-    let _scratch = common::TempDir::new_in_tmp("iso-mcp-2");
-    let pool = WorkerPool::with_scratch(
-        1,
-        "http://localhost:1".to_string(),
-        "test-key".to_string(),
-        mini_swe_mcp::worktree::ScratchRoot::new(_scratch.path()),
-    );
-    let server = McpServer::new(pool, "ninja".to_string());
-
-    let error = server
-        .execute_tool(
-            "worker",
-            json!({ "action": "watch", "worker_id": "watch-test-ghost" }),
-        )
-        .await
-        .expect_err("watching a worker that was never dispatched must fail");
-    assert!(
-        error
-            .to_string()
-            .contains("Worker not found: watch-test-ghost"),
-        "the error must name the worker: {error}"
-    );
-}
-
-/// `timeout_secs` turns the watch into a bounded long-poll: with nothing to
-/// watch it answers `no_event` instead of blocking past the host deadline.
-#[tokio::test]
-async fn watch_with_a_deadline_returns_no_event() {
-    let _scratch = common::TempDir::new_in_tmp("iso-mcp-3");
-    let pool = WorkerPool::with_scratch(
-        1,
-        "http://localhost:1".to_string(),
-        "test-key".to_string(),
-        mini_swe_mcp::worktree::ScratchRoot::new(_scratch.path()),
-    );
-    let server = McpServer::new(pool, "ninja".to_string());
-
-    let result = server
-        .execute_tool("worker", json!({ "action": "watch", "timeout_secs": 0 }))
-        .await
-        .expect("an expired deadline must answer, not hang");
-
-    assert_eq!(result["status"], "no_event");
-    assert_eq!(result["events"].as_array().map(Vec::len), Some(0));
-}
-
-/// A worker that is already finished reports its event on the first poll, so
-/// an MCP-only orchestrator never has to poll `status` to learn the outcome.
-#[tokio::test]
-async fn watch_on_a_completed_worker_returns_its_event() {
-    let _scratch = common::TempDir::new_in_tmp("iso-mcp-4");
-    let pool = WorkerPool::with_scratch(
-        1,
-        "http://localhost:1".to_string(),
-        "test-key".to_string(),
-        mini_swe_mcp::worktree::ScratchRoot::new(_scratch.path()),
-    );
-    pool.__test_insert_worker(completed_worker("watch-test-done"))
-        .await;
-    let server = McpServer::new(pool, "ninja".to_string());
-
-    let result = server
-        .execute_tool(
-            "worker",
-            json!({ "action": "watch", "worker_id": "watch-test-done" }),
-        )
-        .await
-        .expect("a finished worker must answer without waiting");
-
-    assert_eq!(result["status"], "event");
-    let events = result["events"].as_array().expect("events array");
-    assert_eq!(events.len(), 1, "one event per finished worker: {result}");
-    assert_eq!(events[0]["worker_id"], "watch-test-done");
-    assert_eq!(events[0]["event"], "completed");
-}
-
 /// The heartbeat has to fire well inside the 30-minute window an MCP client
 /// allows a silent stdio call before aborting it as idle.
 #[test]
@@ -1316,10 +1237,11 @@ fn the_wait_heartbeat_fires_within_a_minute() {
     assert!(McpServer::PROGRESS_HEARTBEAT_INTERVAL > Duration::ZERO);
 }
 
-/// The new verb is routed by the live stdio dispatcher, and an unknown worker
-/// surfaces as a tool error rather than a silent hang.
+/// The `watch` verb is routed by the live stdio dispatcher, and it answers at
+/// once instead of holding the call: a tool call is bounded by the client's
+/// own timeout, so the wait it names is a shell one.
 #[test]
-fn test_tools_call_wait_on_an_unknown_worker_errors() {
+fn test_tools_call_watch_answers_with_the_shell_command() {
     let mut server = McpProcess::spawn();
     server.initialize();
 
@@ -1336,12 +1258,15 @@ fn test_tools_call_wait_on_an_unknown_worker_errors() {
     let response = server
         .expect_response("tools/call watch")
         .expect("watch must be answered");
-    let error = expect_error_code(&response, -32000);
-    assert!(
-        error["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("Worker not found")),
-        "expected a clear unknown-worker error, got: {error}"
+    let result = expect_result(&response);
+    let payload: serde_json::Value =
+        serde_json::from_str(result["content"][0]["text"].as_str().expect("text"))
+            .expect("the payload is JSON");
+    assert_eq!(payload["status"], "use_shell", "{payload}");
+    assert_eq!(
+        payload["watch_command"],
+        json!("mini-swe-mcp watch missing-xyz"),
+        "the answer names the shell watch that follows this worker: {payload}"
     );
 }
 
@@ -1731,9 +1656,9 @@ fn owned_server() -> (IsolatedPool, McpServer) {
     (owned, server)
 }
 
-/// One agent controls its own workers and nobody else's: `steer`, `kill`,
-/// `collect` and `wait` are refused for a foreign worker, while `status` and
-/// `logs` stay readable by anyone.
+/// One agent controls its own workers and nobody else's: `steer`, `kill` and
+/// `collect` are refused for a foreign worker, while `status` and `logs` stay
+/// readable by anyone.
 #[tokio::test]
 async fn an_agent_cannot_act_on_another_agents_worker_but_can_read_it() {
     let (owned, server) = owned_server();
@@ -1747,7 +1672,6 @@ async fn an_agent_cannot_act_on_another_agents_worker_but_can_read_it() {
         json!({ "action": "steer", "worker_id": "h3-foreign", "message": "stop" }),
         json!({ "action": "kill", "worker_id": "h3-foreign" }),
         json!({ "action": "collect", "worker_id": "h3-foreign" }),
-        json!({ "action": "watch", "worker_id": "h3-foreign", "timeout_secs": 0 }),
         json!({ "action": "status", "worker_id": "h3-foreign" }),
         json!({ "action": "logs", "worker_id": "h3-foreign" }),
     ] {
@@ -2278,39 +2202,9 @@ async fn dispatch_returns_immediately_with_a_watch_hint() {
     crate_branches.assert_untouched();
 }
 
-/// The `watch` action is the only way to wait, and it is bounded by
-/// `timeout_secs`: an expired deadline answers `no_event` rather than hanging.
-#[tokio::test]
-async fn watch_action_answers_no_event_on_an_expired_deadline() {
-    let _scratch = common::TempDir::new_in_tmp("iso-mcp-7");
-    let pool = WorkerPool::with_scratch(
-        1,
-        "http://localhost:1".to_string(),
-        "test-key".to_string(),
-        mini_swe_mcp::worktree::ScratchRoot::new(_scratch.path()),
-    );
-    pool.__test_insert_worker(running_worker("h11-watch-running"))
-        .await;
-    let server = McpServer::new(pool, "ninja".to_string());
-
-    let result = tokio::time::timeout(
-        Duration::from_secs(5),
-        server.execute_tool(
-            "worker",
-            json!({ "action": "watch", "worker_id": "h11-watch-running", "timeout_secs": 0 }),
-        ),
-    )
-    .await
-    .expect("watch must honour its deadline")
-    .expect("watch must answer");
-
-    assert_eq!(result["status"], "no_event");
-    assert_eq!(result["events"].as_array().map(Vec::len), Some(0));
-}
-
 /// A worker is private to its owner: agent B gets the owner's name and nothing
-/// else -- not the task, not the state -- for `status`, `logs`, `collect` and
-/// `watch`, and `list` shows it only to its owner.
+/// else -- not the task, not the state -- for `status`, `logs` and `collect`,
+/// and `list` shows it only to its owner.
 #[tokio::test]
 async fn an_agent_cannot_read_another_agents_worker() {
     let (owned, server) = owned_server();
@@ -2327,7 +2221,6 @@ async fn an_agent_cannot_read_another_agents_worker() {
         json!({ "action": "status", "worker_id": "h11-theirs" }),
         json!({ "action": "logs", "worker_id": "h11-theirs" }),
         json!({ "action": "collect", "worker_id": "h11-theirs" }),
-        json!({ "action": "watch", "worker_id": "h11-theirs", "timeout_secs": 0 }),
     ] {
         let action = arguments["action"].as_str().expect("action").to_string();
         let error = server

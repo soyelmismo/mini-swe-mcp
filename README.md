@@ -98,7 +98,7 @@ mini-swe-mcp watch --group build        # first event in the group, then return
 
 Without `--follow` it prints the next event and returns; with `--follow` it streams until every watched worker is terminal. `--timeout <secs>` bounds the wait; `--json` emits the raw event stream.
 
-An agent with no shell can call the `watch` action instead, passing `timeout_secs` below its host's tool deadline and calling it again on `no_event`. A Claude Code session started with channels enabled also receives the same events as push notifications.
+The MCP `watch` action never blocks: a tool call is bounded by the client's own timeout and the abort that ends it cannot deliver an event, so the action answers at once with the shell command to run instead -- the same ids, `--group`, `--all` and `--timeout` the call asked for. A Claude Code session started with channels enabled also receives the same events as push notifications.
 
 ### 3. review
 
