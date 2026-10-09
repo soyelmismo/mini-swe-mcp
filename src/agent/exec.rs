@@ -226,6 +226,7 @@ impl AgentRunner {
                     sandbox_target,
                     self.network_offline,
                     io_plan,
+                    &self.readonly_mounts,
                 ) {
                     Ok(denied) => denied,
                     Err(e) => {
@@ -257,7 +258,21 @@ impl AgentRunner {
                 // already confined. Offline still needs its network namespace.
                 let final_command = wrap_network_command(command, self.network_offline);
                 let final_command = apply_io_wrapper(final_command, io_plan);
-                apply_sandbox_args(&mut cmd, dir, sandbox_target);
+                if let Err(e) =
+                    apply_sandbox_args(&mut cmd, dir, sandbox_target, &self.readonly_mounts)
+                {
+                    tracing::error!(
+                        error = %format!("{e:#}"),
+                        worktree = %dir.display(),
+                        "bwrap sandbox could not be prepared; refusing to run the command"
+                    );
+                    return Ok((
+                        format!(
+                            "BLOCKED: the sandbox could not be prepared ({e:#}); the command was not run."
+                        ),
+                        Some(1),
+                    ));
+                }
                 cmd.args(["--chdir", &dir.to_string_lossy()]);
                 cmd.args(["/usr/bin/bash", "-c", &final_command]);
                 if let IoPlan::Set(class) = io_plan {
@@ -265,6 +280,12 @@ impl AgentRunner {
                 }
             }
             SandboxBackend::Unconfined => {
+                if !self.readonly_mounts.is_empty() {
+                    return Ok((
+                        "BLOCKED: external read-only mounts require Landlock filesystem confinement; unconfined backend cannot enforce read-only mounts.".to_string(),
+                        Some(1),
+                    ));
+                }
                 warn_unconfined_once();
                 // No confinement is never "with network access" when the
                 // policy says offline.
@@ -283,6 +304,8 @@ impl AgentRunner {
         // variables are layered on top afterwards, then the per-command
         // overlay (the differential verify gate's divergent environment), so
         // the divergent values win over every default.
+        // Finally, operator-forwarded environment variables take immutable precedence
+        // and cannot be overwritten by client overlay.
         apply_sanitized_environment(&mut cmd, dir);
         apply_build_env(&mut cmd, target_dir.as_deref(), &tmp_dir, &parallelism);
         crate::cache::apply_shared_cache_env(&mut cmd);
@@ -290,6 +313,20 @@ impl AgentRunner {
             // The overlay is the variant-B environment: credential-bearing
             // names are refused here as well, so a tampered snapshot can never
             // ride the extra env into a child.
+            if crate::agent::env::is_secret_name(name) {
+                continue;
+            }
+            // Client overlay cannot override operator-forwarded variables.
+            if self.operator_env.iter().any(|(op_name, _)| op_name == name) {
+                tracing::warn!(
+                    var = %name,
+                    "client overlay attempted to override operator-forwarded variable; operator precedence enforced"
+                );
+                continue;
+            }
+            cmd.env(name, value);
+        }
+        for (name, value) in &self.operator_env {
             if crate::agent::env::is_secret_name(name) {
                 continue;
             }
@@ -819,16 +856,34 @@ fn apply_kernel_confinement(
     target_dir: &Path,
     offline: bool,
     io_plan: IoPlan,
+    readonly_mounts: &[PathBuf],
 ) -> Result<bool> {
     // Parent side of the hook: everything that allocates happens here, so the
     // closure below is reduced to syscalls. A `None` plan means this host
     // cannot confine the process, which is not an error. A plan that cannot be
     // built (the worktree or the target dir is gone) fails CLOSED: the command
     // is not run rather than run without the confinement it was promised.
-    let confinement = match KernelConfinement::prepare(dir, target_dir, offline)? {
+    let confinement = match KernelConfinement::prepare_with_mounts(
+        dir,
+        target_dir,
+        offline,
+        readonly_mounts,
+    )? {
         Some(confinement) => confinement,
-        None => return Ok(false),
+        None => {
+            if !readonly_mounts.is_empty() {
+                anyhow::bail!(
+                    "external read-only mounts require Landlock filesystem confinement, but confinement could not be prepared"
+                );
+            }
+            return Ok(false);
+        }
     };
+    if !readonly_mounts.is_empty() && !confinement.has_landlock() {
+        anyhow::bail!(
+            "external read-only mounts require Landlock filesystem confinement, but Landlock plan was not established"
+        );
+    }
     let network_denied = offline && confinement.has_seccomp();
 
     // SAFETY: the closure runs in the child between `fork` and `exec`, where
@@ -863,7 +918,11 @@ fn apply_kernel_confinement(
     _target_dir: &Path,
     _offline: bool,
     _io_plan: IoPlan,
+    readonly_mounts: &[PathBuf],
 ) -> Result<bool> {
+    if !readonly_mounts.is_empty() {
+        anyhow::bail!("external read-only mounts require Linux Landlock filesystem confinement");
+    }
     Ok(false)
 }
 
@@ -1081,7 +1140,36 @@ fn ro_bind_toolchain_cache(cmd: &mut Command, path: &Path) {
 /// target dir and a handful of toolchain caches are bound writable. `$HOME` is
 /// an empty tmpfs so the agent cannot read or clobber SSH keys, dotfiles or
 /// package-manager credentials.
-fn apply_sandbox_args(cmd: &mut Command, dir: &Path, target_dir: &Path) {
+fn apply_sandbox_args(
+    cmd: &mut Command,
+    dir: &Path,
+    target_dir: &Path,
+    readonly_mounts: &[PathBuf],
+) -> Result<()> {
+    apply_sandbox_args_from(cmd, dir, target_dir, readonly_mounts)
+}
+
+#[doc(hidden)]
+pub fn __test_apply_sandbox_args(
+    cmd: &mut Command,
+    dir: &Path,
+    target_dir: &Path,
+    readonly_mounts: &[PathBuf],
+) -> Result<()> {
+    apply_sandbox_args(cmd, dir, target_dir, readonly_mounts)
+}
+
+fn apply_sandbox_args_from(
+    cmd: &mut Command,
+    dir: &Path,
+    target_dir: &Path,
+    readonly_mounts: &[PathBuf],
+) -> Result<()> {
+    if !readonly_mounts.is_empty() {
+        anyhow::bail!(
+            "bubblewrap backend cannot enforce noexec isolation on external read-only mounts; use the default kernel/Landlock sandbox backend instead"
+        );
+    }
     let dir_str = dir.to_string_lossy();
     let target_str = target_dir.to_string_lossy();
 
@@ -1183,6 +1271,7 @@ fn apply_sandbox_args(cmd: &mut Command, dir: &Path, target_dir: &Path) {
 
     // Modular shared package/compiler caches.
     crate::cache::append_bwrap_cache_args(cmd, home.as_deref());
+    Ok(())
 }
 
 /// Replace the inherited environment with the sanitized allow-list.
@@ -3455,6 +3544,7 @@ mod tests {
             &scratch.target,
             offline,
             IoPlan::Inherit,
+            &[],
         )
         .expect("prepare the kernel confinement");
         cmd.arg("-c").arg(script);
@@ -3575,6 +3665,7 @@ for name, fam, kind in [("tcp4", socket.AF_INET, socket.SOCK_STREAM),
             &scratch.target,
             false,
             IoPlan::Inherit,
+            &[],
         )
         .expect("prepare the kernel confinement");
         cmd.arg("-c").arg("echo confined-and-alive");
@@ -3654,6 +3745,7 @@ for name, fam, kind in [("tcp4", socket.AF_INET, socket.SOCK_STREAM),
             &scratch.target,
             false,
             IoPlan::Inherit,
+            &[],
         )
         .expect("prepare the kernel confinement");
         cmd.arg("-c").arg(&probe);
@@ -3715,6 +3807,7 @@ for name, fam, kind in [("tcp4", socket.AF_INET, socket.SOCK_STREAM),
             &scratch.target,
             false,
             IoPlan::Inherit,
+            &[],
         )
         .expect("prepare the kernel confinement");
         cmd.arg("-c").arg("true");
@@ -3728,6 +3821,7 @@ for name, fam, kind in [("tcp4", socket.AF_INET, socket.SOCK_STREAM),
             &scratch.target,
             false,
             IoPlan::Inherit,
+            &[],
         )
         .expect("prepare the kernel confinement");
         child.arg("-c").arg(format!("cat {}", outside.display()));
@@ -3760,7 +3854,8 @@ for name, fam, kind in [("tcp4", socket.AF_INET, socket.SOCK_STREAM),
         // argv, and the Landlock hook must not have been folded into it.
         let scratch = LandlockScratch::new("bwrap");
         let mut cmd = Command::new("true");
-        apply_sandbox_args(&mut cmd, &scratch.worktree, &scratch.target);
+        apply_sandbox_args(&mut cmd, &scratch.worktree, &scratch.target, &[])
+            .expect("bwrap sandbox args applied");
         let rendered: Vec<String> = cmd
             .as_std()
             .get_args()
@@ -3769,6 +3864,56 @@ for name, fam, kind in [("tcp4", socket.AF_INET, socket.SOCK_STREAM),
         assert!(
             rendered.iter().any(|a| a == "bwrap"),
             "bwrap must still lead the argv: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn bubblewrap_fails_closed_on_readonly_mounts() {
+        let scratch = LandlockScratch::new("bwrap_mounts");
+        let mut cmd = Command::new("true");
+        let mounts = vec![std::path::PathBuf::from("/some/external/fixture")];
+        let err = apply_sandbox_args(&mut cmd, &scratch.worktree, &scratch.target, &mounts)
+            .expect_err("bwrap must fail closed when external readonly mounts are configured");
+        assert!(
+            err.to_string()
+                .contains("bubblewrap backend cannot enforce noexec isolation"),
+            "unexpected error message: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn operator_env_has_immutable_precedence_over_client_overlay() {
+        let scratch = LandlockScratch::new("op_precedence");
+        let runner = AgentRunner::new(String::new(), String::new(), String::new(), None)
+            .with_operator_env(vec![
+                ("SHARED_VAR".to_string(), "operator_trusted".to_string()),
+                ("OP_ONLY".to_string(), "op_val".to_string()),
+            ])
+            .with_extra_env(vec![
+                ("SHARED_VAR".to_string(), "client_tampered".to_string()),
+                ("CLIENT_ONLY".to_string(), "client_val".to_string()),
+            ]);
+
+        let (out, code) = runner
+            .execute_bash(
+                &scratch.worktree,
+                "echo S=$SHARED_VAR; echo O=$OP_ONLY; echo C=$CLIENT_ONLY",
+            )
+            .await
+            .expect("execute bash");
+
+        assert_eq!(code, Some(0));
+        assert!(
+            out.contains("S=operator_trusted"),
+            "operator env must take immutable precedence over client overlay: {out}"
+        );
+        assert!(
+            out.contains("O=op_val"),
+            "operator env must reach child: {out}"
+        );
+        assert!(
+            out.contains("C=client_val"),
+            "harmless client overlay must reach child: {out}"
         );
     }
 

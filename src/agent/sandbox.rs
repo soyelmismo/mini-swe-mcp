@@ -863,7 +863,11 @@ fn supported_access_fs(abi: i64) -> u64 {
 
 /// Whether Landlock confinement has been switched off for this process.
 fn landlock_disabled() -> bool {
-    landlock_disabled_from(&|name| std::env::var(name).ok())
+    landlock_disabled_from_os(&|name| std::env::var_os(name))
+}
+
+fn landlock_disabled_from_os(lookup: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> bool {
+    lookup(DISABLE_LANDLOCK_ENV).as_deref() == Some(std::ffi::OsStr::new("1"))
 }
 
 /// [`landlock_disabled`] reading the switch from `lookup`.
@@ -872,14 +876,24 @@ fn landlock_disabled() -> bool {
 /// tests, so the operator opt-out is covered without mutating process-global
 /// state. [`landlock_disabled`] delegates here unchanged.
 fn landlock_disabled_from(lookup: &dyn Fn(&str) -> Option<String>) -> bool {
-    lookup(DISABLE_LANDLOCK_ENV).as_deref() == Some("1")
+    landlock_disabled_from_os(&|k| lookup(k).map(std::ffi::OsString::from))
+}
+
+/// Home directory of the user the worker runs as, reading from `lookup` accepting `OsString`.
+fn home_dir_from_os(lookup: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
+    lookup("HOME")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
 }
 
 /// Home directory of the user the worker runs as, if one is discoverable.
 fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .filter(|p| !p.as_os_str().is_empty())
+    home_dir_from_os(&|name| std::env::var_os(name))
+}
+
+/// Whether two canonicalized paths overlap: either they are identical, or one is an ancestor of the other.
+fn path_overlaps(a: &Path, b: &Path) -> bool {
+    a == b || a.starts_with(b) || b.starts_with(a)
 }
 
 /// Absolute paths that must stay unreachable, resolved against `$HOME`.
@@ -887,7 +901,7 @@ fn home_dir() -> Option<PathBuf> {
 /// Intentionally *not* added as Landlock rules: no rule covers them, so the
 /// handled rights deny them. An explicit, testable list stops a broad prefix
 /// rule from silently granting them by accident.
-fn denied_paths() -> Vec<PathBuf> {
+pub(crate) fn denied_paths() -> Vec<PathBuf> {
     let mut denied = Vec::with_capacity(
         DENIED_ABSOLUTE_PATHS.len() + DENIED_HOME_SUBDIRS.len() + DENIED_CREDENTIAL_FILES.len(),
     );
@@ -972,6 +986,293 @@ fn rights_for(rule_path: &Path, allowed: u64) -> u64 {
     }
 }
 
+/// Environment variable specifying operator-controlled read-only mounts.
+///
+/// Must be a JSON array of absolute path strings, e.g. `["/path/one", "/path/two"]`.
+pub const READONLY_MOUNTS_ENV: &str = "SWE_READONLY_MOUNTS";
+
+/// Paths that must never be granted as read-only mounts (blanket system roots or volatile/shared scratch).
+const FORBIDDEN_READONLY_ROOTS: &[&str] = &[
+    "/", "/root", "/home", "/tmp", "/var/tmp", "/etc", "/dev", "/proc", "/sys", "/usr", "/bin",
+    "/sbin", "/lib", "/lib64", "/lib32", "/opt",
+];
+
+/// Parse and validate operator-configured read-only mount paths from `lookup` accepting `OsString`.
+///
+/// Security properties enforced:
+/// 1. Input must be a valid UTF-8 JSON array of absolute path strings. Fails closed on invalid UTF-8.
+/// 2. Every path exists and is canonicalized (resolving symlinks before evaluation).
+///    *Note on TOCTOU limitations:* Canonicalization resolves symlinks at inspection time.
+///    Landlock rules open resolved paths using `O_PATH` after fork in the `pre_exec` hook.
+///    Because file descriptors are not persistently pinned across process lifetimes,
+///    configured read-only mount paths should reside on trusted filesystems owned by the
+///    operator, where concurrent untrusted actors cannot race or swap symlinks into sensitive files.
+/// 3. Rejects blanket roots (`/`, `/home`, `/tmp`, `/var/tmp`, `/etc`, etc.) and ancestors of `$HOME`.
+/// 4. Rejects paths under system executable prefixes (`/usr`, `/opt`, `/bin`, etc.) because Landlock permissions are additive.
+/// 5. Rejects denied paths and known host-side credential directories (e.g. `~/.ssh`, `~/.aws`, `~/.gnupg` in `denied_paths`).
+///    *Note on limitations:* this is not a general recursive scan for arbitrary nested secrets on the host;
+///    configured read-only mount paths must reside in directories explicitly trusted and managed by the operator.
+/// 6. Rejects overlaps with writable worktree, target directory, worker scratch, or writable toolchain/shared cache roots,
+///    because Landlock permissions are additive and a read-only grant cannot revoke existing write rights.
+pub fn parse_readonly_mounts_from_os(
+    lookup: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+    worktree: &Path,
+    target_dir: &Path,
+    denied: &[PathBuf],
+) -> anyhow::Result<Vec<PathBuf>> {
+    let raw_os = match lookup(READONLY_MOUNTS_ENV) {
+        Some(val) => val,
+        None => return Ok(Vec::new()),
+    };
+
+    let raw = raw_os
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("{READONLY_MOUNTS_ENV}: value is not valid UTF-8 Unicode"))?;
+
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let entries: Vec<String> = serde_json::from_str(&raw).map_err(|e| {
+        anyhow::anyhow!(
+            "invalid {READONLY_MOUNTS_ENV}: must be a JSON array of absolute path strings: {e}"
+        )
+    })?;
+
+    let canonical_wt = canonical_root(worktree);
+    let canonical_target = canonical_root(target_dir);
+    let scratch = canonical_root(&crate::worktree::scratch_dir(worktree));
+    let host_home =
+        home_dir_from_os(lookup).and_then(|h| std::fs::canonicalize(&h).ok().or(Some(h)));
+    let writable_caches: Vec<PathBuf> = writable_cache_paths_from_os(lookup)
+        .into_iter()
+        .map(|c| std::fs::canonicalize(&c).unwrap_or(c))
+        .collect();
+    let toolchain_exec_roots: Vec<PathBuf> = toolchain_cache_paths_from_os(lookup)
+        .into_iter()
+        .map(|tc| std::fs::canonicalize(&tc).unwrap_or(tc))
+        .collect();
+    let git_roots: Vec<PathBuf> = git_rule_paths(worktree)
+        .into_iter()
+        .flat_map(|(common, gitdir)| {
+            let mut v = vec![common];
+            if let Some(gd) = gitdir {
+                v.push(gd);
+            }
+            v
+        })
+        .collect();
+
+    let mut out = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if entry.is_empty() {
+            anyhow::bail!("{READONLY_MOUNTS_ENV}: empty path string is not allowed");
+        }
+        let raw_path = PathBuf::from(&entry);
+        if !raw_path.is_absolute() {
+            anyhow::bail!("{READONLY_MOUNTS_ENV}: path must be absolute: '{entry}'");
+        }
+
+        // Must exist on host and be canonicalizable (preflight check)
+        let resolved = std::fs::canonicalize(&raw_path).map_err(|e| {
+            anyhow::anyhow!(
+                "{READONLY_MOUNTS_ENV}: path '{entry}' does not exist or is unreadable: {e}"
+            )
+        })?;
+
+        // 1. Inode type check: must be regular file or directory (reject special devices, FIFOs, sockets)
+        let meta = std::fs::metadata(&resolved).map_err(|e| {
+            anyhow::anyhow!(
+                "{READONLY_MOUNTS_ENV}: path '{entry}' does not exist or is unreadable: {e}"
+            )
+        })?;
+        if !meta.is_file() && !meta.is_dir() {
+            anyhow::bail!(
+                "{READONLY_MOUNTS_ENV}: path '{}' is not a regular file or directory",
+                resolved.display()
+            );
+        }
+
+        // 2. Blanket root & system paths rejection
+        if FORBIDDEN_READONLY_ROOTS
+            .iter()
+            .any(|&root| resolved == Path::new(root))
+        {
+            anyhow::bail!(
+                "{READONLY_MOUNTS_ENV}: blanket mount of '{}' is forbidden",
+                resolved.display()
+            );
+        }
+
+        // 3. Reject pseudo-filesystems and device directories (/dev, /proc, /sys)
+        const SPECIAL_PSEUDO_PREFIXES: &[&str] = &["/dev", "/proc", "/sys"];
+        for &pseudo in SPECIAL_PSEUDO_PREFIXES {
+            let p = Path::new(pseudo);
+            if path_overlaps(&resolved, p) {
+                anyhow::bail!(
+                    "{READONLY_MOUNTS_ENV}: path '{}' overlaps with special filesystem '{pseudo}'",
+                    resolved.display()
+                );
+            }
+        }
+
+        // 4. Reject system executable prefixes (bidirectional overlap)
+        const SYSTEM_EXEC_PREFIXES: &[&str] =
+            &["/usr", "/opt", "/bin", "/sbin", "/lib", "/lib64", "/lib32"];
+        for &prefix in SYSTEM_EXEC_PREFIXES {
+            let p = Path::new(prefix);
+            if path_overlaps(&resolved, p) {
+                anyhow::bail!(
+                    "{READONLY_MOUNTS_ENV}: path '{}' overlaps with system executable prefix '{prefix}'; external read-only mounts must not overlap system executable paths",
+                    resolved.display()
+                );
+            }
+        }
+
+        // 5. Reject toolchain cache executable paths (bidirectional overlap)
+        for tc in &toolchain_exec_roots {
+            if path_overlaps(&resolved, tc) {
+                anyhow::bail!(
+                    "{READONLY_MOUNTS_ENV}: path '{}' overlaps with executable toolchain location '{}'; external read-only mounts must not overlap executable paths",
+                    resolved.display(),
+                    tc.display()
+                );
+            }
+        }
+
+        // 6. Reject git metadata paths (bidirectional overlap)
+        for git_dir in &git_roots {
+            if path_overlaps(&resolved, git_dir) {
+                anyhow::bail!(
+                    "{READONLY_MOUNTS_ENV}: path '{}' overlaps with git repository metadata '{}'",
+                    resolved.display(),
+                    git_dir.display()
+                );
+            }
+        }
+
+        // 7. Reject HOME or any ancestor of HOME
+        if let Some(home) = &host_home
+            && (resolved == *home || home.starts_with(&resolved))
+        {
+            anyhow::bail!(
+                "{READONLY_MOUNTS_ENV}: granting HOME or an ancestor of HOME ('{}') is forbidden",
+                resolved.display()
+            );
+        }
+
+        // 8. Reject /tmp, /var/tmp or ancestors
+        if Path::new("/tmp").starts_with(&resolved) || Path::new("/var/tmp").starts_with(&resolved)
+        {
+            anyhow::bail!(
+                "{READONLY_MOUNTS_ENV}: granting scratch space or ancestor of scratch space ('{}') is forbidden",
+                resolved.display()
+            );
+        }
+
+        // 9. Denied paths check (direct match or child of denied path)
+        if is_denied(&resolved, denied) {
+            anyhow::bail!(
+                "{READONLY_MOUNTS_ENV}: path '{}' is a denied sensitive location",
+                resolved.display()
+            );
+        }
+
+        // 10. Descendant secret check (directory enclosing denied paths, e.g. ~/.ssh)
+        if resolved.is_dir() && denied.iter().any(|d| d.starts_with(&resolved)) {
+            anyhow::bail!(
+                "{READONLY_MOUNTS_ENV}: directory '{}' encloses sensitive credentials and cannot be mounted",
+                resolved.display()
+            );
+        }
+
+        // 11. Overlap with writable roots (worktree, target, scratch, writable caches)
+        if path_overlaps(&resolved, &canonical_wt) {
+            anyhow::bail!(
+                "{READONLY_MOUNTS_ENV}: path '{}' overlaps with writable worktree",
+                resolved.display()
+            );
+        }
+        if path_overlaps(&resolved, &canonical_target) {
+            anyhow::bail!(
+                "{READONLY_MOUNTS_ENV}: path '{}' overlaps with writable target dir",
+                resolved.display()
+            );
+        }
+        if path_overlaps(&resolved, &scratch) {
+            anyhow::bail!(
+                "{READONLY_MOUNTS_ENV}: path '{}' overlaps with writable worker scratch dir",
+                resolved.display()
+            );
+        }
+        for cache in &writable_caches {
+            if path_overlaps(&resolved, cache) {
+                anyhow::bail!(
+                    "{READONLY_MOUNTS_ENV}: path '{}' overlaps with writable cache root '{}'",
+                    resolved.display(),
+                    cache.display()
+                );
+            }
+        }
+
+        out.push(resolved);
+    }
+
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+/// Wrapper for [`parse_readonly_mounts_from_os`] accepting `Option<String>`.
+pub fn parse_readonly_mounts_from(
+    lookup: &dyn Fn(&str) -> Option<String>,
+    worktree: &Path,
+    target_dir: &Path,
+    denied: &[PathBuf],
+) -> anyhow::Result<Vec<PathBuf>> {
+    parse_readonly_mounts_from_os(
+        &|k| lookup(k).map(std::ffi::OsString::from),
+        worktree,
+        target_dir,
+        denied,
+    )
+}
+
+/// Production wrapper for [`parse_readonly_mounts_from_os`].
+pub fn parse_readonly_mounts(worktree: &Path, target_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let denied = denied_paths();
+    parse_readonly_mounts_from_os(
+        &|name| std::env::var_os(name),
+        worktree,
+        target_dir,
+        &denied,
+    )
+}
+
+/// Preflight check for readonly mounts validating configuration against repository root.
+pub fn preflight_readonly_mounts(repo_path: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let denied = denied_paths();
+    let mounts = parse_readonly_mounts_from_os(
+        &|name| std::env::var_os(name),
+        repo_path,
+        repo_path,
+        &denied,
+    )?;
+    if !mounts.is_empty() {
+        if landlock_disabled() {
+            anyhow::bail!(
+                "external read-only mounts require Landlock filesystem confinement, but Landlock is disabled by {DISABLE_LANDLOCK_ENV}"
+            );
+        }
+        if query_abi_version().is_none() {
+            anyhow::bail!(
+                "external read-only mounts require Landlock filesystem confinement, but Landlock is not supported by this kernel"
+            );
+        }
+    }
+    Ok(mounts)
+}
+
 /// Build the `PATH_BENEATH` rules for a sandboxed child.
 ///
 /// Landlock is allow-only: every granted path widens access, so the policy
@@ -983,9 +1284,33 @@ fn rights_for(rule_path: &Path, allowed: u64) -> u64 {
 /// never be granted even if reachable from an allowed prefix. The
 /// caller-supplied roots are canonicalised first ([`canonical_root`]) so a
 /// symlink cannot point one at a denied directory.
+#[cfg(test)]
 fn build_path_rules(worktree: &Path, target_dir: &Path) -> Vec<PathRule> {
+    build_path_rules_from(worktree, target_dir, &|name| std::env::var(name).ok())
+}
+
+/// Pure core of [`build_path_rules`], reading configuration from `lookup`.
+#[cfg(test)]
+fn build_path_rules_from(
+    worktree: &Path,
+    target_dir: &Path,
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> Vec<PathRule> {
     let denied = denied_paths();
-    let capacity = READ_ONLY_SYSTEM_PATHS.len() + CONFIG_PATHS.len() + 3 + 2 + 2;
+    let mounts =
+        parse_readonly_mounts_from(lookup, worktree, target_dir, &denied).unwrap_or_default();
+    build_path_rules_with_mounts(worktree, target_dir, &mounts)
+}
+
+/// Pure path rule builder given an explicit, pre-validated slice of `readonly_mounts`.
+fn build_path_rules_with_mounts(
+    worktree: &Path,
+    target_dir: &Path,
+    readonly_mounts: &[PathBuf],
+) -> Vec<PathRule> {
+    let denied = denied_paths();
+    let capacity =
+        READ_ONLY_SYSTEM_PATHS.len() + CONFIG_PATHS.len() + 3 + 2 + 2 + readonly_mounts.len();
     let mut rules = Vec::with_capacity(capacity);
 
     let mut push = |path: PathBuf, allowed: u64| {
@@ -1061,6 +1386,17 @@ fn build_path_rules(worktree: &Path, target_dir: &Path) -> Vec<PathRule> {
         }
     }
 
+    // Operator-configured external read-only mounts.
+    // Files receive only ACCESS_FS_READ_FILE; directories receive ACCESS_FS_READ_FILE | ACCESS_FS_READ_DIR.
+    // Never ACCESS_FS_EXECUTE or write rights.
+    for mount in readonly_mounts {
+        let rights = match std::fs::metadata(mount) {
+            Ok(meta) if meta.is_dir() => ACCESS_FS_READ_FILE | ACCESS_FS_READ_DIR,
+            _ => ACCESS_FS_READ_FILE,
+        };
+        push(mount.clone(), rights);
+    }
+
     rules
 }
 
@@ -1072,21 +1408,32 @@ fn build_path_rules(worktree: &Path, target_dir: &Path) -> Vec<PathRule> {
 /// for tool discovery through `PATH`. Everything here is resolved in the
 /// parent, where reading the environment and probing the filesystem is safe.
 fn toolchain_cache_paths() -> Vec<PathBuf> {
+    toolchain_cache_paths_from_os(&|name| std::env::var_os(name))
+}
+
+fn toolchain_cache_paths_from_os(
+    lookup: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<PathBuf> {
     let mut paths = Vec::with_capacity(4);
-    if let Some(cargo_home) = crate::agent::env::host_cargo_home() {
-        paths.push(cargo_home);
-    } else if let Some(home) = home_dir() {
-        // `host_cargo_home` only reports `~/.cargo` when it exists; without a
-        // Cargo home there is no registry to grant, so nothing is added.
-        let _ = home;
-    }
-    if let Some(rustup_home) = std::env::var_os("RUSTUP_HOME")
+    let home = home_dir_from_os(lookup);
+    if let Some(cargo_home) = lookup("CARGO_HOME")
+        .filter(|p| !p.is_empty())
         .map(PathBuf::from)
-        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| {
+            home.as_ref()
+                .map(|h| h.join(".cargo"))
+                .filter(|p| p.exists())
+        })
+    {
+        paths.push(cargo_home);
+    }
+    if let Some(rustup_home) = lookup("RUSTUP_HOME")
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
     {
         paths.push(rustup_home);
     }
-    if let Some(home) = home_dir() {
+    if let Some(home) = home {
         for dir in [".cargo", ".rustup", ".local/bin"] {
             paths.push(home.join(dir));
         }
@@ -1103,13 +1450,21 @@ fn toolchain_cache_paths() -> Vec<PathBuf> {
 /// cache root, the user's `kache` directory, and any `SWE_SHARED_CACHES`
 /// host-side binds. Missing paths are skipped when the plan is applied.
 pub(crate) fn writable_cache_paths() -> Vec<PathBuf> {
+    writable_cache_paths_from_os(&|name| std::env::var_os(name))
+}
+
+pub(crate) fn writable_cache_paths_from_os(
+    lookup: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<PathBuf> {
     let mut paths = Vec::with_capacity(4);
     paths.push(crate::cache::shared_cache_root());
-    if let Some(home) = home_dir() {
+    if let Some(home) = home_dir_from_os(lookup) {
         paths.push(home.join(".cache").join("kache"));
     }
-    if let Ok(custom) = std::env::var("SWE_SHARED_CACHES") {
-        for (host, _guest) in crate::cache::parse_custom_cache_binds(&custom) {
+    if let Some(custom_os) = lookup("SWE_SHARED_CACHES")
+        && let Some(custom) = custom_os.to_str()
+    {
+        for (host, _guest) in crate::cache::parse_custom_cache_binds(custom) {
             paths.push(host);
         }
     }
@@ -1401,25 +1756,59 @@ pub fn build_landlock_plan(
     )
 }
 
-/// [`build_landlock_plan`] with the ABI probe and the parent environment
-/// supplied by the caller, so tests drive both the "kernel cannot confine" and
-/// the "operator disabled Landlock" branches without mutating process-global
-/// state. Production passes the real environment through.
-pub fn build_plan_with_abi(
+/// Build a Landlock plan given pre-validated frozen `readonly_mounts`.
+pub fn build_landlock_plan_with_mounts(
+    worktree: &Path,
+    target_dir: &Path,
+    offline: bool,
+    readonly_mounts: &[PathBuf],
+) -> Result<Option<LandlockPlan>> {
+    build_plan_with_abi_and_mounts(
+        worktree,
+        target_dir,
+        query_abi_version(),
+        offline,
+        readonly_mounts,
+    )
+}
+
+/// Core plan builder given resolved `abi` and pre-validated `readonly_mounts`.
+pub(crate) fn build_plan_with_abi_and_mounts(
     worktree: &Path,
     target_dir: &Path,
     abi: Option<i64>,
     offline: bool,
+    readonly_mounts: &[PathBuf],
+) -> Result<Option<LandlockPlan>> {
+    build_plan_with_abi_and_mounts_from(
+        &|name| std::env::var(name).ok(),
+        worktree,
+        target_dir,
+        abi,
+        offline,
+        readonly_mounts,
+    )
+}
+
+/// Core plan builder with parameterised environment lookup.
+pub(crate) fn build_plan_with_abi_and_mounts_from(
     lookup: &dyn Fn(&str) -> Option<String>,
+    worktree: &Path,
+    target_dir: &Path,
+    abi: Option<i64>,
+    offline: bool,
+    readonly_mounts: &[PathBuf],
 ) -> Result<Option<LandlockPlan>> {
     if landlock_disabled_from(lookup) {
+        if !readonly_mounts.is_empty() {
+            anyhow::bail!(
+                "external read-only mounts require Landlock filesystem confinement, but Landlock is disabled by {DISABLE_LANDLOCK_ENV}"
+            );
+        }
         tracing::debug!("landlock confinement disabled by {DISABLE_LANDLOCK_ENV}=1");
         return Ok(None);
     }
 
-    // A rule on a missing path is a caller bug; silently granting access to a
-    // directory that is not there would only hide it until the first write
-    // fails somewhere far less obvious.
     if !worktree.is_dir() {
         anyhow::bail!("landlock worktree does not exist: {}", worktree.display());
     }
@@ -1430,39 +1819,34 @@ pub fn build_plan_with_abi(
         );
     }
 
-    // A kernel without Landlock is not a reason to fail a worker: the caller
-    // gets `None`, registers no hook, and the command runs unconfined.
     let Some(abi) = abi else {
+        if !readonly_mounts.is_empty() {
+            anyhow::bail!(
+                "external read-only mounts require Landlock filesystem confinement, but Landlock is not supported by this kernel"
+            );
+        }
         tracing::debug!("landlock unsupported by this kernel; running unconfined");
         return Ok(None);
     };
 
-    let rules = build_path_rules(worktree, target_dir);
+    let rules = build_path_rules_with_mounts(worktree, target_dir, readonly_mounts);
     let handled = handled_access_fs(&rules, supported_access_fs(abi));
 
-    // Offline network policy: handle TCP bind/connect with no rule granting
-    // any port, which denies them all. Online workers leave the network
-    // unhandled and therefore unrestricted.
     let handled_net = if offline && abi >= ABI_NET {
         ACCESS_NET_BIND_TCP | ACCESS_NET_CONNECT_TCP
     } else {
         0
     };
 
-    // A worker's signals and abstract sockets stay inside its own domain, so
-    // one agent cannot kill or impersonate the daemon or another worker.
     let scoped = if abi >= ABI_SCOPE {
         LANDLOCK_SCOPE_SIGNAL | LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET
     } else {
         0
     };
 
-    // Counts are fixed by the policy, so size both vectors up front.
     let mut paths = Vec::with_capacity(rules.len());
     let mut allowed = Vec::with_capacity(rules.len());
     for rule in &rules {
-        // A path with an interior NUL cannot be a C string; a rule we cannot
-        // name must not be pretended installed.
         let Ok(c_path) = CString::new(rule.path.as_os_str().as_bytes()) else {
             tracing::debug!(
                 path = %rule.path.display(),
@@ -1470,8 +1854,6 @@ pub fn build_plan_with_abi(
             );
             continue;
         };
-        // Directory-only rights are meaningless on a non-directory; the kernel
-        // rejects a rule carrying them rather than masking them out.
         let allowed_access = rights_for(&rule.path, rule.allowed);
         paths.push(c_path);
         allowed.push(allowed_access);
@@ -1491,6 +1873,27 @@ pub fn build_plan_with_abi(
         paths,
         allowed,
     }))
+}
+
+/// [`build_landlock_plan`] with the ABI probe and the parent environment
+/// supplied by the caller, so tests drive both the "kernel cannot confine" and
+/// the "operator disabled Landlock" branches without mutating process-global
+/// state. Production passes the real environment through.
+pub fn build_plan_with_abi(
+    worktree: &Path,
+    target_dir: &Path,
+    abi: Option<i64>,
+    offline: bool,
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> Result<Option<LandlockPlan>> {
+    if landlock_disabled_from(lookup) {
+        tracing::debug!("landlock confinement disabled by {DISABLE_LANDLOCK_ENV}=1");
+        return Ok(None);
+    }
+
+    let denied = denied_paths();
+    let mounts = parse_readonly_mounts_from(lookup, worktree, target_dir, &denied)?;
+    build_plan_with_abi_and_mounts(worktree, target_dir, abi, offline, &mounts)
 }
 
 #[cfg(test)]
@@ -2316,6 +2719,509 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_readonly_mounts_unset_and_empty() {
+        let scratch = Scratch::new("ro-unset");
+        let denied = denied_paths();
+        let lookup = |_: &str| None;
+        let mounts =
+            parse_readonly_mounts_from(&lookup, &scratch.worktree(), &scratch.target(), &denied)
+                .expect("unset should succeed");
+        assert!(mounts.is_empty());
+
+        let lookup_empty = |k: &str| match k {
+            READONLY_MOUNTS_ENV => Some("   ".to_string()),
+            _ => None,
+        };
+        let mounts = parse_readonly_mounts_from(
+            &lookup_empty,
+            &scratch.worktree(),
+            &scratch.target(),
+            &denied,
+        )
+        .expect("blank should succeed");
+        assert!(mounts.is_empty());
+    }
+
+    #[test]
+    fn test_readonly_mounts_fails_closed_on_malformed_json() {
+        let scratch = Scratch::new("ro-malformed");
+        let denied = denied_paths();
+        for malformed in ["not-json", "{\"path\": 1}", "[\"unclosed"] {
+            let lookup = |k: &str| match k {
+                READONLY_MOUNTS_ENV => Some(malformed.to_string()),
+                _ => None,
+            };
+            assert!(
+                parse_readonly_mounts_from(
+                    &lookup,
+                    &scratch.worktree(),
+                    &scratch.target(),
+                    &denied
+                )
+                .is_err(),
+                "should fail closed on {malformed}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_readonly_mounts_rejects_blanket_roots_and_ancestors() {
+        let scratch = Scratch::new("ro-roots");
+        let denied = denied_paths();
+        for forbidden in [
+            "/", "/root", "/home", "/tmp", "/var/tmp", "/etc", "/dev", "/usr",
+        ] {
+            let lookup = |k: &str| match k {
+                READONLY_MOUNTS_ENV => Some(format!("[\"{forbidden}\"]")),
+                _ => None,
+            };
+            assert!(
+                parse_readonly_mounts_from(
+                    &lookup,
+                    &scratch.worktree(),
+                    &scratch.target(),
+                    &denied
+                )
+                .is_err(),
+                "should reject blanket root {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_readonly_mounts_rejects_denied_and_credential_paths() {
+        let scratch = Scratch::new("ro-denied");
+        let fake_secret = scratch.dir().join(".fake-ssh");
+        std::fs::create_dir_all(&fake_secret).unwrap();
+        let mut denied = denied_paths();
+        denied.push(fake_secret.clone());
+
+        // Direct denied path
+        let lookup_direct = |k: &str| match k {
+            READONLY_MOUNTS_ENV => Some(format!("[\"{}\"]", fake_secret.display())),
+            _ => None,
+        };
+        assert!(
+            parse_readonly_mounts_from(
+                &lookup_direct,
+                &scratch.worktree(),
+                &scratch.target(),
+                &denied
+            )
+            .is_err(),
+            "direct denied path must be rejected"
+        );
+
+        // Parent enclosing a denied path
+        let lookup_parent = |k: &str| match k {
+            READONLY_MOUNTS_ENV => Some(format!("[\"{}\"]", scratch.dir().display())),
+            _ => None,
+        };
+        assert!(
+            parse_readonly_mounts_from(
+                &lookup_parent,
+                &scratch.worktree(),
+                &scratch.target(),
+                &denied
+            )
+            .is_err(),
+            "parent enclosing credentials must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_readonly_mounts_rejects_writable_overlaps() {
+        let scratch = Scratch::new("ro-overlap");
+        let denied = denied_paths();
+        let wt = scratch.worktree();
+        let target = scratch.target();
+
+        let lookup_wt = |k: &str| match k {
+            READONLY_MOUNTS_ENV => Some(format!("[\"{}\"]", wt.display())),
+            _ => None,
+        };
+        assert!(
+            parse_readonly_mounts_from(&lookup_wt, &wt, &target, &denied).is_err(),
+            "overlap with worktree must be rejected"
+        );
+
+        let lookup_target = |k: &str| match k {
+            READONLY_MOUNTS_ENV => Some(format!("[\"{}\"]", target.display())),
+            _ => None,
+        };
+        assert!(
+            parse_readonly_mounts_from(&lookup_target, &wt, &target, &denied).is_err(),
+            "overlap with target must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_readonly_mounts_grants_read_only_and_distinguishes_files_and_dirs() {
+        let scratch = Scratch::new("ro-grants");
+        let external_dir = scratch.dir().join("ext-dir");
+        std::fs::create_dir_all(&external_dir).unwrap();
+        let external_file = external_dir.join("asset.xbe");
+        std::fs::write(&external_file, b"MOCK_XBE").unwrap();
+
+        let canonical_file = external_file.canonicalize().unwrap();
+        let canonical_dir = external_dir.canonicalize().unwrap();
+
+        let json = format!(
+            "[\"{}\", \"{}\"]",
+            canonical_file.display(),
+            canonical_dir.display()
+        );
+        let lookup = |k: &str| match k {
+            READONLY_MOUNTS_ENV => Some(json.clone()),
+            _ => None,
+        };
+
+        let rules = build_path_rules_from(&scratch.worktree(), &scratch.target(), &lookup);
+
+        let file_rule = rules
+            .iter()
+            .find(|r| r.path == canonical_file)
+            .expect("file rule must exist");
+        assert_eq!(
+            file_rule.allowed, ACCESS_FS_READ_FILE,
+            "file must only have READ_FILE, no EXEC or write"
+        );
+
+        let dir_rule = rules
+            .iter()
+            .find(|r| r.path == canonical_dir)
+            .expect("dir rule must exist");
+        assert_eq!(
+            dir_rule.allowed,
+            ACCESS_FS_READ_FILE | ACCESS_FS_READ_DIR,
+            "dir must only have READ_FILE | READ_DIR, no EXEC or write"
+        );
+    }
+
+    #[test]
+    fn test_readonly_mounts_rejects_toolchain_cache_overlaps() {
+        let scratch = Scratch::new("ro-tc-overlap");
+        let denied = denied_paths();
+        let wt = scratch.worktree();
+        let target = scratch.target();
+
+        let fake_home = scratch.dir().join("fake_home");
+        let fake_local_bin = fake_home.join(".local").join("bin");
+        std::fs::create_dir_all(&fake_local_bin).unwrap();
+        let probe_sh = fake_local_bin.join("probe.sh");
+        std::fs::write(&probe_sh, b"#!/bin/sh\necho test\n").unwrap();
+
+        let fake_rustup = scratch.dir().join("fake_rustup");
+        let fake_tc = fake_rustup.join("toolchains").join("stable");
+        std::fs::create_dir_all(&fake_tc).unwrap();
+        let rustup_script = fake_tc.join("cargo.sh");
+        std::fs::write(&rustup_script, b"#!/bin/sh\n").unwrap();
+
+        let lookup = |k: &str| match k {
+            READONLY_MOUNTS_ENV => Some(format!("[\"{}\"]", probe_sh.display())),
+            "HOME" => Some(fake_home.to_string_lossy().to_string()),
+            "RUSTUP_HOME" => Some(fake_rustup.to_string_lossy().to_string()),
+            _ => None,
+        };
+
+        // Descendant of toolchain cache root (~/.local/bin)
+        let err = parse_readonly_mounts_from(&lookup, &wt, &target, &denied).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("overlaps with executable toolchain location"),
+            "unexpected error: {err:#}"
+        );
+
+        // Descendant of custom RUSTUP_HOME
+        let lookup_rustup = |k: &str| match k {
+            READONLY_MOUNTS_ENV => Some(format!("[\"{}\"]", rustup_script.display())),
+            "HOME" => Some(fake_home.to_string_lossy().to_string()),
+            "RUSTUP_HOME" => Some(fake_rustup.to_string_lossy().to_string()),
+            _ => None,
+        };
+        let err = parse_readonly_mounts_from(&lookup_rustup, &wt, &target, &denied).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("overlaps with executable toolchain location"),
+            "unexpected error: {err:#}"
+        );
+
+        // Ancestor of toolchain cache root (mounting directory that encloses ~/.local/bin)
+        let fake_local = fake_home.join(".local");
+        let lookup_ancestor = |k: &str| match k {
+            READONLY_MOUNTS_ENV => Some(format!("[\"{}\"]", fake_local.display())),
+            "HOME" => Some(fake_home.to_string_lossy().to_string()),
+            _ => None,
+        };
+        let err = parse_readonly_mounts_from(&lookup_ancestor, &wt, &target, &denied).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("overlaps with executable toolchain location"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn test_readonly_mounts_rejects_git_metadata_overlaps() {
+        let scratch = Scratch::new("ro-git-overlap");
+        let denied = denied_paths();
+        let wt = scratch.worktree();
+        let target = scratch.target();
+
+        // Simulate git repository inside worktree
+        let git_dir = wt.join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        let git_config = git_dir.join("config");
+        std::fs::write(&git_config, b"[core]\n").unwrap();
+
+        let lookup_git = |k: &str| match k {
+            READONLY_MOUNTS_ENV => Some(format!("[\"{}\"]", git_config.display())),
+            _ => None,
+        };
+
+        let err = parse_readonly_mounts_from(&lookup_git, &wt, &target, &denied).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("overlaps with git repository metadata")
+                || err.to_string().contains("overlaps with writable worktree"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn test_readonly_mounts_rejects_special_files_and_pseudofs() {
+        let scratch = Scratch::new("ro-special-files");
+        let denied = denied_paths();
+        let wt = scratch.worktree();
+        let target = scratch.target();
+
+        // A. Pseudo-filesystem overlap
+        for pseudo in ["/dev", "/proc", "/sys"] {
+            let lookup = |k: &str| match k {
+                READONLY_MOUNTS_ENV => Some(format!("[\"{pseudo}\"]")),
+                _ => None,
+            };
+            let err = parse_readonly_mounts_from(&lookup, &wt, &target, &denied).unwrap_err();
+            assert!(
+                err.to_string().contains("overlaps with special filesystem")
+                    || err.to_string().contains("blanket mount"),
+                "unexpected error for {pseudo}: {err:#}"
+            );
+        }
+
+        // B. Special FIFO rejection (non-blocking)
+        let fifo_path = scratch.dir().join("test_pipe");
+        let c_path = std::ffi::CString::new(fifo_path.to_str().unwrap()).unwrap();
+        unsafe {
+            libc::mkfifo(c_path.as_ptr(), 0o600);
+        }
+        if fifo_path.exists() {
+            let lookup = |k: &str| match k {
+                READONLY_MOUNTS_ENV => Some(format!("[\"{}\"]", fifo_path.display())),
+                _ => None,
+            };
+            let err = parse_readonly_mounts_from(&lookup, &wt, &target, &denied).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("is not a regular file or directory"),
+                "unexpected error for FIFO: {err:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_readonly_mounts_rejects_symlink_aliases_to_writable_roots() {
+        let scratch = Scratch::new("ro-symlink-alias");
+        let denied = denied_paths();
+        let wt = scratch.worktree();
+        let target = scratch.target();
+
+        let symlink_path = scratch.dir().join("alias_to_wt");
+        std::os::unix::fs::symlink(&wt, &symlink_path).unwrap();
+
+        let lookup = |k: &str| match k {
+            READONLY_MOUNTS_ENV => Some(format!("[\"{}\"]", symlink_path.display())),
+            _ => None,
+        };
+
+        let err = parse_readonly_mounts_from(&lookup, &wt, &target, &denied).unwrap_err();
+        assert!(
+            err.to_string().contains("overlaps with writable worktree"),
+            "canonicalization must resolve symlink to writable root: {err:#}"
+        );
+    }
+
+    #[test]
+    fn test_readonly_mounts_permits_sibling_and_deep_data_in_user_tree() {
+        let scratch = Scratch::new("ro-deep-data");
+        let denied = denied_paths();
+        let wt = scratch.worktree();
+        let target = scratch.target();
+
+        let data_root = scratch.dir().join("legit_data");
+        let sub_dir = data_root.join("sub");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+
+        let asset_file = sub_dir.join("asset.dat");
+        std::fs::write(&asset_file, b"DATA_PAYLOAD").unwrap();
+
+        let sibling_secret = data_root.join("sibling_secret.txt");
+        std::fs::write(&sibling_secret, b"SECRET_BYTES").unwrap();
+
+        let canonical_asset = asset_file.canonicalize().unwrap();
+        let canonical_sub = sub_dir.canonicalize().unwrap();
+
+        let json = format!(
+            "[\"{}\", \"{}\"]",
+            canonical_asset.display(),
+            canonical_sub.display()
+        );
+        let lookup = |k: &str| match k {
+            READONLY_MOUNTS_ENV => Some(json.clone()),
+            _ => None,
+        };
+
+        let mounts = parse_readonly_mounts_from(&lookup, &wt, &target, &denied)
+            .expect("legitimate user data must be accepted");
+        assert_eq!(mounts.len(), 2);
+        assert!(mounts.contains(&canonical_asset));
+        assert!(mounts.contains(&canonical_sub));
+        assert!(!mounts.contains(&sibling_secret));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_readonly_mounts_rejects_non_utf8_env() {
+        use std::os::unix::ffi::OsStringExt;
+        let wt = PathBuf::from("/fake/wt");
+        let target = PathBuf::from("/fake/target");
+        let denied = vec![];
+
+        let invalid_os = std::ffi::OsString::from_vec(vec![0xFF, 0xFE]);
+        let lookup = |k: &str| match k {
+            READONLY_MOUNTS_ENV => Some(invalid_os.clone()),
+            _ => None,
+        };
+
+        let err = parse_readonly_mounts_from_os(&lookup, &wt, &target, &denied).unwrap_err();
+        assert!(
+            err.to_string().contains("not valid UTF-8"),
+            "expected non-UTF8 error, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn test_build_plan_fails_closed_when_abi_is_none_and_mounts_present() {
+        let scratch = Scratch::new("ro-no-abi");
+        let external_dir = scratch.dir().join("ext-dir");
+        std::fs::create_dir_all(&external_dir).unwrap();
+        let canonical_dir = external_dir.canonicalize().unwrap();
+
+        // 1. With abi = None and mounts present, must fail closed
+        let err = build_plan_with_abi_and_mounts(
+            &scratch.worktree(),
+            &scratch.target(),
+            None,
+            false,
+            std::slice::from_ref(&canonical_dir),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Landlock is not supported by this kernel"),
+            "unexpected error: {err:#}"
+        );
+
+        // 2. With abi = None and empty mounts, must succeed with Ok(None) (legacy degradation)
+        let res = build_plan_with_abi_and_mounts(
+            &scratch.worktree(),
+            &scratch.target(),
+            None,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert!(res.is_none());
+    }
+
+    #[test]
+    fn test_prepare_with_mounts_fails_closed_when_landlock_disabled_or_unsupported() {
+        let scratch = Scratch::new("ro-disabled-unsupported");
+        let external_dir = scratch.dir().join("ext-dir");
+        std::fs::create_dir_all(&external_dir).unwrap();
+        let canonical_dir = external_dir.canonicalize().unwrap();
+
+        let lookup_disabled = |k: &str| match k {
+            DISABLE_LANDLOCK_ENV => Some("1".to_string()),
+            _ => None,
+        };
+        let lookup_normal = |_: &str| None;
+
+        // A. Landlock disabled with non-empty mounts -> Err
+        let err = KernelConfinement::prepare_with_mounts_from(
+            &lookup_disabled,
+            Some(4),
+            true,
+            &scratch.worktree(),
+            &scratch.target(),
+            false,
+            std::slice::from_ref(&canonical_dir),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Landlock is disabled by SWE_DISABLE_LANDLOCK"),
+            "unexpected error: {err:#}"
+        );
+
+        // B. Landlock disabled with empty mounts -> Ok(None) (legacy degradation)
+        let res = KernelConfinement::prepare_with_mounts_from(
+            &lookup_disabled,
+            Some(4),
+            true,
+            &scratch.worktree(),
+            &scratch.target(),
+            false,
+            &[],
+        )
+        .unwrap();
+        assert!(res.is_none());
+
+        // C. Landlock unsupported (abi = None) with non-empty mounts -> Err (even if seccomp is available!)
+        let err = KernelConfinement::prepare_with_mounts_from(
+            &lookup_normal,
+            None,
+            true,
+            &scratch.worktree(),
+            &scratch.target(),
+            false,
+            std::slice::from_ref(&canonical_dir),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Landlock is not supported by this kernel"),
+            "seccomp must not excuse missing filesystem isolation: {err:#}"
+        );
+
+        // D. Landlock unsupported with empty mounts but seccomp available -> Ok(Some(confinement)) (legacy degradation)
+        let res = KernelConfinement::prepare_with_mounts_from(
+            &lookup_normal,
+            None,
+            true,
+            &scratch.worktree(),
+            &scratch.target(),
+            false,
+            &[],
+        )
+        .unwrap();
+        assert!(res.is_some());
+        let confinement = res.unwrap();
+        assert!(!confinement.has_landlock());
+        assert!(confinement.has_seccomp());
+    }
+
     /// Sentinel that turns this test binary into a Landlock probe instead of a
     /// libtest run.
     const ENFORCE_ENV: &str = "MINI_SWE_LANDLOCK_ENFORCE";
@@ -2905,18 +3811,57 @@ pub struct KernelConfinement {
 }
 
 impl KernelConfinement {
-    /// Prepare confinement for `worktree`/`target_dir` under `offline`.
-    ///
-    /// Returns `Ok(None)` when this kernel offers neither Landlock nor
-    /// seccomp, so the caller can fall back to bubblewrap or run unconfined.
-    /// A malformed policy (a missing root) stays an `Err`.
-    pub fn prepare(worktree: &Path, target_dir: &Path, offline: bool) -> Result<Option<Self>> {
-        if landlock_disabled() {
+    /// Prepare confinement for `worktree`/`target_dir` with explicit pre-validated `readonly_mounts`.
+    pub fn prepare_with_mounts(
+        worktree: &Path,
+        target_dir: &Path,
+        offline: bool,
+        readonly_mounts: &[PathBuf],
+    ) -> Result<Option<Self>> {
+        Self::prepare_with_mounts_from(
+            &|name| std::env::var(name).ok(),
+            query_abi_version(),
+            seccomp_supported(),
+            worktree,
+            target_dir,
+            offline,
+            readonly_mounts,
+        )
+    }
+
+    /// Prepare confinement with parameterised lookup and kernel capabilities.
+    pub(crate) fn prepare_with_mounts_from(
+        lookup: &dyn Fn(&str) -> Option<String>,
+        abi: Option<i64>,
+        seccomp_avail: bool,
+        worktree: &Path,
+        target_dir: &Path,
+        offline: bool,
+        readonly_mounts: &[PathBuf],
+    ) -> Result<Option<Self>> {
+        if landlock_disabled_from(lookup) {
+            if !readonly_mounts.is_empty() {
+                anyhow::bail!(
+                    "external read-only mounts require Landlock filesystem confinement, but Landlock is disabled by {DISABLE_LANDLOCK_ENV}"
+                );
+            }
             tracing::debug!("kernel confinement disabled by {DISABLE_LANDLOCK_ENV}=1");
             return Ok(None);
         }
-        let landlock = build_landlock_plan(worktree, target_dir, offline)?;
-        let seccomp = seccomp_supported().then(|| SeccompFilter::build(offline));
+        let landlock = build_plan_with_abi_and_mounts_from(
+            lookup,
+            worktree,
+            target_dir,
+            abi,
+            offline,
+            readonly_mounts,
+        )?;
+        if !readonly_mounts.is_empty() && landlock.is_none() {
+            anyhow::bail!(
+                "external read-only mounts require Landlock filesystem confinement, but Landlock is not supported by this kernel"
+            );
+        }
+        let seccomp = seccomp_avail.then(|| SeccompFilter::build(offline));
         if landlock.is_none() && seccomp.is_none() {
             return Ok(None);
         }
@@ -2928,6 +3873,16 @@ impl KernelConfinement {
             // with no death signal armed.
             parent_pid: std::process::id(),
         }))
+    }
+
+    /// Prepare confinement for `worktree`/`target_dir` under `offline`.
+    ///
+    /// Returns `Ok(None)` when this kernel offers neither Landlock nor
+    /// seccomp, so the caller can fall back to bubblewrap or run unconfined.
+    /// A malformed policy (a missing root) stays an `Err`.
+    pub fn prepare(worktree: &Path, target_dir: &Path, offline: bool) -> Result<Option<Self>> {
+        let mounts = parse_readonly_mounts(worktree, target_dir)?;
+        Self::prepare_with_mounts(worktree, target_dir, offline, &mounts)
     }
 
     /// Whether this kernel can confine a worker at all: Landlock, seccomp,

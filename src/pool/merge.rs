@@ -702,9 +702,14 @@ async fn run_gate_confined(
         None => None,
     };
 
+    let frozen_mounts = crate::agent::sandbox::parse_readonly_mounts(gate_dir, &build_dir)?;
+    let frozen_env = crate::agent::env::operator_forwarded_vars()?;
+
     // The bash path never dials the API, so the transport fields are unused;
     // only the confinement, environment and build directory matter here.
     let mut runner = AgentRunner::new(String::new(), String::new(), String::new(), None)
+        .with_readonly_mounts(frozen_mounts)
+        .with_operator_env(frozen_env)
         .with_extra_env(client_env.to_vec())
         // The gate is run by the harness, not the model, so it must never
         // become a background job; its budget is the absolute job ceiling, so a

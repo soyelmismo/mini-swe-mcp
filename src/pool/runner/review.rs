@@ -1711,6 +1711,11 @@ impl WorkerPool {
         };
         let review_prompt = security_prompt.unwrap_or(review_prompt);
 
+        let build_dir = worktree.leased_build_dir().unwrap_or(&worktree.path);
+        let frozen_mounts =
+            crate::agent::sandbox::parse_readonly_mounts(&worktree.path, build_dir)?;
+        let frozen_env = crate::agent::env::operator_forwarded_vars()?;
+
         let reviewer_runner = AgentRunner::new(
             self.api_base.clone(),
             self.api_key.clone(),
@@ -1720,7 +1725,9 @@ impl WorkerPool {
         .with_network_offline(network_offline)
         // The reviewer shares the worker's job table, so a job it backgrounds
         // is confined and stopped exactly like the implementer's.
-        .with_jobs(self.job_handle(&worker_id));
+        .with_jobs(self.job_handle(&worker_id))
+        .with_readonly_mounts(frozen_mounts)
+        .with_operator_env(frozen_env);
 
         let manifest = self.manifest();
         let (_, _, reviewer_manifest_turns) = manifest.resolve_model(&reviewer_model);

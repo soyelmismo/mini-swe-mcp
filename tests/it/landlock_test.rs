@@ -38,6 +38,7 @@ fn a_missing_worktree_is_an_error_for_external_callers() {
 /// rest of the suite. The parent re-executes this same binary with the
 /// sentinel set, exactly as the crate's own Landlock end-to-end test does.
 const EXEC_PROBE_ENV: &str = "MINI_SWE_LANDLOCK_EXEC_PROBE";
+const RO_PROBE_ENV: &str = "MINI_SWE_LANDLOCK_RO_PROBE";
 
 /// A sandboxed runner pointed at a throwaway endpoint; no request is ever made.
 fn runner() -> AgentRunner {
@@ -336,4 +337,315 @@ fn bin_dir_without_bwrap(roots: &Roots) -> PathBuf {
 /// Whether `name` resolves inside `dir`, the way `Command::spawn` would.
 fn has_command(dir: &Path, name: &str) -> bool {
     dir.join(name).exists()
+}
+
+/// An external read-only fixture is readable under Landlock confinement, but
+/// cannot be modified or executed, and sibling files outside the mount stay denied.
+/// Non-secret environment variables are forwarded, while secret-bearing ones are filtered.
+#[test]
+fn an_external_readonly_mount_is_readable_not_writable_under_confinement() {
+    if std::env::var_os(RO_PROBE_ENV).is_some() {
+        run_readonly_mount_confined_probe();
+    }
+
+    let roots = Roots::new("ro-e2e");
+
+    let fixture_base = std::env::temp_dir().join(format!(
+        "swe-ro-fixture-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&fixture_base).expect("create fixture dir");
+    let fixture = fixture_base.join("fixture_exec.sh");
+    let dir_fixture = fixture_base.join("dir_assets");
+    std::fs::create_dir_all(&dir_fixture).expect("create dir fixture");
+    let asset = dir_fixture.join("asset.txt");
+    let outside = fixture_base.join("sibling_secret.txt");
+
+    std::fs::write(&fixture, b"#!/bin/sh\necho VULN_EXECUTED\n").expect("write fixture");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&fixture).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fixture, perms).expect("chmod +x fixture");
+    }
+    std::fs::write(&asset, b"ASSET_DATA_BYTES").expect("write asset");
+    std::fs::write(&outside, b"SIBLING_SECRET").expect("write outside secret");
+
+    let canonical_fixture = fixture.canonicalize().expect("canonical fixture");
+    let canonical_dir = dir_fixture.canonicalize().expect("canonical dir");
+    let canonical_outside = outside.canonicalize().expect("canonical outside");
+
+    let sanitized = bin_dir_without_bwrap(&roots);
+    if !has_command(&sanitized, "bash") {
+        eprintln!("skipping: could not build a PATH without bwrap");
+        let _ = std::fs::remove_dir_all(&fixture_base);
+        return;
+    }
+
+    let exe = std::env::current_exe().expect("test binary path");
+    let mounts_json = format!(
+        r#"["{}", "{}"]"#,
+        canonical_fixture.display(),
+        canonical_dir.display()
+    );
+    let forward_json = r#"["TEST_FORWARD_OK", "TEST_EMPTY_VAR", "TEST_ABSENT_VAR"]"#.to_string();
+
+    let out = std::process::Command::new(&exe)
+        .arg("--exact")
+        .arg("landlock_test::an_external_readonly_mount_is_readable_not_writable_under_confinement")
+        .arg("--nocapture")
+        .env(RO_PROBE_ENV, "1")
+        .env("PATH", &sanitized)
+        .env_remove("CARGO_TARGET_DIR")
+        .env("LL_WORKTREE", &roots.worktree)
+        .env("LL_TARGET", &roots.target)
+        .env("LL_FIXTURE", &canonical_fixture)
+        .env("LL_DIR", &canonical_dir)
+        .env("LL_OUTSIDE", &canonical_outside)
+        .env(
+            mini_swe_mcp::agent::sandbox::READONLY_MOUNTS_ENV,
+            &mounts_json,
+        )
+        .env(mini_swe_mcp::agent::env::FORWARD_ENV_VAR, &forward_json)
+        .env("TEST_FORWARD_OK", "forward_success")
+        .env("TEST_EMPTY_VAR", "")
+        .output()
+        .expect("spawn readonly probe");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let _ = std::fs::remove_dir_all(&fixture_base);
+
+    assert!(
+        out.status.success(),
+        "readonly probe failed\nstdout: {stdout}\nstderr: {stderr}"
+    );
+
+    if stdout.contains("NO_LANDLOCK") {
+        eprintln!("skipping enforcement: this kernel does not support Landlock");
+    } else {
+        assert!(
+            stdout.contains("VERDICT OK"),
+            "readonly mount probe failed\nstdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+}
+
+fn run_readonly_mount_confined_probe() -> ! {
+    let var = |name: &str| -> PathBuf {
+        std::env::var_os(name)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                eprintln!("probe needs {name}");
+                std::process::exit(2);
+            })
+    };
+    let worktree = var("LL_WORKTREE");
+    let target = var("LL_TARGET");
+    let fixture = var("LL_FIXTURE");
+    let dir = var("LL_DIR");
+    let outside = var("LL_OUTSIDE");
+
+    if has_bwrap() {
+        eprintln!("PROBE ERROR: bwrap is still reachable");
+        std::process::exit(3);
+    }
+
+    match build_landlock_plan(&worktree, &target, false) {
+        Ok(None) => {
+            println!("NO_LANDLOCK");
+            std::process::exit(0);
+        }
+        Ok(Some(_)) => {}
+        Err(e) => {
+            eprintln!("PROBE ERROR: could not build a plan: {e:#}");
+            std::process::exit(1);
+        }
+    }
+
+    let mounts = mini_swe_mcp::agent::sandbox::parse_readonly_mounts(&worktree, &target)
+        .expect("parse readonly mounts");
+    let operator_env =
+        mini_swe_mcp::agent::env::operator_forwarded_vars().expect("parse operator forward env");
+    let r = runner()
+        .with_readonly_mounts(mounts)
+        .with_operator_env(operator_env);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build a runtime");
+
+    // 1. Reading the mounted fixture file succeeds.
+    let (out, code) = runtime
+        .block_on(r.execute_bash(
+            &worktree,
+            &format!("cat {}; echo cat_rc=$?", fixture.display()),
+        ))
+        .expect("read fixture");
+    assert_eq!(code, Some(0));
+    assert!(
+        out.contains("cat_rc=0"),
+        "fixture must be readable: {out:?}"
+    );
+    assert!(
+        out.contains("VULN_EXECUTED"),
+        "fixture content must match: {out:?}"
+    );
+
+    // 2. Writing to the mounted fixture file is DENIED.
+    let (out, _) = runtime
+        .block_on(r.execute_bash(
+            &worktree,
+            &format!("printf overwrite > {}; echo write_rc=$?", fixture.display()),
+        ))
+        .expect("write to readonly fixture");
+    assert!(
+        !out.contains("write_rc=0"),
+        "writing to readonly fixture must be denied: {out:?}"
+    );
+
+    // 3. Direct execution (execve) of the mounted fixture is DENIED under Landlock.
+    let (out, code) = runtime
+        .block_on(r.execute_bash(
+            &worktree,
+            &format!("{}; echo exec_rc=$?", fixture.display()),
+        ))
+        .expect("exec fixture");
+    assert!(
+        !out.contains("exec_rc=0") || !out.contains("VULN_EXECUTED"),
+        "direct execve of readonly fixture must be denied: {out:?}"
+    );
+    assert!(
+        code != Some(0) || !out.contains("VULN_EXECUTED"),
+        "direct execution must not succeed: code={code:?}, out={out:?}"
+    );
+
+    // 3b. Userland interpreter data-reading execution (sh /path/to/script) succeeds
+    // because reading bytes is permitted; this clarifies the direct-execve vs data-read distinction.
+    let (out, code) = runtime
+        .block_on(r.execute_bash(
+            &worktree,
+            &format!("sh {}; echo interp_rc=$?", fixture.display()),
+        ))
+        .expect("interpret fixture");
+    assert_eq!(code, Some(0));
+    assert!(
+        out.contains("interp_rc=0") && out.contains("VULN_EXECUTED"),
+        "interpreter reading bytes is permitted: {out:?}"
+    );
+
+    // 4. Reading directory asset succeeds, writing to directory is DENIED.
+    let asset_path = dir.join("asset.txt");
+    let (out, code) = runtime
+        .block_on(r.execute_bash(
+            &worktree,
+            &format!("cat {}; echo asset_rc=$?", asset_path.display()),
+        ))
+        .expect("read asset");
+    assert_eq!(code, Some(0));
+    assert!(
+        out.contains("asset_rc=0") && out.contains("ASSET_DATA_BYTES"),
+        "directory asset must be readable: {out:?}"
+    );
+
+    let (out, _) = runtime
+        .block_on(r.execute_bash(
+            &worktree,
+            &format!(
+                "printf overwrite > {}; echo asset_write_rc=$?",
+                asset_path.display()
+            ),
+        ))
+        .expect("write to readonly asset");
+    assert!(
+        !out.contains("asset_write_rc=0"),
+        "overwriting deep asset in readonly directory must be denied: {out:?}"
+    );
+
+    let new_asset = dir.join("new_file.txt");
+    let (out, _) = runtime
+        .block_on(r.execute_bash(
+            &worktree,
+            &format!("touch {}; echo touch_rc=$?", new_asset.display()),
+        ))
+        .expect("write to readonly dir");
+    assert!(
+        !out.contains("touch_rc=0"),
+        "writing new file into readonly directory must be denied: {out:?}"
+    );
+
+    // 5. Reading sibling outside the mount is DENIED.
+    let (out, _) = runtime
+        .block_on(r.execute_bash(
+            &worktree,
+            &format!("cat {}; echo cat_rc=$?", outside.display()),
+        ))
+        .expect("read outside sibling");
+    assert!(
+        !out.contains("cat_rc=0"),
+        "sibling secret must stay denied: {out:?}"
+    );
+    assert!(
+        !out.contains("SIBLING_SECRET"),
+        "secret must not leak: {out:?}"
+    );
+
+    // 6. Scoped non-secret env reaches command, preserving defined-empty and omitting absent.
+    let (out, _) = runtime
+        .block_on(r.execute_bash(
+            &worktree,
+            "echo F=$TEST_FORWARD_OK EMPTY_SET=${TEST_EMPTY_VAR+set} ABSENT_SET=${TEST_ABSENT_VAR+set}",
+        ))
+        .expect("check env");
+    assert!(
+        out.contains("F=forward_success"),
+        "forwarded non-secret env must reach child: {out:?}"
+    );
+    assert!(
+        out.contains("EMPTY_SET=set"),
+        "defined empty env var must be set in child environment: {out:?}"
+    );
+    assert!(
+        out.contains("ABSENT_SET="),
+        "absent env var must remain unset in child environment: {out:?}"
+    );
+
+    // 7. Operator environment precedence over client overlay.
+    let r_tamper = r.clone().with_extra_env(vec![(
+        "TEST_FORWARD_OK".to_string(),
+        "tampered_value".to_string(),
+    )]);
+    let (out, _) = runtime
+        .block_on(r_tamper.execute_bash(&worktree, "echo F=$TEST_FORWARD_OK"))
+        .expect("check env tamper");
+    assert!(
+        out.contains("F=forward_success") && !out.contains("tampered_value"),
+        "operator env must have immutable precedence over client overlay: {out:?}"
+    );
+
+    println!("VERDICT OK");
+    std::process::exit(0);
+}
+
+#[tokio::test]
+async fn bubblewrap_backend_fails_closed_when_readonly_mounts_configured() {
+    let roots = Roots::new("ro-bwrap-failclosed");
+    let mut cmd = tokio::process::Command::new("true");
+    let err = mini_swe_mcp::agent::exec::__test_apply_sandbox_args(
+        &mut cmd,
+        &roots.worktree,
+        &roots.target,
+        std::slice::from_ref(&roots.worktree),
+    )
+    .expect_err("bwrap must fail closed with mounts");
+    assert!(
+        err.to_string()
+            .contains("bubblewrap backend cannot enforce noexec isolation"),
+        "unexpected error message: {err:#}"
+    );
 }

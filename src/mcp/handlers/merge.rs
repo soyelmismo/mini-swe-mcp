@@ -29,6 +29,8 @@ impl McpServer {
         args: &Value,
         ctx: &crate::mcp::server::ConnectionContext,
     ) -> Result<Value> {
+        crate::agent::env::parse_forward_env()?;
+
         // `merge --approved` lands a whole round with one gate: no worker id,
         // the caller's approved workers (optionally one group) instead.
         if args.get("approved").and_then(|v| v.as_bool()) == Some(true) {
@@ -36,6 +38,13 @@ impl McpServer {
         }
         let wid = Self::get_worker_id(args, "merge")?;
         self.require_owner(wid, ctx).await?;
+
+        // Preflight check for operator-configured readonly mounts.
+        if let Some(entry) = crate::pool::load_registry_entry_in(self.pool.scratch_root(), wid)
+            && let Some(repo_path) = &entry.repo_path
+        {
+            crate::agent::sandbox::preflight_readonly_mounts(std::path::Path::new(repo_path))?;
+        }
         // A worker this process owns carries its verify verdict in memory; a
         // cross-process caller has only the on-disk row, which names none, and
         // therefore re-runs the gate.

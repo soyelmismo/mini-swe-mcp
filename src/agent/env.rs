@@ -516,7 +516,132 @@ pub fn ambient_snapshot_from(
     pairs
 }
 
-/// Test-only core for callers that vary just `HOME`/`CARGO_HOME`: the
+/// Environment variable specifying operator-configured non-secret variable names to forward into child processes.
+///
+/// Must be a JSON array of strings (e.g. `["REBLACK_XBE", "REBLACK_DATA", "GHIDRA_URL"]`).
+pub const FORWARD_ENV_VAR: &str = "SWE_FORWARD_ENV";
+
+/// Variable names that must never be overridden via `SWE_FORWARD_ENV`.
+const RESERVED_FORWARD_VARS: &[&str] = &[
+    "HOME",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "PATH",
+    "SWE_TEMP_DIR",
+    "CARGO_TARGET_DIR",
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_INSERT_LIBRARIES",
+    "PYTHONPATH",
+    "PERL5OPT",
+    "RUBYOPT",
+    "NODE_OPTIONS",
+    "BASH_ENV",
+    "ENV",
+];
+
+/// Whether `name` is a valid environment variable identifier (`[a-zA-Z_][a-zA-Z0-9_]*`).
+pub fn is_valid_env_ident(name: &str) -> bool {
+    !name.is_empty()
+        && name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Parse operator-configured non-secret variables to forward from `lookup` accepting `OsString`.
+///
+/// Fails closed with an error on non-UTF-8 values, malformed JSON, or illegal variable names
+/// (reserved runtime variables, invalid identifiers, secret names).
+/// Unset variables are omitted cleanly without inventing fallback values.
+pub fn parse_forward_env_from_os(
+    lookup: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> anyhow::Result<Vec<(String, String)>> {
+    let raw_os = match lookup(FORWARD_ENV_VAR) {
+        Some(val) => val,
+        None => return Ok(Vec::new()),
+    };
+
+    let raw = raw_os
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("{FORWARD_ENV_VAR}: value is not valid UTF-8 Unicode"))?;
+
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let names: Vec<String> = serde_json::from_str(&raw).map_err(|e| {
+        anyhow::anyhow!("invalid {FORWARD_ENV_VAR}: must be a JSON array of strings: {e}")
+    })?;
+
+    let mut out = Vec::with_capacity(names.len());
+    for name in names {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            anyhow::bail!("{FORWARD_ENV_VAR}: empty variable name is not allowed");
+        }
+        if !is_valid_env_ident(trimmed) {
+            anyhow::bail!(
+                "{FORWARD_ENV_VAR}: '{trimmed}' is not a valid environment variable identifier"
+            );
+        }
+        if RESERVED_FORWARD_VARS
+            .iter()
+            .any(|reserved| reserved.eq_ignore_ascii_case(trimmed))
+        {
+            anyhow::bail!(
+                "{FORWARD_ENV_VAR}: '{trimmed}' is a reserved runtime variable and cannot be forwarded"
+            );
+        }
+        if is_secret_name(trimmed) {
+            anyhow::bail!(
+                "{FORWARD_ENV_VAR}: '{trimmed}' matches secret name markers and cannot be forwarded"
+            );
+        }
+
+        if let Some(val_os) = lookup(trimmed) {
+            let val = val_os.into_string().map_err(|_| {
+                anyhow::anyhow!(
+                    "{FORWARD_ENV_VAR}: value for '{trimmed}' is not valid UTF-8 Unicode"
+                )
+            })?;
+            if val.is_empty() {
+                out.push((trimmed.to_string(), String::new()));
+            } else if let Some(clean) = sanitize_ambient_value(trimmed, &val) {
+                out.push((trimmed.to_string(), clean));
+            } else {
+                anyhow::bail!(
+                    "{FORWARD_ENV_VAR}: value for '{trimmed}' appears to be a secret/token and cannot be forwarded"
+                );
+            }
+        }
+    }
+
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out.dedup_by(|a, b| a.0 == b.0);
+    Ok(out)
+}
+
+/// Parse operator-configured non-secret variables to forward from `lookup`.
+///
+/// Fails closed with an error on malformed JSON or illegal variable names
+/// (reserved runtime variables, invalid identifiers, secret names).
+/// Unset variables are omitted cleanly without inventing fallback values.
+pub fn parse_forward_env_from(
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> anyhow::Result<Vec<(String, String)>> {
+    parse_forward_env_from_os(&|k| lookup(k).map(std::ffi::OsString::from))
+}
+
+/// Production wrapper for [`parse_forward_env_from_os`] reading the process environment.
+pub fn parse_forward_env() -> anyhow::Result<Vec<(String, String)>> {
+    parse_forward_env_from_os(&|name| std::env::var_os(name))
+}
+
+/// Helper returning operator-forwarded variables, failing closed if misconfigured.
+pub fn operator_forwarded_vars() -> anyhow::Result<Vec<(String, String)>> {
+    parse_forward_env()
+}
 /// remaining parent variables come from the process environment. Tests that
 /// vary anything else use [`build_clean_environment_from`] with a synthetic
 /// map instead, so no test mutates process-global state.
@@ -991,5 +1116,169 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_forward_env_handles_unset_and_empty() {
+        let lookup = |_: &str| None;
+        let res = parse_forward_env_from(&lookup).expect("unset should succeed");
+        assert!(res.is_empty());
+
+        let lookup_empty = |k: &str| match k {
+            FORWARD_ENV_VAR => Some("   ".to_string()),
+            _ => None,
+        };
+        let res = parse_forward_env_from(&lookup_empty).expect("blank should succeed");
+        assert!(res.is_empty());
+    }
+
+    #[test]
+    fn parse_forward_env_fails_closed_on_malformed_json() {
+        for malformed in ["not-json", "{not array}", "[\"unclosed"] {
+            let lookup = |k: &str| match k {
+                FORWARD_ENV_VAR => Some(malformed.to_string()),
+                _ => None,
+            };
+            assert!(
+                parse_forward_env_from(&lookup).is_err(),
+                "should fail on malformed JSON: {malformed}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_forward_env_rejects_invalid_identifiers() {
+        for invalid in [
+            "\"123BAD\"",
+            "\"VAR-WITH-DASH\"",
+            "\"VAR WITH SPACE\"",
+            "\"\"",
+        ] {
+            let lookup = |k: &str| match k {
+                FORWARD_ENV_VAR => Some(format!("[{invalid}]")),
+                _ => None,
+            };
+            assert!(
+                parse_forward_env_from(&lookup).is_err(),
+                "should reject invalid ident: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_forward_env_rejects_reserved_and_secret_vars() {
+        for reserved in ["\"HOME\"", "\"PATH\"", "\"TMPDIR\"", "\"LD_PRELOAD\""] {
+            let lookup = |k: &str| match k {
+                FORWARD_ENV_VAR => Some(format!("[{reserved}]")),
+                _ => None,
+            };
+            assert!(
+                parse_forward_env_from(&lookup).is_err(),
+                "should reject reserved: {reserved}"
+            );
+        }
+
+        for secret in ["\"MY_API_KEY\"", "\"AUTH_TOKEN\"", "\"SECRET_PASSWORD\""] {
+            let lookup = |k: &str| match k {
+                FORWARD_ENV_VAR => Some(format!("[{secret}]")),
+                _ => None,
+            };
+            assert!(
+                parse_forward_env_from(&lookup).is_err(),
+                "should reject secret name: {secret}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_forward_env_forwards_clean_vars_and_omits_unset() {
+        let lookup = |k: &str| match k {
+            FORWARD_ENV_VAR => Some(
+                "[\"REBLACK_XBE\", \"REBLACK_DATA\", \"GHIDRA_URL\", \"UNSET_VAR\"]".to_string(),
+            ),
+            "REBLACK_XBE" => Some("/path/to/default.xbe".to_string()),
+            "REBLACK_DATA" => Some("/path/to/data".to_string()),
+            "GHIDRA_URL" => Some("http://127.0.0.1:8089".to_string()),
+            _ => None,
+        };
+        let forwarded = parse_forward_env_from(&lookup).expect("valid config should parse");
+        assert_eq!(
+            forwarded,
+            vec![
+                (
+                    "GHIDRA_URL".to_string(),
+                    "http://127.0.0.1:8089".to_string()
+                ),
+                ("REBLACK_DATA".to_string(), "/path/to/data".to_string()),
+                (
+                    "REBLACK_XBE".to_string(),
+                    "/path/to/default.xbe".to_string()
+                ),
+            ]
+        );
+        // UNSET_VAR was omitted cleanly without inventing a fallback
+        assert!(!forwarded.iter().any(|(k, _)| k == "UNSET_VAR"));
+    }
+
+    #[test]
+    fn parse_forward_env_rejects_credential_values() {
+        let token = "a".repeat(40);
+        let lookup = |k: &str| match k {
+            FORWARD_ENV_VAR => Some("[\"INNOCENT_NAME\"]".to_string()),
+            "INNOCENT_NAME" => Some(token.clone()),
+            _ => None,
+        };
+        assert!(
+            parse_forward_env_from(&lookup).is_err(),
+            "should reject long token value"
+        );
+    }
+
+    #[test]
+    fn parse_forward_env_distinguishes_absent_from_defined_empty() {
+        let lookup = |k: &str| match k {
+            FORWARD_ENV_VAR => Some("[\"REBLACK_XBE\", \"EMPTY_VAR\", \"ABSENT_VAR\"]".to_string()),
+            "REBLACK_XBE" => Some("/path/to/xbe".to_string()),
+            "EMPTY_VAR" => Some("".to_string()),
+            _ => None,
+        };
+        let forwarded = parse_forward_env_from(&lookup).expect("valid config should parse");
+        assert_eq!(
+            forwarded,
+            vec![
+                ("EMPTY_VAR".to_string(), "".to_string()),
+                ("REBLACK_XBE".to_string(), "/path/to/xbe".to_string()),
+            ]
+        );
+        assert!(!forwarded.iter().any(|(k, _)| k == "ABSENT_VAR"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn parse_forward_env_rejects_non_utf8_env() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let invalid_os = std::ffi::OsString::from_vec(vec![0xFF, 0xFE]);
+        let lookup_invalid_top = |k: &str| match k {
+            FORWARD_ENV_VAR => Some(invalid_os.clone()),
+            _ => None,
+        };
+        let err = parse_forward_env_from_os(&lookup_invalid_top).unwrap_err();
+        assert!(
+            err.to_string().contains("not valid UTF-8"),
+            "expected non-UTF8 error for top var, got: {err:#}"
+        );
+
+        let lookup_invalid_member = |k: &str| match k {
+            FORWARD_ENV_VAR => Some(std::ffi::OsString::from("[\"INVALID_BYTES_VAR\"]")),
+            "INVALID_BYTES_VAR" => Some(invalid_os.clone()),
+            _ => None,
+        };
+        let err = parse_forward_env_from_os(&lookup_invalid_member).unwrap_err();
+        assert!(
+            err.to_string().contains("INVALID_BYTES_VAR")
+                && err.to_string().contains("not valid UTF-8"),
+            "expected non-UTF8 error naming variable, got: {err:#}"
+        );
     }
 }

@@ -117,6 +117,12 @@ pub struct AgentRunner {
     /// command in the dispatcher's ambient environment; ordinary steps leave
     /// it empty.
     pub extra_env: Vec<(String, String)>,
+    /// Operator-configured external read-only mounts frozen for this runner instance/phase.
+    /// Sandboxed commands cannot mutate host files or configuration.
+    pub readonly_mounts: Vec<std::path::PathBuf>,
+    /// Operator-configured non-secret environment variables (`SWE_FORWARD_ENV`) frozen
+    /// for this runner instance/phase. These take immutable precedence over any client overlay (`extra_env`).
+    pub operator_env: Vec<(String, String)>,
     /// The worker's background jobs. `None` for a runner no worker owns, in
     /// which case a command that outlives its budget is simply killed.
     pub(crate) jobs: Option<JobHandle>,
@@ -146,6 +152,8 @@ impl AgentRunner {
             build_jobs: None,
             build_target_dir: None,
             extra_env: Vec::new(),
+            readonly_mounts: Vec::new(),
+            operator_env: Vec::new(),
             jobs: None,
             last_job: Arc::new(Mutex::new(None)),
             jobs_disabled: false,
@@ -158,9 +166,26 @@ impl AgentRunner {
         self
     }
 
+    /// Attach frozen operator-configured read-only mounts to this runner.
+    pub fn with_readonly_mounts(mut self, mounts: Vec<std::path::PathBuf>) -> Self {
+        self.readonly_mounts = mounts;
+        self
+    }
+
+    /// Attach frozen operator-forwarded environment variables to this runner.
+    ///
+    /// Operator variables have strict immutable precedence over any client overlay
+    /// applied via [`Self::with_extra_env`].
+    pub fn with_operator_env(mut self, vars: Vec<(String, String)>) -> Self {
+        self.operator_env = vars;
+        self
+    }
+
     /// Layer `vars` on top of the sanitized environment of the next
     /// `execute_bash` call. The caller clones per command, so the overlay
-    /// never leaks into an unrelated step.
+    /// never leaks into an unrelated step. Note that operator-forwarded variables
+    /// (`operator_env`) have immutable precedence and cannot be overwritten by
+    /// `extra_env`.
     pub fn with_extra_env(mut self, vars: Vec<(String, String)>) -> Self {
         self.extra_env = vars;
         self

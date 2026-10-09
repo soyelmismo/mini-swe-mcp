@@ -471,6 +471,11 @@ impl WorkerPool {
         let client_env = config.client_env.to_vec();
         let repo_path_str = config.repo_path_str.to_string();
 
+        let build_dir = worktree.leased_build_dir().unwrap_or(&worktree.path);
+        let frozen_mounts =
+            crate::agent::sandbox::parse_readonly_mounts(&worktree.path, build_dir)?;
+        let frozen_env = crate::agent::env::operator_forwarded_vars()?;
+
         let runner = AgentRunner::new(
             self.api_base.clone(),
             self.api_key.clone(),
@@ -480,7 +485,9 @@ impl WorkerPool {
         .with_network_offline(network_offline)
         // A command that outlives its budget becomes one of this worker's
         // background jobs, so the runner needs the worker's job table.
-        .with_jobs(self.job_handle(worker_id));
+        .with_jobs(self.job_handle(worker_id))
+        .with_readonly_mounts(frozen_mounts)
+        .with_operator_env(frozen_env);
         let _jobs = JobGuard {
             pool: self,
             worker_id,

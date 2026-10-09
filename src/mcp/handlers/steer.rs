@@ -16,6 +16,15 @@ impl McpServer {
         let resolved = self.resolve_worker_id(args, "steer", ctx).await?;
         let wid = resolved.as_str();
         self.require_owner(wid, ctx).await?;
+
+        // Preflight check for operator-configured readonly mounts and forward environment.
+        if let Some(entry) = crate::pool::load_registry_entry_in(self.pool.scratch_root(), wid)
+            && let Some(repo_path) = &entry.repo_path
+        {
+            crate::agent::sandbox::preflight_readonly_mounts(std::path::Path::new(repo_path))?;
+        }
+        crate::agent::env::parse_forward_env()?;
+
         let message = Self::required_string(args, "message", "steer")?.to_string();
         // An explicit `max_turns` on a steer is the revision's fresh budget;
         // it is validated but otherwise ignored for live workers (whose loop

@@ -37,3 +37,22 @@ models:
       # capabilities as `ninja`, declared explicitly rather than by omission.
       network: "allow"
       fs: "full"
+
+  minis:
+    id: combo:minis
+    role: "Small, low-cost subagent. Correct on narrow, fully specified edits with an explicit acceptance test, but slow and exploratory (about 3x the steps of ninja); avoid for open-ended or multi-file work."
+    instructions:
+      - "Read a file whole with `cat <file>` (or `cat -n`) the first time you need it; do not page through it with `sed -n X,Yp` or `head`/`tail` ranges. Use ranges only for files over 1500 lines, after locating the region with `grep -n`."
+      - "Batch independent reads into one command (`cat a.rs b.rs; grep -n name src -r`) instead of one file per turn."
+      - "Stay inside your worktree and $TMPDIR; once the acceptance test passes, run the gate and finish instead of exploring further."
+    temperature: 0.2
+    max_turns: 150
+    policy:
+      network: "allow"
+      fs: "full"
+
+# Review modes: built-ins (quality, security) are overridden field by field.
+# Only default_model is set here, so the built-in security checklist is kept.
+review_modes:
+  security:
+    default_model: nerd

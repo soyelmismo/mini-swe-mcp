@@ -198,6 +198,9 @@ impl McpServer {
         self.check_agent_cap(&agent, self.max_workers_per_agent)
             .await?;
         let repo_path = Self::get_repo_path(args, ctx);
+        // Preflight check for operator-configured readonly mounts and forward environment.
+        crate::agent::sandbox::preflight_readonly_mounts(&repo_path)?;
+        crate::agent::env::parse_forward_env()?;
         let requested_model = args
             .get("model")
             .and_then(|v| v.as_str())
